@@ -72,8 +72,13 @@ class RetentionService:
         rollup_pruned = await asyncio.to_thread(
             self.db.prune_rollup_1m, now - self.cfg.rollup_1m_days * 86400
         )
-        if rows or raw_pruned or rollup_pruned:
+        events_pruned = 0
+        if self.cfg.events_days > 0:
+            events_pruned = await asyncio.to_thread(
+                self.db.prune_events, now - self.cfg.events_days * 86400
+            )
+        if rows or raw_pruned or rollup_pruned or events_pruned:
             log.info(
-                "retention: rolled %d 1m buckets, pruned raw=%d rollup_1m=%d",
-                rows, raw_pruned, rollup_pruned,
+                "retention: rolled %d 1m buckets, pruned raw=%d rollup_1m=%d events=%d",
+                rows, raw_pruned, rollup_pruned, events_pruned,
             )

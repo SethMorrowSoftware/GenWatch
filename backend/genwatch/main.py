@@ -10,6 +10,7 @@ Lifespan order:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import logging.handlers
 import os
@@ -35,7 +36,9 @@ from .db import Database
 from .modbus.client import MockModbusClient, ModbusClient, SerialModbusClient
 from .modbus.poller import Poller
 from .modbus.registers import load_register_map
+from .services import notify
 from .services.control import ControlService
+from .services.ratelimit import RateLimiter
 from .services.retention import RetentionService
 from .services.state import EventBus, StateMachine
 
@@ -76,7 +79,7 @@ async def lifespan(app: FastAPI):
 
     # Choose client implementation
     if settings.mock:
-        log.warning("Modbus MOCK mode — no real RS-485 traffic")
+        log.warning("Modbus MOCK mode — no real RS-485 traffic (GENWATCH_MOCK=true)")
         client: ModbusClient = MockModbusClient(regmap)
     else:
         client = SerialModbusClient(
@@ -92,11 +95,20 @@ async def lifespan(app: FastAPI):
         )
 
     connected = await client.connect()
-    if not connected and not settings.mock:
-        log.error("Modbus serial connect failed — falling back to MOCK so the UI still boots")
-        client = MockModbusClient(regmap)
-        await client.connect()
-        settings = settings.model_copy(update={"mock": True})
+    if not connected:
+        # Production safety: refuse to start so the operator notices the
+        # cabling/permission problem instead of silently running a mock
+        # that looks live. systemd will retry per its restart policy.
+        if not settings.mock:
+            msg = (
+                f"Modbus serial connect failed on {settings.serial.device}. "
+                "Check the USB-RS485 adapter, A/B wiring, baud rate, and that "
+                "the 'genwatch' user is in the 'dialout' group. To run without "
+                "hardware (UI demo), set GENWATCH_MOCK=true."
+            )
+            log.error(msg)
+            raise RuntimeError(msg)
+        raise RuntimeError("mock client failed to connect — this should never happen")
 
     bus = EventBus()
     state_machine = StateMachine(regmap, db, bus)
@@ -148,6 +160,9 @@ async def lifespan(app: FastAPI):
     poller = Poller(client, regmap, on_poll)
     retention = RetentionService(db, settings.retention)
 
+    # 5 login attempts then 1 token every 3 minutes (~20/hour steady state).
+    login_limiter = RateLimiter(capacity=5, refill_per_s=1.0 / 180.0)
+
     # Attach everything to app.state so route handlers can read it.
     app.state.settings = settings
     app.state.db = db
@@ -158,6 +173,7 @@ async def lifespan(app: FastAPI):
     app.state.control = control_service
     app.state.poller = poller
     app.state.retention = retention
+    app.state.login_limiter = login_limiter
     app.state.version = __version__
     app.state.started_at = time.time()
 
@@ -165,10 +181,36 @@ async def lifespan(app: FastAPI):
     await poller.start()
     await retention.start()
 
+    # Signal systemd that we're ready, then start a watchdog ping task.
+    # If systemd's WatchdogSec is unset (dev / non-systemd), both are no-ops.
+    notify.ready()
+    watchdog_task: asyncio.Task | None = None
+    interval = notify.watchdog_interval_s()
+    if interval and interval > 0:
+        async def _watchdog_loop() -> None:
+            log.info("sd_notify watchdog ticker every %.1fs", interval)
+            while True:
+                try:
+                    await asyncio.sleep(interval)
+                except asyncio.CancelledError:
+                    return
+                # Ping only while the poller is running — if the poller has
+                # hung, we stop pinging and systemd will restart us.
+                if poller._running:  # type: ignore[attr-defined]
+                    notify.watchdog()
+        watchdog_task = asyncio.create_task(_watchdog_loop(), name="sd-watchdog")
+
     try:
         yield
     finally:
         log.info("Shutting down...")
+        notify.stopping()
+        if watchdog_task is not None:
+            watchdog_task.cancel()
+            try:
+                await watchdog_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         await poller.stop()
         await retention.stop()
         await client.close()

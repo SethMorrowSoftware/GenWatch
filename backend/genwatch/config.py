@@ -53,6 +53,9 @@ class RetentionConfig(BaseModel):
     raw_days: int = 7
     rollup_1m_days: int = 90
     rollup_1h_days: int = 730
+    # Info/ok events older than this are pruned. Alarms/warns are never
+    # auto-pruned (kept for forensic value).
+    events_days: int = 30
     audit_days: int = 0  # 0 = never delete
 
 
@@ -140,12 +143,7 @@ def load(config_path: str | None = None) -> Settings:
     else:
         s = Settings(config_path=chosen)
 
-    # 3. Auto-mock if device is missing
-    if not s.mock and not Path(s.serial.device).exists():
-        # Don't print here — let main.py log it during startup.
-        s = s.model_copy(update={"mock": True})
-
-    # 4. Ensure data dir exists. If we can't create it (read-only fs in
+    # 3. Ensure data dir exists. If we can't create it (read-only fs in
     #    test), fall back to a tempdir under the cwd.
     try:
         Path(s.data_dir).mkdir(parents=True, exist_ok=True)

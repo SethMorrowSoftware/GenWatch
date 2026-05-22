@@ -12,6 +12,11 @@ node_modules/
 dist/
 .vite/
 
+# TypeScript build artifacts (tsc -b emits these alongside sources)
+frontend/src/**/*.js
+frontend/src/**/*.js.map
+frontend/**/*.tsbuildinfo
+
 # Editor
 .vscode/
 .idea/

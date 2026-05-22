@@ -80,6 +80,7 @@ async def health(request: Request) -> dict:
         "ok": True,
         "comms": st.state_machine.snap.comms.state,
         "engineState": st.state_machine.snap.engine_state,
+        "uptimeS": int(time.time() - st.started_at),
         "dbBytes": db_bytes,
         "mock": st.settings.mock,
         "version": st.version,

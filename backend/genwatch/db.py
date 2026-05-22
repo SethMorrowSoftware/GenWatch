@@ -216,6 +216,16 @@ class Database:
             cur = c.execute("DELETE FROM telemetry_1m WHERE ts < ?", (int(older_than_ts),))
             return cur.rowcount or 0
 
+    def prune_events(self, older_than_ts: float) -> int:
+        """Prune info/ok events older than ts. Alarms and warnings are
+        always kept for forensic review."""
+        with self._writer() as c:
+            cur = c.execute(
+                "DELETE FROM events WHERE ts < ? AND severity IN ('info', 'ok')",
+                (older_than_ts,),
+            )
+            return cur.rowcount or 0
+
     def aggregate_rollup_1m(self, from_ts: float, to_ts: float) -> int:
         """Aggregate raw telemetry into 1-minute buckets in the half-open
         interval [from_ts, to_ts). Idempotent via INSERT OR REPLACE.
