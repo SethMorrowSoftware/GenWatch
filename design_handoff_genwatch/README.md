@@ -1,23 +1,22 @@
-# Handoff: GenWatch — Generac H-100 Operator Console
+# Design Spec: GenWatch — Generac H-100 Operator Console
+
+> **Status: implemented.** This document was the original design handoff. The
+> backend lives in `backend/`, the React + TypeScript frontend in `frontend/`,
+> and the Pi deployment in `deploy/`. Keep this file as a **spec reference**
+> for design tokens (color, type, spacing), screen layouts, and the API
+> contract — useful when adding new views or auditing visual regressions.
+> The prototype JSX/HTML files referenced below have been removed; the CSS
+> they defined is preserved verbatim in `frontend/src/styles/genwatch.css`.
 
 ## Overview
 
-GenWatch is a Raspberry-Pi-hosted monitoring & control dashboard for a Generac H-100 industrial generator over Modbus RTU. This handoff covers the **web frontend** — an operator console with four views (Live, History, Events & Alarms, Settings) and a confirm-token-gated control surface for start / stop / exercise / transfer commands.
+GenWatch is a Raspberry-Pi-hosted monitoring & control dashboard for a Generac H-100 industrial generator over Modbus RTU. The operator console has four views (Live, History, Events & Alarms, Settings) and a confirm-token-gated control surface for start / stop / exercise / transfer commands.
 
-The full system spec is in the parent project's draft (`GenWatch — Raspberry Pi Monitoring & Control for the Generac H-100 Control Panel`). This README documents the **UI only**; the backend (Python + FastAPI + pymodbus + SQLite) and Modbus poller live behind the API contract listed under §API.
-
-## About the design files
-
-The HTML/JSX files in this bundle are **design references**, not production code. They are React + Babel inline prototypes running entirely client-side with synthetic telemetry. Your task is to:
-
-- Recreate this UI in the target codebase's existing environment (likely React + Vite or similar; see §Recommended stack), **not** to ship the HTML as-is.
-- Wire the screens to the real backend API and WebSocket described under §API.
-- Keep the same visual system (tokens, type, spacing, status colors) — this is a **hi-fi spec**, treat it pixel-perfectly.
-- If there is no existing frontend yet, scaffold a fresh one (Vite + React + TypeScript is a safe default for a Pi-served SPA).
+This README documents the **UI design**; the backend implementation is documented in the repo-root `README.md`.
 
 ## Fidelity: High
 
-Pixel-perfect colors, typography, spacing, and interaction states. Mirror them exactly. Replace the synthetic data with real API/WebSocket calls; do not introduce a different design system.
+Pixel-perfect colors, typography, spacing, and interaction states. The shipped frontend mirrors them exactly via `frontend/src/styles/genwatch.css` (the original prototype CSS, unchanged).
 
 ---
 
@@ -27,7 +26,7 @@ Matches the spec's recommendation:
 
 - **Frontend:** Vite + React + TypeScript, static build served by FastAPI
 - **Charts:** uPlot (lightweight, performant on a Pi) or Chart.js. The prototype uses hand-rolled SVG which is fine to keep for the small sparklines, but switch to uPlot for the History view's large chart.
-- **Icons:** the prototype uses inline SVGs in `components.jsx`. Swap to **lucide-react** in the real app — every icon used here has a 1:1 Lucide equivalent (see §Icons).
+- **Icons:** inline SVGs (see `frontend/src/components/primitives.tsx` `Icon`). The implementation kept the inline approach over `lucide-react` to save ~20 KB on the Pi bundle; if you'd rather swap, every icon has a 1:1 Lucide equivalent (see §Icons).
 - **Fonts:** Geist (sans) + JetBrains Mono — both via Google Fonts or self-hosted woff2. Geist is recent; if it's not in the codebase, add it.
 - **State:** local `useState` + a single WebSocket subscription is enough; no Redux needed. TanStack Query is a good fit for the REST calls (events, history, settings).
 
@@ -80,7 +79,7 @@ All tokens are CSS custom properties on `:root`. The light theme is a sibling `:
 | `--blue-d`    | `oklch(0.45 0.12 220)`      | Blue borders |
 | `--slate`     | `oklch(0.70 0.02 250)`      | Stopped (neutral) |
 
-Light theme rebalances chroma; see CSS in `GenWatch.html`. Always go through `color-mix(in oklch, var(--<status>) <N>%, var(--panel-2))` for tinted backgrounds rather than hardcoding new colors.
+Light theme rebalances chroma; see the `[data-theme="light"]` block in `frontend/src/styles/genwatch.css`. Always go through `color-mix(in oklch, var(--<status>) <N>%, var(--panel-2))` for tinted backgrounds rather than hardcoding new colors.
 
 ### Typography
 - **Sans:** Geist, fallback `ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif`. Weights 400 / 500 / 600 / 700.
@@ -204,7 +203,7 @@ Triggered by every control button on Live. 440 px wide, blurred scrim.
 
 ## Components inventory
 
-All defined in `components.jsx` and `views.jsx`:
+All defined in `frontend/src/components/primitives.tsx` and `frontend/src/views/*.tsx`:
 
 - `<Icon name size stroke>` — inline SVG library (~24 icons). **Map to lucide-react** in the real codebase; see §Icons.
 - `<Pill tone>` — chip with leading dot. Tones: `ok | warn | alarm | info` (plus neutral default).
@@ -347,42 +346,24 @@ Snapshots fire on every prime poll (~1.5 s). Transitions and alarms fire immedia
 
 ---
 
-## Assets & files in this bundle
+## Implementation map
 
-- `GenWatch.html` — entry HTML with all CSS tokens + Google Fonts imports + React/Babel script tags + mount point.
-- `app.jsx` — top-level `App` component: routing, tweak panel, polling loop, confirm flow.
-- `views.jsx` — all four views + their internal sub-components + the confirm modal.
-- `components.jsx` — shared visual primitives (Icon, Card, Pill, Sparkline, LineChart, Gauge, Modal, LiveTick, Switch).
-- `data.jsx` — synthetic telemetry generator + canned events + active alarms + register map + alarm codes. **Replace entirely** with real API/WS data.
-- `tweaks-panel.jsx` — prototype-only Tweaks affordance. **Do not port.**
-
-No images or external assets — every visual is CSS, inline SVG, or unicode characters.
+| Spec section            | Lives in                                                  |
+|-------------------------|-----------------------------------------------------------|
+| Design tokens (color, type, spacing, radii, shadows) | `frontend/src/styles/genwatch.css` (`:root` and `[data-theme="light"]`) |
+| Icon library            | `frontend/src/components/primitives.tsx` — `Icon` |
+| Shared primitives       | same file — `Pill`, `Sparkline`, `LineChart`, `Card`, `Modal`, `LiveTick`, `Switch` |
+| Live view + hero + ATS  | `frontend/src/views/LiveView.tsx` |
+| History view + chart    | `frontend/src/views/HistoryView.tsx` |
+| Events + alarm log      | `frontend/src/views/EventsView.tsx` |
+| Settings + register map | `frontend/src/views/SettingsView.tsx` |
+| Confirm modal           | `frontend/src/views/ConfirmModal.tsx` |
+| API contract            | `backend/genwatch/api/*` (mirrored in repo-root `README.md`) |
+| WebSocket push          | `backend/genwatch/api/ws.py` + `frontend/src/hooks/useLiveData.ts` |
 
 ## Fonts
 
 - [Geist](https://fonts.google.com/specimen/Geist) — sans, weights 300/400/500/600/700.
 - [JetBrains Mono](https://fonts.google.com/specimen/JetBrains+Mono) — mono, weights 400/500/600.
 
-Self-host or load from Google Fonts. The current `<link>` tag is in `GenWatch.html`'s `<head>`.
-
----
-
-## Things explicitly NOT in scope here
-
-- Backend Python service, Modbus polling, register decoder.
-- systemd unit files, install scripts.
-- Authentication implementation (session/JWT) — the UI assumes a logged-in operator and a server-side session.
-- MQTT / SNMP integration UIs beyond the Notifications settings panel.
-- First-run wizard (referenced in the parent spec) — not designed yet.
-
-These are listed so you don't try to infer them from the design. They live in the parent project's spec.
-
----
-
-## Open questions for the developer
-
-1. **Framework lock-in?** If the codebase already has a Vue/Svelte choice, restyle these layouts in that framework rather than dragging React in.
-2. **Charting library?** uPlot is recommended for History; for sparklines, the inline SVG approach in `components.jsx` is fine to port. Confirm before pulling in Chart.js or anything heavier.
-3. **Real-time strategy?** WebSocket is assumed; if you prefer SSE, the message shapes don't change.
-4. **Light theme default?** The prototype defaults to dark — wall-tablet operator console. Confirm with the user before flipping.
-5. **Tweaks panel:** strip entirely, or keep behind a dev flag? Recommendation: strip.
+Loaded from Google Fonts via the `<link>` tag in `frontend/index.html`.

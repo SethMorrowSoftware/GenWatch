@@ -32,8 +32,7 @@ deploy/
   scripts/install.sh         Idempotent installer for Raspberry Pi OS
   config.yaml.example        Annotated config template
 
-design_handoff_genwatch/     Original prototype + design system docs (reference)
-screenshots/                 Reference visuals from the handoff
+design_handoff_genwatch/     Design spec — tokens, layout, screen specs (reference)
 ```
 
 ---
