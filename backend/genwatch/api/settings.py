@@ -264,3 +264,57 @@ async def reload_registers(
         meta=f"{len(rm_new.registers)} regs · {len(rm_new.controls)} controls",
     )
     return {"ok": True, "registers": len(rm_new.registers), "controls": len(rm_new.controls)}
+
+
+@router.get("/registers/verify")
+async def verify_registers(
+    request: Request,
+    p: Principal = Depends(require_admin),
+) -> dict:
+    from ..modbus.registers import validate_register_map
+
+    rm = request.app.state.regmap
+    report = validate_register_map(rm)
+    live = {
+        "skipped": request.app.state.settings.mock,
+        "ok": True,
+        "tested": 0,
+        "failed": 0,
+        "failures": [],
+    }
+    if not request.app.state.settings.mock:
+        failures = []
+        for reg in rm.registers:
+            r = await request.app.state.client.read(reg.addr, 1, fc=reg.fc)
+            if not r.ok:
+                failures.append({
+                    "name": reg.name,
+                    "addr": f"0x{reg.addr:04X}",
+                    "fc": reg.fc,
+                    "error": r.error,
+                })
+        live = {
+            "skipped": False,
+            "ok": len(failures) == 0,
+            "tested": len(rm.registers),
+            "failed": len(failures),
+            "failures": failures,
+        }
+
+    overall_ok = report.ok and live["ok"]
+    request.app.state.db.write_audit(
+        p.operator,
+        "registers.verify",
+        f"static_ok={report.ok} live_ok={live['ok']} tested={live['tested']} failed={live['failed']}",
+        "",
+        "ok" if overall_ok else "failed",
+    )
+    return {
+        "ok": overall_ok,
+        "static": {
+            "ok": report.ok,
+            "errors": report.errors,
+            "warnings": report.warnings,
+        },
+        "live": live,
+    }

@@ -136,6 +136,18 @@ export const api = {
     }>("/api/registers"),
   reloadRegisters: () =>
     request<{ ok: boolean; registers: number; controls: number }>("/api/registers/reload", { method: "POST" }),
+  verifyRegisters: () =>
+    request<{
+      ok: boolean;
+      static: { ok: boolean; errors: string[]; warnings: string[] };
+      live: {
+        skipped: boolean;
+        ok: boolean;
+        tested: number;
+        failed: number;
+        failures: Array<{ name: string; addr: string; fc: number; error: string | null }>;
+      };
+    }>("/api/registers/verify"),
 };
 
 export const EMPTY_READING: Reading = {

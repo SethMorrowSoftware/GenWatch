@@ -8,7 +8,7 @@ A single-pane operator console with live engine state, electrical output, two-st
 
 ![architecture diagram — see docs/HARDWARE for wiring](#)
 
-> **Reliability:** All 28 unit + end-to-end tests pass. systemd hardened unit with sd_notify watchdog. Service refuses to start if the Modbus link is unreachable (no silent fallback to mock). Login rate-limited. SQLite WAL with crash-safe retention. Audit log on every control command.
+> **Reliability:** Test coverage lives under `backend/tests/` (register parsing/decoding, hardening, Slack notifier, and end-to-end mock flow). systemd hardened unit with sd_notify watchdog. Service refuses to start if the Modbus link is unreachable (no silent fallback to mock). Login rate-limited. SQLite WAL with crash-safe retention. Audit log on every control command.
 
 ---
 
@@ -444,6 +444,26 @@ Restricts the GenWatch port to your LAN ranges.
 
 ## 9. Updating GenWatch
 
+For production updates, use this sequence so you don't lose observability:
+
+```bash
+cd ~/genwatch
+git pull
+sudo deploy/scripts/install.sh
+sudo systemctl restart genwatch
+sudo systemctl status genwatch --no-pager
+sudo genwatch doctor
+```
+
+If you changed the register map, immediately run verification after login:
+
+```bash
+curl -b cookies.txt -X POST http://localhost:8000/api/registers/reload
+curl -b cookies.txt http://localhost:8000/api/registers/verify
+```
+
+Keep a dated backup of `/etc/genwatch/config.yaml` before major upgrades.
+
 The installer is idempotent. To upgrade:
 
 ```bash
@@ -631,7 +651,16 @@ Then hot-reload (admin auth required):
 
 ```bash
 curl -b cookies.txt -X POST http://localhost:8000/api/registers/reload
+
+# Run automated verification (static safety + live read probe)
+curl -b cookies.txt http://localhost:8000/api/registers/verify
 ```
+
+`/api/registers/verify` is read-only. It reports:
+- **static**: map structure/safety issues (overlaps, invalid FC, invalid tier, etc.)
+- **live**: per-register Modbus read failures against the currently configured H-100 link
+
+This makes commissioning easier: edit YAML → reload → verify → only then enable operator controls.
 
 Or restart the service to fully rebind the poller batching:
 
@@ -678,8 +707,8 @@ The mock client simulates a plausible H-100 — engine state machine, electrical
 cd backend
 .venv/bin/pip install pytest==8.3.4 pytest-asyncio==0.25.0 httpx==0.28.1
 .venv/bin/python -m pytest tests/ -v
-# 28 tests: register decode + batching, e2e mock control flow, rate-limit,
-# events retention, sd_notify, refuse-to-start safety
+# Test categories: register decode + batching, e2e mock control flow,
+# rate-limit, events retention, sd_notify, refuse-to-start safety, Slack notifier
 ```
 
 ### Layout
@@ -730,6 +759,7 @@ design_handoff_genwatch/       Original design spec (reference)
 | PUT    | `/api/config`                 | Update on-disk config (admin)       |
 | GET    | `/api/registers`              | Current register map + last read    |
 | POST   | `/api/registers/reload`       | Re-read YAML from disk (admin)      |
+| GET    | `/api/registers/verify`       | Static + live register verification (admin) |
 | WS     | `/ws/live`                    | `snapshot` / `transition` / `alarm` |
 
 All errors return JSON `{ detail: { code, message } }` with appropriate HTTP status.
@@ -738,4 +768,4 @@ All errors return JSON `{ detail: { code, message } }` with appropriate HTTP sta
 
 ## 14. License
 
-MIT — see [LICENSE](LICENSE) (add one before shipping).
+MIT — see [LICENSE](LICENSE).
