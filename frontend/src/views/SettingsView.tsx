@@ -219,6 +219,9 @@ function ModbusSection({ v, set }: { v: Config["modbus"]; set: (patch: Partial<C
 function RegisterMapSection() {
   const [data, setData] = useState<Awaited<ReturnType<typeof api.registers>> | null>(null);
   const [reloading, setReloading] = useState(false);
+  const [verifying, setVerifying] = useState(false);
+  const [verify, setVerify] = useState<Awaited<ReturnType<typeof api.verifyRegisters>> | null>(null);
+  const [verifyErr, setVerifyErr] = useState<string | null>(null);
 
   const refresh = async () => setData(await api.registers());
   useEffect(() => { refresh(); }, []);
@@ -233,15 +236,73 @@ function RegisterMapSection() {
     try { await api.reloadRegisters(); await refresh(); } finally { setReloading(false); }
   };
 
+  const onVerify = async () => {
+    setVerifying(true);
+    setVerifyErr(null);
+    try {
+      setVerify(await api.verifyRegisters());
+    } catch (e: any) {
+      setVerifyErr(e?.body?.detail ?? e?.message ?? "verify failed");
+    } finally {
+      setVerifying(false);
+    }
+  };
+
   return (
     <Card title={`Register map — ${data.path.split("/").pop()}`}
           sub={`slave ${data.slave} · ${data.registers.length} registers`}
           actions={
-            <button className="btn btn-ghost" disabled={reloading} onClick={onReload}>
+            <button className="btn btn-ghost" disabled={reloading || verifying} onClick={onReload}>
               <Icon name="refresh" size={14} /> {reloading ? "…" : "Reload"}
+            </button>
+            <button className="btn btn-primary" disabled={reloading || verifying} onClick={onVerify}>
+              <Icon name="check" size={14} /> {verifying ? "Verifying…" : "Verify map"}
             </button>
           }
           flush>
+      {verifyErr && (
+        <div style={{ padding: "10px 14px", borderBottom: "1px solid var(--border)", color: "var(--red)" }}>
+          {verifyErr}
+        </div>
+      )}
+      {verify && (
+        <div style={{ padding: "10px 14px", borderBottom: "1px solid var(--border)", display: "grid", gap: 8 }}>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <Pill tone={verify.ok ? "ok" : "alarm"}>{verify.ok ? "Verification passed" : "Verification failed"}</Pill>
+            <Pill tone={verify.static.ok ? "ok" : "alarm"}>
+              Static: {verify.static.ok ? "OK" : `${verify.static.errors.length} errors`}
+            </Pill>
+            <Pill tone={verify.live.ok ? "ok" : "warn"}>
+              Live: {verify.live.skipped ? "SKIPPED (mock mode)" : `${verify.live.tested - verify.live.failed}/${verify.live.tested} readable`}
+            </Pill>
+          </div>
+          {verify.static.errors.length > 0 && (
+            <div>
+              <div className="mono" style={{ color: "var(--text-2)", marginBottom: 4 }}>Static errors</div>
+              <ul style={{ margin: 0, paddingLeft: 18 }}>
+                {verify.static.errors.map((e) => <li key={e} className="mono" style={{ color: "var(--red)" }}>{e}</li>)}
+              </ul>
+            </div>
+          )}
+          {verify.live.failures.length > 0 && (
+            <div>
+              <div className="mono" style={{ color: "var(--text-2)", marginBottom: 4 }}>Live read failures</div>
+              <ul style={{ margin: 0, paddingLeft: 18 }}>
+                {verify.live.failures.slice(0, 12).map((f) => (
+                  <li key={`${f.name}-${f.addr}`} className="mono" style={{ color: "var(--amber)" }}>
+                    {f.name} @{f.addr} fc={f.fc} → {f.error ?? "unknown"}
+                  </li>
+                ))}
+              </ul>
+              {verify.live.failures.length > 12 && (
+                <div className="mono" style={{ color: "var(--text-3)", marginTop: 4 }}>
+                  …and {verify.live.failures.length - 12} more
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
       <table className="reg-table">
         <thead>
           <tr><th>Address</th><th>Name</th><th>FC</th><th>Type</th><th>Scale</th><th>Unit</th><th>Last read</th></tr>
