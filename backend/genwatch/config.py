@@ -68,6 +68,30 @@ class AuthConfig(BaseModel):
     session_hours: int = 12
 
 
+class SlackConfig(BaseModel):
+    """Slack alerts via the Web API (chat.postMessage) using a bot token.
+
+    Create a Slack app at https://api.slack.com/apps, add the
+    ``chat:write`` scope, install it to your workspace, and invite the
+    bot user to the target channel. The token starts with ``xoxb-``.
+    """
+
+    enabled: bool = False
+    bot_token: str = ""        # xoxb-...
+    channel: str = ""          # "#alerts" or channel id "C0123ABCD"
+    site_label: str = ""       # overrides site.name in messages
+
+    # Which event types to forward to Slack. All default to True except
+    # state-change (chatty — a generator transitions through several
+    # states on a normal start) and warning-severity alarms.
+    alert_on_alarm: bool = True
+    alert_on_warning: bool = True
+    alert_on_alarm_cleared: bool = True
+    alert_on_state_change: bool = False
+    alert_on_command: bool = True
+    alert_on_comms_lost: bool = True
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="GENWATCH_",
@@ -87,6 +111,7 @@ class Settings(BaseSettings):
     modbus: ModbusConfig = Field(default_factory=ModbusConfig)
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
+    slack: SlackConfig = Field(default_factory=SlackConfig)
 
     # WebSocket push cadence — kept at prime poll by default per design
     ws_push_ms: int = 1500

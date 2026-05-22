@@ -5,6 +5,7 @@ import type {
   EventRow,
   MeBody,
   Reading,
+  SlackUpdate,
   StatusBody,
 } from "../types";
 
@@ -99,11 +100,22 @@ export const api = {
 
   // Settings
   config: () => request<any>("/api/config"),
-  updateConfig: (body: { serial?: any; modbus?: any; retention?: any; ws_push_ms?: number }) =>
-    request<{ ok: boolean; restart_required: boolean }>("/api/config", {
-      method: "PUT",
-      body: JSON.stringify(body),
-    }),
+  updateConfig: (body: {
+    serial?: any;
+    modbus?: any;
+    retention?: any;
+    slack?: SlackUpdate;
+    ws_push_ms?: number;
+  }) =>
+    request<{ ok: boolean; restart_required: boolean; slack_updated?: boolean }>(
+      "/api/config",
+      {
+        method: "PUT",
+        body: JSON.stringify(body),
+      }
+    ),
+  testSlack: () =>
+    request<{ ok: boolean; detail: string }>("/api/slack/test", { method: "POST" }),
   registers: () =>
     request<{
       path: string;
