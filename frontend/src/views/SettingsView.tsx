@@ -1,13 +1,14 @@
-// Settings view: serial port, modbus, register map, retention.
+// Settings view: serial port, modbus, register map, retention, alerts.
 // Saves go through PUT /api/config (admin-only) and require a restart for
 // serial/modbus changes — we surface that warning rather than try to
-// hot-reload the poller.
+// hot-reload the poller. Slack alert settings hot-reload immediately.
 
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { api } from "../api/client";
-import { Card, Icon, Pill } from "../components/primitives";
+import { Card, Icon, Pill, Switch } from "../components/primitives";
+import type { SlackConfigView, SlackUpdate } from "../types";
 
-type Section = "serial" | "modbus" | "registers" | "retention";
+type Section = "serial" | "modbus" | "registers" | "retention" | "alerts";
 
 interface Config {
   configPath: string;
@@ -16,12 +17,13 @@ interface Config {
   modbus: { slave: number; read_fc: number; prime_poll_ms: number; base_poll_ms: number; retries: number; register_file: string };
   retention: { raw_days: number; rollup_1m_days: number; rollup_1h_days: number; audit_days: number };
   auth: { operatorName: string; sessionHours: number; passwordConfigured: boolean; jwtSecretConfigured: boolean };
+  slack: SlackConfigView;
 }
 
 export function SettingsView() {
   const [section, setSection] = useState<Section>("serial");
   const [cfg, setCfg] = useState<Config | null>(null);
-  const [dirty, setDirty] = useState<Partial<{ serial: any; modbus: any; retention: any }>>({});
+  const [dirty, setDirty] = useState<Partial<{ serial: any; modbus: any; retention: any; slack: SlackUpdate }>>({});
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -36,6 +38,7 @@ export function SettingsView() {
     serial: { ...cfg.serial, ...(dirty.serial || {}) },
     modbus: { ...cfg.modbus, ...(dirty.modbus || {}) },
     retention: { ...cfg.retention, ...(dirty.retention || {}) },
+    slack: { ...cfg.slack, ...(dirty.slack || {}) },
   };
   const hasDirty = Object.keys(dirty).length > 0;
 
@@ -45,9 +48,15 @@ export function SettingsView() {
     setSaved(null);
     try {
       const r = await api.updateConfig(dirty as any);
-      setSaved(r.restart_required
-        ? "Saved. Restart genwatch.service for changes to take effect."
-        : "Saved.");
+      let message = "Saved.";
+      if (r.restart_required) {
+        message = r.slack_updated
+          ? "Saved. Slack updated live · restart genwatch.service for serial/modbus changes."
+          : "Saved. Restart genwatch.service for changes to take effect.";
+      } else if (r.slack_updated) {
+        message = "Saved · Slack alerts updated live.";
+      }
+      setSaved(message);
       setDirty({});
       const fresh = await api.config();
       setCfg(fresh);
@@ -63,6 +72,7 @@ export function SettingsView() {
     { id: "modbus", label: "Modbus", icon: "cpu" },
     { id: "registers", label: "Register Map", icon: "list" },
     { id: "retention", label: "Retention", icon: "history" },
+    { id: "alerts", label: "Alerts · Slack", icon: "bell" },
   ];
 
   return (
@@ -111,6 +121,13 @@ export function SettingsView() {
             <RetentionSection
               v={effective.retention}
               set={(patch) => setDirty((d) => ({ ...d, retention: { ...(d.retention || {}), ...patch } }))}
+            />
+          )}
+          {section === "alerts" && (
+            <SlackSection
+              v={effective.slack}
+              dirty={dirty.slack ?? {}}
+              set={(patch) => setDirty((d) => ({ ...d, slack: { ...(d.slack || {}), ...patch } }))}
             />
           )}
         </div>
@@ -231,8 +248,8 @@ function RegisterMapSection() {
         </thead>
         <tbody>
           {Object.entries(grouped).map(([group, regs]) => (
-            <>
-              <tr key={group} className="group"><td colSpan={7}>{group}</td></tr>
+            <Fragment key={group}>
+              <tr className="group"><td colSpan={7}>{group}</td></tr>
               {regs.map((r) => (
                 <tr key={r.addr + r.name}>
                   <td className="mono">{r.addr}</td>
@@ -246,7 +263,7 @@ function RegisterMapSection() {
                   </td>
                 </tr>
               ))}
-            </>
+            </Fragment>
           ))}
         </tbody>
       </table>
@@ -257,6 +274,184 @@ function RegisterMapSection() {
 function formatValue(v: number): string {
   if (Number.isInteger(v)) return v.toLocaleString();
   return v.toFixed(2);
+}
+
+function SlackSection({
+  v, dirty, set,
+}: {
+  v: SlackConfigView;
+  dirty: SlackUpdate;
+  set: (patch: SlackUpdate) => void;
+}) {
+  // Token UX: don't show the existing token (we don't have it client-side
+  // anyway). Display "Configured" badge when the server reports one;
+  // expose an input to change it. An empty string in the input + Save
+  // explicitly clears it.
+  const tokenWasSet = v.botTokenConfigured;
+  const tokenDirty = dirty.bot_token !== undefined;
+  const [revealing, setRevealing] = useState(!tokenWasSet);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{ ok: boolean; detail: string } | null>(null);
+
+  const runTest = async () => {
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const r = await api.testSlack();
+      setTestResult(r);
+    } catch (e: any) {
+      setTestResult({ ok: false, detail: e?.body?.detail ?? e?.message ?? "test failed" });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  return (
+    <div className="settings-section">
+      <div className="settings-head">
+        <h2>Slack alerts</h2>
+        <p>
+          Forward alarms, operator commands, and Modbus comms changes to a Slack channel via the
+          Web API. Requires a Slack bot token (<span className="mono">xoxb-…</span>) with the{" "}
+          <span className="mono">chat:write</span> scope and the bot invited to the target channel.
+          Changes apply immediately — no restart required.
+        </p>
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">Enabled <span className="desc">master switch</span></div>
+        <Switch value={!!v.enabled} onChange={(b) => set({ enabled: b })} />
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">Channel <span className="desc">e.g. #genwatch-alerts or C0123ABCD</span></div>
+        <input
+          className="input"
+          placeholder="#genwatch-alerts"
+          value={v.channel}
+          onChange={(e) => set({ channel: e.target.value })}
+        />
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">Site label <span className="desc">overrides site.name in messages</span></div>
+        <input
+          className="input"
+          placeholder={`(uses site name)`}
+          value={v.siteLabel}
+          onChange={(e) => set({ site_label: e.target.value })}
+        />
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">
+          Bot token <span className="desc">xoxb-… · stored on disk; never returned by API</span>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {!revealing && tokenWasSet ? (
+            <div className="flex ai-c gap-8">
+              <Pill tone="ok">Configured</Pill>
+              <button className="btn btn-ghost" onClick={() => { setRevealing(true); set({ bot_token: "" }); }}>
+                Change…
+              </button>
+            </div>
+          ) : (
+            <>
+              <input
+                className="input mono"
+                type="password"
+                placeholder="xoxb-…"
+                autoComplete="off"
+                spellCheck={false}
+                value={dirty.bot_token ?? ""}
+                onChange={(e) => set({ bot_token: e.target.value })}
+              />
+              {tokenDirty && (
+                <div style={{ fontSize: 11.5, color: "var(--text-3)" }}>
+                  {dirty.bot_token === ""
+                    ? "Save with an empty value to clear the token."
+                    : "Token will be saved to /etc/genwatch/config.yaml."}
+                </div>
+              )}
+              {tokenWasSet && (
+                <button
+                  className="btn btn-ghost"
+                  style={{ alignSelf: "flex-start" }}
+                  onClick={() => { setRevealing(false); set({ bot_token: undefined as any }); }}
+                >
+                  Keep existing token
+                </button>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+
+      <div className="settings-head" style={{ marginTop: 16, paddingTop: 14, borderTop: "1px solid var(--border)" }}>
+        <h2 style={{ fontSize: 13 }}>Event types</h2>
+        <p>Pick which events forward to Slack. State-change is off by default — it can be chatty.</p>
+      </div>
+
+      <SlackToggle label="Alarms"
+        desc="Alarm-severity events (shutdowns, overspeed, overcrank…)"
+        value={v.alertOnAlarm} onChange={(b) => set({ alert_on_alarm: b })} />
+      <SlackToggle label="Warnings"
+        desc="Warn-severity events (low battery, charger failure, …)"
+        value={v.alertOnWarning} onChange={(b) => set({ alert_on_warning: b })} />
+      <SlackToggle label="Alarm cleared"
+        desc="Operator-ack and auto-clears"
+        value={v.alertOnAlarmCleared} onChange={(b) => set({ alert_on_alarm_cleared: b })} />
+      <SlackToggle label="Operator commands"
+        desc="Start, stop, exercise, transfer"
+        value={v.alertOnCommand} onChange={(b) => set({ alert_on_command: b })} />
+      <SlackToggle label="Modbus comms"
+        desc="Comms lost / recovered"
+        value={v.alertOnCommsLost} onChange={(b) => set({ alert_on_comms_lost: b })} />
+      <SlackToggle label="Engine state transitions"
+        desc="Every stopped/cranking/running/cooling change — chatty"
+        value={v.alertOnStateChange} onChange={(b) => set({ alert_on_state_change: b })} />
+
+      <div className="field-row" style={{ marginTop: 14, paddingTop: 14, borderTop: "1px solid var(--border)" }}>
+        <div className="lbl">Test message
+          <span className="desc">posts a one-shot message to the configured channel</span></div>
+        <div className="flex ai-c gap-8">
+          <button
+            className="btn"
+            disabled={testing || !v.enabled || !v.channel || (!v.botTokenConfigured && !dirty.bot_token)}
+            onClick={runTest}
+          >
+            {testing ? "Sending…" : "Send test"}
+          </button>
+          {testResult && (
+            <Pill tone={testResult.ok ? "ok" : "alarm"}>
+              {testResult.ok ? "Sent" : testResult.detail}
+            </Pill>
+          )}
+        </div>
+      </div>
+      {!v.botTokenConfigured && !dirty.bot_token && (
+        <div style={{
+          marginTop: 8, padding: 10, borderRadius: 7, fontSize: 12,
+          background: "var(--panel-2)", border: "1px solid var(--border)", color: "var(--text-3)",
+        }}>
+          Save the bot token first, then the Send test button enables.
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SlackToggle({
+  label, desc, value, onChange,
+}: {
+  label: string; desc: string; value: boolean; onChange: (b: boolean) => void;
+}) {
+  return (
+    <div className="field-row">
+      <div className="lbl">{label} <span className="desc">{desc}</span></div>
+      <Switch value={!!value} onChange={onChange} />
+    </div>
+  );
 }
 
 function RetentionSection({ v, set }: { v: Config["retention"]; set: (patch: Partial<Config["retention"]>) => void }) {

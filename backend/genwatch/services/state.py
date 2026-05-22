@@ -112,17 +112,30 @@ class StateMachine:
                             message=f"Alarm cleared — <em>{ac.desc}</em>",
                             meta=f"code {ac.code}",
                         )
-                        emitted.append({"type": "alarm-cleared", "code": ac.code, "ts": time.time()})
+                        emitted.append({
+                            "type": "alarm-cleared",
+                            "code": ac.code,
+                            "desc": ac.desc,
+                            "ts": time.time(),
+                        })
                         log.info("Alarm cleared: %s", ac.code)
 
-        # Comms transition logging
+        # Comms transition logging + event
         if comms.state != self.snap.comms.state:
+            old_comms = self.snap.comms.state
             self.db.write_event(
                 severity="warn" if comms.state != "healthy" else "ok",
                 type_="COMMS",
                 message=f"Comms <em>{comms.state}</em> · {comms.success_pct:.1f}% success",
                 meta=None,
             )
+            emitted.append({
+                "type": "comms",
+                "from": old_comms,
+                "to": comms.state,
+                "successPct": comms.success_pct,
+                "ts": time.time(),
+            })
         self.snap.comms = comms
         self.snap.last_reading = reading
         return emitted

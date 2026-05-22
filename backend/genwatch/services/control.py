@@ -21,11 +21,15 @@ import logging
 import secrets
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from ..db import Database
 from ..modbus.client import ModbusClient
 from ..modbus.registers import ControlDef, RegisterMap
 from .state import StateMachine
+
+if TYPE_CHECKING:
+    from .slack import SlackNotifier
 
 log = logging.getLogger("genwatch.control")
 
@@ -64,11 +68,19 @@ class ControlError(Exception):
 
 
 class ControlService:
-    def __init__(self, regmap: RegisterMap, client: ModbusClient, db: Database, state: StateMachine):
+    def __init__(
+        self,
+        regmap: RegisterMap,
+        client: ModbusClient,
+        db: Database,
+        state: StateMachine,
+        slack: "SlackNotifier | None" = None,
+    ):
         self.regmap = regmap
         self.client = client
         self.db = db
         self.state = state
+        self.slack = slack
         self._tokens: dict[str, ConfirmToken] = {}
         self._lock = asyncio.Lock()
 
@@ -144,6 +156,7 @@ class ControlService:
         # Write the Modbus register.
         log.warning("CONTROL %s by %s -> %s @0x%04X = %d", verb, operator, ctl.name, ctl.addr, ctl.value)
         res = await self.client.write(ctl.addr, ctl.value, fc=ctl.fc)
+        ts = time.time()
         if not res.ok:
             self.db.write_audit(operator, f"control.{verb}", res.error or "modbus_write_failed", token, "failed")
             self.db.write_event(
@@ -152,6 +165,8 @@ class ControlService:
                 message=f"Operator command <em>{verb}</em> — Modbus write failed",
                 meta=res.error or "",
             )
+            if self.slack is not None:
+                await self.slack.alert_command(verb, operator, "failed", ts)
             raise ControlError("modbus_failed", f"Modbus write failed: {res.error}", 502)
 
         self.db.write_audit(
@@ -167,4 +182,6 @@ class ControlService:
             message=f"Operator command <em>{verb}</em> — confirmed",
             meta=operator,
         )
+        if self.slack is not None:
+            await self.slack.alert_command(verb, operator, "ok", ts)
         return {"ok": True, "verb": verb, "register": ctl.name, "addr": ctl.addr, "value": ctl.value}

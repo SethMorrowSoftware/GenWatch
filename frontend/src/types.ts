@@ -111,3 +111,33 @@ export interface MeBody {
   operator?: string;
   role?: Role;
 }
+
+// Returned by GET /api/config.slack — the bot token itself is never
+// exposed; only a flag confirming it is set on disk.
+export interface SlackConfigView {
+  enabled: boolean;
+  channel: string;
+  siteLabel: string;
+  botTokenConfigured: boolean;
+  alertOnAlarm: boolean;
+  alertOnWarning: boolean;
+  alertOnAlarmCleared: boolean;
+  alertOnStateChange: boolean;
+  alertOnCommand: boolean;
+  alertOnCommsLost: boolean;
+}
+
+// Sent in PUT /api/config.slack — omit a field to leave it unchanged.
+// Set bot_token to "" to explicitly clear it.
+export interface SlackUpdate {
+  enabled?: boolean;
+  bot_token?: string;
+  channel?: string;
+  site_label?: string;
+  alert_on_alarm?: boolean;
+  alert_on_warning?: boolean;
+  alert_on_alarm_cleared?: boolean;
+  alert_on_state_change?: boolean;
+  alert_on_command?: boolean;
+  alert_on_comms_lost?: boolean;
+}

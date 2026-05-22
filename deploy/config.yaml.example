@@ -61,6 +61,31 @@ auth:
   operator_name: operator
   session_hours: 12
 
+# ─── Slack alerts ─────────────────────────────────────────────────────────
+# Forwards alarms, alarm-clears, operator commands, and (optionally)
+# state/comms transitions to a Slack channel.
+#
+# Setup:
+#   1. Create a Slack app:  https://api.slack.com/apps  →  "From scratch"
+#   2. OAuth & Permissions  →  Bot Token Scopes  →  add  chat:write
+#   3. Install to workspace  →  copy the "Bot User OAuth Token" (xoxb-...)
+#   4. Invite the bot to your alert channel:  /invite @YourBotName
+#   5. Paste the token below, set enabled: true, set channel, restart.
+#
+# Slack settings can also be edited through the Settings → Alerts page
+# in the UI (admin role); the UI hot-reloads without a service restart.
+slack:
+  enabled: false
+  bot_token: ""           # xoxb-... — keep secret! file mode is 0640.
+  channel: ""             # "#genwatch-alerts" or channel id "C0123ABCD"
+  site_label: ""          # overrides site.name in Slack messages, optional
+  alert_on_alarm: true            # alarm-severity events (engine shutdowns, etc.)
+  alert_on_warning: true          # warn-severity events (low battery, etc.)
+  alert_on_alarm_cleared: true    # operator-ack and auto-clears
+  alert_on_state_change: false    # every stopped/cranking/running/cooling — chatty
+  alert_on_command: true          # operator-issued start/stop/exercise/transfer
+  alert_on_comms_lost: true       # Modbus link lost / recovered
+
 # WebSocket push cadence (ms). Leave at prime_poll_ms unless the UI
 # feels sluggish.
 ws_push_ms: 1500

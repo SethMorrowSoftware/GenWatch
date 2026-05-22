@@ -40,6 +40,7 @@ from .services import notify
 from .services.control import ControlService
 from .services.ratelimit import RateLimiter
 from .services.retention import RetentionService
+from .services.slack import SlackNotifier
 from .services.state import EventBus, StateMachine
 
 log = logging.getLogger("genwatch")
@@ -115,7 +116,8 @@ async def lifespan(app: FastAPI):
 
     bus = EventBus()
     state_machine = StateMachine(regmap, db, bus)
-    control_service = ControlService(regmap, client, db, state_machine)
+    slack = SlackNotifier(settings.slack, db, site_name=regmap.site.name)
+    control_service = ControlService(regmap, client, db, state_machine, slack=slack)
 
     # Poller callback: persist telemetry, update state machine, push to WS bus.
     async def on_poll(tier, reading, comms):
@@ -156,9 +158,14 @@ async def lifespan(app: FastAPI):
             }
             await bus.publish(payload)
 
-        # Fire transition/alarm events as separate messages.
+        # Fire transition/alarm events as separate messages, and forward
+        # them to Slack (best-effort — failures are logged, not raised).
         for evt in emitted:
             await bus.publish(evt)
+            try:
+                await _forward_to_slack(slack, evt)
+            except Exception as e:  # noqa: BLE001
+                log.exception("slack forward failed: %s", e)
 
     poller = Poller(client, regmap, on_poll)
     retention = RetentionService(db, settings.retention)
@@ -176,11 +183,13 @@ async def lifespan(app: FastAPI):
     app.state.control = control_service
     app.state.poller = poller
     app.state.retention = retention
+    app.state.slack = slack
     app.state.login_limiter = login_limiter
     app.state.version = __version__
     app.state.started_at = time.time()
 
     db.write_event("info", "BOOT", f"GenWatch v{__version__} starting", "mock" if settings.mock else "live")
+    await slack.start()
     await poller.start()
     await retention.start()
 
@@ -216,8 +225,47 @@ async def lifespan(app: FastAPI):
                 pass
         await poller.stop()
         await retention.stop()
+        await slack.stop()
         await client.close()
         db.write_event("info", "BOOT", "GenWatch stopped", None)
+
+
+async def _forward_to_slack(slack: SlackNotifier, evt: dict) -> None:
+    """Dispatch a state machine event to the Slack notifier.
+
+    The notifier itself decides whether to send (config flags + queue).
+    This function just maps event-shape to the right call.
+    """
+    if not slack.is_enabled():
+        return
+    t = evt.get("type")
+    ts = float(evt.get("ts") or time.time())
+    if t == "alarm":
+        await slack.alert_alarm(
+            code=str(evt.get("code", "")),
+            desc=str(evt.get("desc", "")),
+            severity=str(evt.get("severity", "alarm")),
+            ts=ts,
+        )
+    elif t == "alarm-cleared":
+        await slack.alert_alarm_cleared(
+            code=str(evt.get("code", "")),
+            desc=str(evt.get("desc", "")),
+            ts=ts,
+        )
+    elif t == "transition":
+        await slack.alert_state_change(
+            old=str(evt.get("from", "")),
+            new=str(evt.get("to", "")),
+            ts=ts,
+        )
+    elif t == "comms":
+        await slack.alert_comms_change(
+            old=str(evt.get("from", "")),
+            new=str(evt.get("to", "")),
+            success_pct=float(evt.get("successPct", 0.0)),
+            ts=ts,
+        )
 
 
 def _reading_to_ui(values: dict) -> dict:
