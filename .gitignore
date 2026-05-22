@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Runtime
+var-genwatch/
+/tmp/gw-*
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

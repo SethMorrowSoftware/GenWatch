@@ -1,0 +1,128 @@
+# GenWatch — Generac H-100 register map
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# The Generac H-100 controller exposes Modbus RTU over RS-485 on its rear
+# Modbus port. The register layout below matches what is shipped in the
+# design handoff and is consistent with publicly documented H-100 / HSB
+# implementations. However: real installations vary by firmware version
+# and by what the dealer has enabled. Treat this file as the *default*
+# and override per-site by editing the values and reloading from the
+# Settings UI (or by editing /etc/genwatch/registers/h100.yaml on disk
+# and POST /api/registers/reload).
+#
+# CONVENTIONS
+# -----------
+#   addr   : Modbus register address (decimal). Hex shown in name comments.
+#   fc     : Function code. 3=read holding, 4=read input, 6=write single,
+#            16=write multiple.
+#   type   : u16 | s16 | u32 | s32 | bitfld | enum
+#   scale  : multiply raw integer by this to get engineering units
+#            (e.g. 0.1 means raw 1798 -> 179.8). Default 1.
+#   tier   : prime | base. Prime registers poll fast (state & alarms),
+#            base registers poll slower (slow-changing telemetry).
+#   group  : free-text grouping for the Settings UI register table.
+#   warn_range / alarm_range : optional [lo, hi] tuples. If the decoded
+#            value falls outside the range, GenWatch raises a soft warning
+#            or alarm event. Engine hardware safeties remain primary.
+#
+# SAFETY
+# ------
+# Write-gated registers (FC06) are *commands*. They are protected by the
+# confirm-token flow in /api/control/*. Do NOT add registers to this file
+# with fc:6 unless they are intentional control surfaces — anything with
+# fc:6 is exposed to the operator as a control button on the Live view.
+
+site:
+  id: SITE-23
+  name: "Generac H-100"
+  rating_kw: 200
+  engine: "Cummins QSB7-G5"
+  tank_gal: 220
+  exercise:
+    enabled: true
+    day: sun        # mon|tue|wed|thu|fri|sat|sun
+    time: "03:00"   # 24h local
+    duration_min: 30
+    quiet: true
+
+modbus:
+  slave: 100        # 0x64
+  read_fc: 3        # 0x03 — read holding (H-100 default)
+  prime_poll_ms: 1500
+  base_poll_ms: 15000
+  timeout_s: 1.5
+  retries: 2
+  backoff_s: [0.25, 0.5, 1.0]   # per retry attempt
+
+# ─── State / alarm decoding tables ────────────────────────────────────────
+# Raw register -> engine state enum. The H-100 typically reports a small
+# enum in 0x0001. Adjust the right-hand keys if your firmware differs;
+# the canonical states are: stopped | cranking | running | exercising |
+# cooling | alarm.
+engine_state_map:
+  0: stopped
+  1: cranking
+  2: running
+  3: running     # H-100 sometimes splits "running unloaded" vs "on load"
+  4: exercising
+  5: cooling
+  6: alarm
+  255: alarm     # firmware fault sentinel
+
+# alarm_state register — anything non-zero means an alarm is active.
+# The bitfield/value -> human description is in alarm_codes below.
+alarm_codes:
+  - { code: "0x40", desc: "Overcrank",              severity: alarm }
+  - { code: "0x41", desc: "Overspeed",              severity: alarm }
+  - { code: "0x42", desc: "Low Oil Pressure",       severity: alarm }
+  - { code: "0x43", desc: "High Engine Temp",       severity: alarm }
+  - { code: "0x44", desc: "Emergency Stop",         severity: alarm }
+  - { code: "0x52", desc: "Low Coolant Level",      severity: alarm }
+  - { code: "0x60", desc: "Low Battery",            severity: warn  }
+  - { code: "0x61", desc: "Charger Failure",        severity: warn  }
+  - { code: "0x70", desc: "Comms Loss (RS-485)",    severity: warn  }
+  - { code: "0x71", desc: "HTS-1 Not Responding",   severity: warn  }
+
+# ─── Read registers ───────────────────────────────────────────────────────
+# Prime tier — polled every prime_poll_ms (state, alarms, switch).
+# Base tier  — polled every base_poll_ms (slow telemetry).
+registers:
+  # Prime poll · 1.5 s
+  - { name: engine_state,   addr: 0x0001, fc: 3, type: u16,    tier: prime, group: "State", unit: enum }
+  - { name: alarm_state,    addr: 0x0002, fc: 3, type: u16,    tier: prime, group: "State", unit: enum }
+  - { name: switch_state,   addr: 0x0003, fc: 3, type: bitfld, tier: prime, group: "State", unit: bits }
+
+  # Base poll · 15 s — engine telemetry
+  - { name: rpm,            addr: 0x0010, fc: 3, type: u16, tier: base, group: "Engine", unit: rpm,  warn_range: [1750, 1850] }
+  - { name: oil_pressure,   addr: 0x0011, fc: 3, type: u16, tier: base, group: "Engine", unit: psi,  warn_range: [35, 80] }
+  - { name: coolant_temp,   addr: 0x0012, fc: 3, type: u16, tier: base, group: "Engine", unit: F,    warn_range: [170, 210], alarm_range: [120, 235] }
+  - { name: battery_volts,  addr: 0x0013, fc: 3, type: u16, tier: base, group: "Engine", unit: V,    scale: 0.1, warn_range: [12.6, 14.6] }
+
+  # Base poll · 15 s — electrical (line-to-line voltages on phases A/B/C)
+  - { name: gen_voltage_ab, addr: 0x0020, fc: 3, type: u16, tier: base, group: "Electrical", unit: V }
+  - { name: gen_voltage_bc, addr: 0x0021, fc: 3, type: u16, tier: base, group: "Electrical", unit: V }
+  - { name: gen_voltage_ca, addr: 0x0022, fc: 3, type: u16, tier: base, group: "Electrical", unit: V }
+  - { name: gen_current_a,  addr: 0x0023, fc: 3, type: u16, tier: base, group: "Electrical", unit: A }
+  - { name: gen_current_b,  addr: 0x0024, fc: 3, type: u16, tier: base, group: "Electrical", unit: A }
+  - { name: gen_current_c,  addr: 0x0025, fc: 3, type: u16, tier: base, group: "Electrical", unit: A }
+  - { name: frequency,      addr: 0x0026, fc: 3, type: u16, tier: base, group: "Electrical", unit: Hz, scale: 0.1 }
+  - { name: total_kw,       addr: 0x0028, fc: 3, type: u16, tier: base, group: "Electrical", unit: kW }
+
+  # Base poll · 60 s — accumulators
+  - { name: run_hours,      addr: 0x0030, fc: 3, type: u32, tier: base, group: "Maintenance", unit: h, scale: 0.1 }
+  - { name: start_count,    addr: 0x0032, fc: 3, type: u32, tier: base, group: "Maintenance", unit: count }
+  - { name: fuel_level_pct, addr: 0x0034, fc: 3, type: u16, tier: base, group: "Maintenance", unit: pct }
+
+# ─── Write-gated control registers ────────────────────────────────────────
+# Each command writes value -> register via FC06. The confirm-token flow
+# enforces operator role + acknowledgement + token freshness before any
+# write fires. The "value" below is what gets written when the command is
+# invoked — most H-100 controllers latch on rising edge so writing 1 once
+# is sufficient. Adjust per site if your firmware requires a different
+# magic number.
+controls:
+  - { name: remote_start, addr: 0x00A0, fc: 6, value: 1, desc: "Crank engine and transfer to generator" }
+  - { name: remote_stop,  addr: 0x00A1, fc: 6, value: 1, desc: "Initiate cool-down then engine-off" }
+  - { name: exercise,     addr: 0x00A2, fc: 6, value: 1, desc: "Begin 30-minute unloaded quiet test" }
+  - { name: transfer,     addr: 0x00A3, fc: 6, value: 1, desc: "HTS-1 transfer back to utility" }
