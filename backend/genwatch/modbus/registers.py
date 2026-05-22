@@ -107,6 +107,16 @@ class RegisterMap:
         return next((a for a in self.alarm_codes if a.value == raw), None)
 
 
+@dataclass(frozen=True)
+class MapValidation:
+    errors: list[str]
+    warnings: list[str]
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+
 def _coerce_addr(v) -> int:
     if isinstance(v, int):
         return v
@@ -122,6 +132,56 @@ def _coerce_range(v):
     if not isinstance(v, (list, tuple)) or len(v) != 2:
         raise ValueError(f"range must be [lo, hi], got {v!r}")
     return (float(v[0]), float(v[1]))
+
+
+def validate_register_map(rm: RegisterMap) -> MapValidation:
+    """Validate safety and structural invariants for a register map."""
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if not (1 <= rm.slave <= 247):
+        errors.append(f"modbus.slave must be 1..247 (got {rm.slave})")
+    if rm.read_fc not in (3, 4):
+        errors.append(f"modbus.read_fc must be 3 or 4 (got {rm.read_fc})")
+
+    by_name: set[str] = set()
+    occupied_words: dict[int, str] = {}
+    for r in rm.registers:
+        if r.name in by_name:
+            errors.append(f"duplicate register name: {r.name}")
+        by_name.add(r.name)
+
+        if r.fc not in (3, 4):
+            errors.append(f"register '{r.name}' has unsupported read fc {r.fc} (expected 3/4)")
+        if r.tier not in ("prime", "base"):
+            errors.append(f"register '{r.name}' has invalid tier '{r.tier}'")
+        if r.addr < 0 or r.addr > 0xFFFF:
+            errors.append(f"register '{r.name}' addr out of 16-bit range: {r.addr}")
+
+        for w in range(r.addr, r.addr + r.words):
+            prior = occupied_words.get(w)
+            if prior and prior != r.name:
+                errors.append(f"register word overlap at 0x{w:04X}: '{prior}' vs '{r.name}'")
+            occupied_words[w] = r.name
+
+    control_names: set[str] = set()
+    for c in rm.controls.values():
+        if c.name in control_names or c.name in by_name:
+            errors.append(f"duplicate control name: {c.name}")
+        control_names.add(c.name)
+        if c.fc not in (6, 16):
+            errors.append(f"control '{c.name}' has unsupported write fc {c.fc} (expected 6/16)")
+        if c.addr < 0 or c.addr > 0xFFFF:
+            errors.append(f"control '{c.name}' addr out of 16-bit range: {c.addr}")
+        if c.addr in occupied_words:
+            errors.append(f"control '{c.name}' overlaps read register '{occupied_words[c.addr]}' at 0x{c.addr:04X}")
+
+    if not rm.registers:
+        errors.append("register map has no read registers")
+    if not rm.controls:
+        warnings.append("register map has no control registers")
+
+    return MapValidation(errors=errors, warnings=warnings)
 
 
 def load_register_map(path: Path | str) -> RegisterMap:
@@ -193,7 +253,7 @@ def load_register_map(path: Path | str) -> RegisterMap:
         )
         controls[d.name] = d
 
-    return RegisterMap(
+    rm = RegisterMap(
         path=p,
         site=site,
         slave=slave,
@@ -209,6 +269,10 @@ def load_register_map(path: Path | str) -> RegisterMap:
         controls=controls,
         raw=data,
     )
+    report = validate_register_map(rm)
+    if report.errors:
+        raise ValueError("; ".join(report.errors))
+    return rm
 
 
 def decode_value(reg: RegisterDef, words: list[int]) -> float | int | None:

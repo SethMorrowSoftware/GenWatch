@@ -3,10 +3,12 @@ from pathlib import Path
 import pytest
 
 from genwatch.modbus.registers import (
+    ControlDef,
     RegisterDef,
     batch_reads,
     decode_value,
     load_register_map,
+    validate_register_map,
 )
 
 
@@ -78,3 +80,14 @@ def test_batch_reads_respects_max_words():
     assert len(batches) >= 2
     for _, count in batches:
         assert count <= 64
+
+
+def test_validate_register_map_detects_overlap_and_bad_fc(regmap):
+    bad = regmap.registers[0]
+    regmap.registers.append(RegisterDef(name="overlap", addr=bad.addr, type="u16", fc=3))
+    regmap.controls["bad_ctl"] = ControlDef(name="bad_ctl", addr=0x200, fc=5, value=1)
+
+    report = validate_register_map(regmap)
+    assert not report.ok
+    assert any("overlap" in e for e in report.errors)
+    assert any("unsupported write fc" in e for e in report.errors)
