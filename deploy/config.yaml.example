@@ -1,0 +1,51 @@
+# GenWatch example config. Install to /etc/genwatch/config.yaml.
+#
+# Most installations only need to:
+#   1. Set auth.admin_password_hash (from `genwatch hash <password>`)
+#   2. Set auth.jwt_secret           (from `genwatch gensecret`)
+#   3. Verify serial.device matches your USB-RS485 adapter
+#   4. Tweak modbus.slave if your H-100 isn't on 100 (0x64)
+#
+# Anything not set here falls back to the package defaults.
+
+# Set to true to disable real serial I/O. The poller will synthesise
+# plausible telemetry — handy for setting up the UI before you have
+# RS-485 wiring done.
+mock: false
+
+serial:
+  device: /dev/ttyUSB0
+  baud: 9600
+  parity: N
+  stopbits: 1
+  bytesize: 8
+  timeout_s: 1.5
+
+modbus:
+  slave: 100              # 0x64
+  read_fc: 3              # 0x03 — read holding registers
+  prime_poll_ms: 1500
+  base_poll_ms: 15000
+  retries: 2
+  # Path is resolved against the package's bundled registers/ dir if
+  # relative, else absolute. Edit registers/h100.yaml in-place to adjust
+  # per-site addresses; reload via POST /api/registers/reload (admin).
+  register_file: registers/h100.yaml
+
+retention:
+  raw_days: 7
+  rollup_1m_days: 90
+  rollup_1h_days: 730
+  audit_days: 0          # 0 = never delete audit log
+
+auth:
+  # bcrypt hash — generate with: genwatch hash <password>
+  admin_password_hash: "REPLACE_ME"
+  # JWT signing secret — generate with: genwatch gensecret
+  jwt_secret: "REPLACE_ME"
+  operator_name: operator
+  session_hours: 12
+
+# How often to push live snapshots over the WebSocket (ms). Defaults to
+# the prime poll cadence.
+ws_push_ms: 1500
