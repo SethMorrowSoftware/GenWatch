@@ -200,11 +200,15 @@ def _doctor(args: list[str]) -> int:
     if err or result is None or not getattr(result, "ok", False):
         reason = err or getattr(result, "error", "unknown")
         print(f"  Modbus:   NO RESPONSE from slave {rm.slave} at 0x{opts.probe_addr:04X} ({reason})")
-        print("            Things to check:")
-        print("              · A/B (D+/D-) lines — try swapping")
-        print("              · 120Ω termination at both ends of the RS-485 bus")
-        print("              · GND wire from adapter to controller")
-        print("              · Baud rate / parity match the H-100 setting")
+        print("            Things to check (the H-100 RS-232 port is the factory-default")
+        print("            Modbus slave; RS-485 is master by default and won't respond unless")
+        print("            you've reconfigured it):")
+        print("              · Cable to the correct port (RS-232 slave by default)")
+        print("              · RS-232: TX↔RX crossover — use the Generac 0F7707 cable or")
+        print("                a USB-to-DB9 cable + DB9 null-modem adapter inline")
+        print("              · RS-485 (advanced): A/B swap, 120Ω termination at both ends, GND")
+        print(f"              · Baud / parity / stop bits match the panel "
+              f"(currently {settings.serial.baud} {settings.serial.bytesize}{settings.serial.parity}{settings.serial.stopbits})")
         print(f"              · Slave ID — H-100 default is 100 (0x64); currently set to {rm.slave}")
         rc = 1
     else:

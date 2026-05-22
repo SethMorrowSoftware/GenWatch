@@ -124,10 +124,10 @@ function SerialSection({ v, set }: { v: Config["serial"]; set: (patch: Partial<C
     <div className="settings-section">
       <div className="settings-head">
         <h2>Serial port</h2>
-        <p>USB-RS485 adapter. Restart required after changes.</p>
+        <p>USB-to-serial adapter (RS-232 by default; RS-485 if reconfigured). Restart required after changes.</p>
       </div>
       <div className="field-row">
-        <div className="lbl">Device <span className="desc">/dev/ttyUSB0 or /dev/serial0</span></div>
+        <div className="lbl">Device <span className="desc">/dev/genwatch-modbus, /dev/ttyUSB0, or /dev/serial0</span></div>
         <input className="input" value={v.device} onChange={(e) => set({ device: e.target.value })} />
       </div>
       <div className="field-row">
