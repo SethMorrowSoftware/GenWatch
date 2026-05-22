@@ -252,12 +252,14 @@ function RegisterMapSection() {
     <Card title={`Register map — ${data.path.split("/").pop()}`}
           sub={`slave ${data.slave} · ${data.registers.length} registers`}
           actions={
-            <button className="btn btn-ghost" disabled={reloading || verifying} onClick={onReload}>
-              <Icon name="refresh" size={14} /> {reloading ? "…" : "Reload"}
-            </button>
-            <button className="btn btn-primary" disabled={reloading || verifying} onClick={onVerify}>
-              <Icon name="check" size={14} /> {verifying ? "Verifying…" : "Verify map"}
-            </button>
+            <>
+              <button className="btn btn-ghost" disabled={reloading || verifying} onClick={onReload}>
+                <Icon name="refresh" size={14} /> {reloading ? "…" : "Reload"}
+              </button>
+              <button className="btn btn-primary" disabled={reloading || verifying} onClick={onVerify}>
+                <Icon name="check" size={14} /> {verifying ? "Verifying…" : "Verify map"}
+              </button>
+            </>
           }
           flush>
       {verifyErr && (

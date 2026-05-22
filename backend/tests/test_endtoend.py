@@ -7,13 +7,10 @@ control flow accepts a valid token + rejects a bad one.
 from __future__ import annotations
 
 import asyncio
-import os
-import tempfile
 
 import httpx
 import pytest
 
-from genwatch.config import load
 from genwatch.main import create_app
 from genwatch.services.auth import hash_password
 

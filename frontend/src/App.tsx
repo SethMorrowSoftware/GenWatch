@@ -1,6 +1,6 @@
 // Top-level app: auth gate, topbar + nav + footer, view switching.
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api/client";
 import { Icon } from "./components/primitives";
 import { useLiveData } from "./hooks/useLiveData";
@@ -41,12 +41,6 @@ function Shell({ auth, view, setView, onLogout }: {
     return () => clearInterval(t);
   }, []);
 
-  // Re-render once a second so the time-in-state ticks
-  useEffect(() => {
-    const t = setInterval(() => setClock((c) => new Date(c.getTime() + 1)), 1000);
-    return () => clearInterval(t);
-  }, []);
-
   const navItems: Array<{ id: View; label: string; icon: any }> = [
     { id: "live", label: "Live", icon: "activity" },
     { id: "history", label: "History", icon: "history" },
@@ -63,10 +57,20 @@ function Shell({ auth, view, setView, onLogout }: {
   });
 
   // Bump timeInState locally each second between WS pushes for smooth UI.
-  const tickedStatus = status ? {
-    ...status,
-    timeInState: status.timeInState + Math.floor((Date.now() / 1000) - status.serverTs),
-  } : null;
+  // We anchor on a monotonic wall-clock instant captured when the status
+  // was received, so a client/server NTP gap can't make the value go
+  // backward.
+  const seenAt = useRef<{ ts: number; receivedMs: number } | null>(null);
+  if (status && (!seenAt.current || seenAt.current.ts !== status.serverTs)) {
+    seenAt.current = { ts: status.serverTs, receivedMs: Date.now() };
+  }
+  const tickedStatus = useMemo(() => {
+    if (!status || !seenAt.current) return null;
+    const elapsedS = Math.max(0, Math.floor((Date.now() - seenAt.current.receivedMs) / 1000));
+    return { ...status, timeInState: status.timeInState + elapsedS };
+    // `clock` is the heartbeat that drives this recomputation each second.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status, clock]);
 
   return (
     <div className="app">
@@ -116,7 +120,7 @@ function Shell({ auth, view, setView, onLogout }: {
             <span>{live.error}</span>
           </div>
         )}
-        {tickedStatus && view === "live" && <LiveView status={tickedStatus} history={live.history} />}
+        {tickedStatus && view === "live" && <LiveView status={tickedStatus} history={live.history} operator={auth.operator ?? "operator"} />}
         {tickedStatus && view === "history" && <HistoryView />}
         {tickedStatus && view === "events" && <EventsView />}
         {tickedStatus && view === "settings" && <SettingsView />}
