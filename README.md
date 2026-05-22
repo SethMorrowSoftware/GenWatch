@@ -2,18 +2,20 @@
 
 Professional monitoring and control software for the **Generac H-100** industrial generator, running on a **Raspberry Pi 5**.
 
-A single-pane operator console with live engine state, electrical output, two-step-confirm controls (start / stop / quiet-test / transfer), time-series history, alarms, and on-device configuration of the serial port, register map, and retention policy. Communicates with the H-100 controller over Modbus RTU via a USB-to-RS485 adapter.
+A single-pane operator console with live engine state, electrical output, two-step-confirm controls (start / stop / quiet-test / transfer), time-series history, alarms, and on-device configuration of the serial port, register map, and retention policy. Communicates with the H-100 controller over Modbus RTU.
+
+**Physical layer:** the H-100 has both an **RS-232** port (factory-default Modbus *slave*, 9600 8N1, address 100 — this is what GenLink uses, and what GenWatch uses by default) and an **RS-485** port (factory-default Modbus *master* to remote annunciators and HTS transfer switches at 4800 8N2 — not directly usable until the panel is reconfigured). The default install path documented below targets the RS-232 port because that's how the H-100 ships from the factory. An advanced RS-485 path is documented in [§2.5](#25-advanced-rs-485-instead-of-rs-232).
 
 ![architecture diagram — see docs/HARDWARE for wiring](#)
 
-> **Reliability:** All 28 unit + end-to-end tests pass. systemd hardened unit with watchdog. Service refuses to start if the RS-485 link is unreachable (no silent fallback to mock). Login rate-limited. SQLite WAL with crash-safe retention. Audit log on every control command.
+> **Reliability:** All 28 unit + end-to-end tests pass. systemd hardened unit with sd_notify watchdog. Service refuses to start if the Modbus link is unreachable (no silent fallback to mock). Login rate-limited. SQLite WAL with crash-safe retention. Audit log on every control command.
 
 ---
 
 ## Table of contents
 
 1. [What you need (Bill of Materials)](#1-what-you-need-bill-of-materials)
-2. [Wiring the RS-485 link](#2-wiring-the-rs-485-link)
+2. [Wiring the Modbus link](#2-wiring-the-modbus-link)
 3. [Prepare the Raspberry Pi 5](#3-prepare-the-raspberry-pi-5)
 4. [Install GenWatch](#4-install-genwatch)
 5. [Initial configuration](#5-initial-configuration)
@@ -33,18 +35,31 @@ A single-pane operator console with live engine state, electrical output, two-st
 
 Approximate total: **$150–$250 USD** depending on enclosure and adapter choice.
 
-### Required
+### Required — recommended (default) RS-232 path
+
+This is the path that matches the H-100 as it ships from Generac. No panel reconfiguration needed.
 
 | # | Item | Why | Recommended |
 |---|------|-----|-------------|
-| 1 | Raspberry Pi 5 (4 GB or 8 GB) | The host computer. 4 GB is plenty; 8 GB if you want headroom. | [Raspberry Pi 5 — 4GB](https://www.raspberrypi.com/products/raspberry-pi-5/) |
-| 2 | Raspberry Pi 27 W USB-C power supply | Pi 5 needs 5 V / 5 A. Cheap chargers cause brownouts and under-voltage warnings. | Official Pi 27 W PSU |
-| 3 | Active cooler for Pi 5 | Pi 5 throttles aggressively without active cooling, especially in an outdoor/cabinet enclosure. | Official Pi 5 Active Cooler |
-| 4 | microSD card, 32 GB+, A2 class | OS + database storage. A2 cards have markedly better random-write IOPS — important for SQLite. | SanDisk Extreme Pro 64 GB A2, or Samsung Pro Endurance |
-| 5 | USB-to-RS485 adapter | Bridges the Pi's USB to the H-100 controller's RS-485 bus. Get one with hardware auto-direction and FTDI/CH340/CP210x chipset. | FTDI USB-RS485-WE-1800-BT, or DSD TECH SH-U10 (CH340), or Waveshare USB-to-RS485 (FT232) |
-| 6 | Twisted-pair shielded cable, 22-24 AWG | The RS-485 differential pair plus shield/drain. Belden 9841 (or equivalent) is the industry standard. Length up to ~1000 m at 9600 baud. | Belden 9841 (one twisted pair + shield) |
-| 7 | Two 120 Ω 1/4 W resistors | Bus termination at both physical ends (Pi end and H-100 end). Many USB-RS485 adapters have a built-in terminator — check before buying extras. | Standard 1/4 W, ±5 % carbon-film |
-| 8 | Pi 5 case with cooling cut-outs | Mechanical protection inside the generator cabinet. Argon NEO 5 BRED, Pironman, or a sealed DIN-rail enclosure for industrial install. | Argon NEO 5 BRED (active-cooler compatible) |
+| 1 | Raspberry Pi 5 (4 GB or 8 GB) | The host computer. 4 GB is plenty; 8 GB if you want headroom. | [Raspberry Pi 5 — 4 GB](https://www.raspberrypi.com/products/raspberry-pi-5/) |
+| 2 | Raspberry Pi 27 W USB-C power supply | Pi 5 needs 5 V / 5 A. Cheap chargers cause brownouts and under-voltage warnings. | Official Raspberry Pi 27 W PSU |
+| 3 | Active cooler for Pi 5 | Pi 5 throttles aggressively without active cooling, especially in an outdoor/cabinet enclosure. | Official Raspberry Pi 5 Active Cooler |
+| 4 | microSD card, 32 GB+, A2 class | OS + database storage. A2 cards have markedly better random-write IOPS — important for SQLite. | SanDisk Extreme Pro 64 GB A2, or Samsung Pro Endurance 64 GB |
+| 5a | **Generac 0F7707 PC interface cable** (recommended) | The factory service cable. Gray "Computer" end on the PC side, Black "Control Panel" end on the H-100 RS-232 port. Handles the panel-side connector + null-modem crossover for you. | Generac part **0F7707** (sold through Generac dealers) |
+| 5b | **USB-to-DB9 serial adapter** with a quality chipset | Bridges the Pi's USB to the gray DB9 end of the 0F7707. Avoid no-name PL2303 clones — they're driver-unstable on modern Linux. | StarTech **ICUSB232V2** (FTDI), Tripp Lite **USA-19HS** (Keyspan), or any FTDI-FT232R-based USB-DB9 cable |
+| 6 | Pi 5 case with cooling cut-outs | Mechanical protection inside the generator cabinet. Argon NEO 5 BRED, Pironman 5, or a sealed DIN-rail enclosure for industrial install. | Argon NEO 5 BRED (active-cooler compatible) |
+
+> If the Generac 0F7707 cable isn't available, you can build an equivalent: USB-DB9 (FTDI) cable + **DB9 female-female null-modem adapter** + DB9-to-(panel connector) extension. The 0F7707 saves you the wiring research, though, and is the supported configuration. RS-232 max cable length is ~15 m at 9600 baud — beyond that, use the RS-485 path in [§2.5](#25-advanced-rs-485-instead-of-rs-232).
+
+### Alternative — RS-485 path (long runs, multi-device, requires panel reconfig)
+
+Use this if the Pi is more than ~15 m of cable from the H-100, or if you need to drop the Pi onto an existing RS-485 SCADA bus. Requires reconfiguring the H-100's RS-485 port from "master" to "slave" via GenLink and disconnecting any annunciators/HTS-485 peripherals from that port.
+
+| # | Item | Why | Recommended |
+|---|------|-----|-------------|
+| 5' | **USB-to-RS485 adapter** with hardware auto-direction and a quality chipset | Bridges the Pi's USB to the H-100 RS-485 terminal block (A/B/GND). | FTDI **USB-RS485-WE-1800-BT**, DSD TECH **SH-U10** (CH340), Waveshare **USB to RS485** (FT232) |
+| 6' | Twisted-pair shielded cable, 22-24 AWG | The RS-485 differential pair plus shield/drain. Up to ~1000 m at 9600 baud, ~300 m typical with consumer cable. | Belden **9841** (one twisted pair + shield) |
+| 7' | Two 120 Ω 1/4 W resistors | Bus termination at both physical ends of the linear bus. Many USB-RS485 adapters have a built-in terminator switchable by a DIP — check before buying extras. | Standard 1/4 W, ±5 % carbon-film |
 
 ### Optional but recommended
 
@@ -59,54 +74,112 @@ Approximate total: **$150–$250 USD** depending on enclosure and adapter choice
 
 ### Compatible adapter chipsets (any will work)
 
-Plug-and-play under the bundled udev rule (no extra config — they all show up as `/dev/genwatch-rs485`):
+The bundled udev rule symlinks any of these adapters to `/dev/genwatch-modbus` (covers both RS-232 cables and RS-485 modules — they use the same USB-to-serial bridge chips):
 
-- **FTDI FT232/FT231X/FT232H** (USB VID 0x0403) — most reliable, slightly more expensive
-- **WCH CH340/CH341** (VID 0x1A86) — cheap, generally works fine on Bookworm
-- **Silicon Labs CP2102/CP2104** (VID 0x10C4) — good middle ground
-- **Prolific PL2303** (VID 0x067B) — works but avoid clones with sketchy drivers
+- **FTDI FT232 / FT231X / FT232H** (USB VID 0x0403) — most reliable, the safe choice for mission-critical sites
+- **Silicon Labs CP2102 / CP2104** (VID 0x10C4) — good middle ground, well-supported on Linux
+- **WCH CH340 / CH341** (VID 0x1A86) — cheap, generally works fine on Bookworm; budget-friendly
+- **Prolific PL2303** (VID 0x067B) — works in principle, but **avoid no-name clones** — many ship with counterfeit chips that get blacklisted by recent Linux kernels. If you can't tell, get FTDI instead.
 
-If you're buying new, the **DSD TECH SH-U10** (CH340) is ~$10 and has been reliable in field deployments. For mission-critical sites prefer a true FTDI chip.
+For a field-deployed monitoring station that's expected to run for years, **buy an FTDI-based adapter.** The ~$15 premium is paid back the first time you don't have to drive out to a generator pad because a Prolific clone got blacklisted by a kernel update.
 
 ---
 
-## 2. Wiring the RS-485 link
+## 2. Wiring the Modbus link
 
-The H-100 controller exposes Modbus RTU on a 3-terminal RS-485 port (label varies by panel: "Modbus", "RS-485", "External Comms", or "Mod-485").
+The H-100 has both an RS-232 port (factory-default Modbus *slave* — the recommended GenWatch path) and an RS-485 port (factory-default Modbus *master* — not directly usable until reconfigured). They are **not interchangeable** — RS-232 is ±5–12 V single-ended; RS-485 is differential 0–5 V. Wiring an RS-485 module to the RS-232 port (or vice versa) won't work.
+
+### 2.1 Identify the RS-232 port on your H-100
+
+The label varies by panel revision: "**RS-232**", "**GenLink**", "**PC**", or "**Service**". It is **not** the terminal block labeled "Mod-485" / "A B GND" — that's the RS-485 master port.
+
+Physically it is either:
+- A **DB9 male** connector (most common), or
+- A **modular RJ-style** jack on newer revisions (the 0F7707 cable handles either)
+
+If your H-100 has only an RS-485 terminal block visible and no DB9/RJ port, your panel revision may not have a populated RS-232 port — in that case use the [RS-485 path](#25-advanced-rs-485-instead-of-rs-232).
+
+### 2.2 Recommended cabling — Generac 0F7707 + USB-DB9
 
 ```
-   USB-RS485 adapter             H-100 controller
-   ─────────────────             ────────────────
-   A  (D+ / TX+)     ───────►    A  (D+)
-   B  (D− / TX−)     ───────►    B  (D−)
-   GND (signal gnd)  ───────►    COM / GND
-                                 │
-                                 ├── 120 Ω termination at this end
-                                 │   (if not already factory-installed)
-   120 Ω termination ─────┘ also at the adapter end (most have a jumper)
+   Raspberry Pi 5 USB ─── USB-DB9 adapter ─── Generac 0F7707 ─── H-100 RS-232 port
+                          (FTDI chipset)       PC end (gray)        Panel end (black)
+                          DB9 male             DB9 female
 ```
 
-### Wiring rules
+The 0F7707 cable is wired as a "null-modem" internally (TX↔RX crossover) and matches the panel's connector revision. **No additional null-modem adapter is needed when using 0F7707.**
 
-1. **A↔A, B↔B**: If the line is dead, swap A and B at one end. Half of all RS-485 problems are polarity swaps.
-2. **Twisted pair only**: A and B must be the *same* twisted pair (e.g. blue / blue-white in Belden 9841). Don't use ribbon cable.
-3. **Single shield ground**: Connect the shield/drain wire to GND at *one* end only (the Pi end) — grounding both ends creates a ground loop and adds noise.
-4. **120 Ω termination at both physical ends of the bus**: not in the middle. The Pi-side adapter usually has a built-in 120 Ω termination resistor that you can enable with a jumper or DIP switch. The H-100 end needs an external 120 Ω resistor across A↔B if there isn't already one fitted internally (check the panel manual or measure with a multimeter — see §10 Troubleshooting).
-5. **No daisy-chain spurs > 30 cm**: For a long run, the bus must be linear (Pi → controller). Don't tee off branches.
-6. **Keep away from high-voltage runs**: Don't run the RS-485 cable inside conduit with the generator output bus. Cross at 90° if you have to.
+### 2.3 Without the 0F7707 cable — DIY equivalent
 
-### Recommended H-100 panel settings (verify against your firmware)
+If you can't source the 0F7707, the equivalent is:
+
+```
+   Pi USB ─── USB-DB9 (FTDI) ─── DB9 null-modem adapter ─── DB9-to-(panel) cable ─── H-100
+              [DB9 male]         [DB9 F-F crossover]        [match the panel jack]
+```
+
+DB9 null-modem pinout (for reference — most off-the-shelf null-modem adapters already do this):
+
+| PC side (DB9) | Panel side (DB9) |
+|---|---|
+| Pin 2 (RXD) | Pin 3 (TXD) |
+| Pin 3 (TXD) | Pin 2 (RXD) |
+| Pin 5 (GND) | Pin 5 (GND) |
+
+Hardware handshake (RTS/CTS/DTR/DSR) is **not** required by the H-100 Modbus slave — only RX, TX, and GND are used.
+
+### 2.4 Recommended H-100 panel settings (factory defaults — usually no change needed)
 
 | Setting | Value |
-|---------|-------|
-| Modbus slave address | **100** (`0x64`) — factory default |
+|---|---|
+| Modbus slave address | **100** (`0x64`) |
 | Baud rate | **9600** |
 | Data bits | **8** |
 | Parity | **None** |
 | Stop bits | **1** |
-| Function code (read) | **3** (read holding registers) |
+| Read function code | **3** (read holding registers) |
 
-These are the GenWatch defaults too — no changes needed if your H-100 ships from the factory.
+These are GenWatch's defaults too. If a previous integrator changed them on your panel, either restore them via GenLink or update `/etc/genwatch/config.yaml` to match what your panel is actually set to.
+
+### 2.5 Advanced — RS-485 instead of RS-232
+
+Use this only if you have a clear reason: cable run longer than ~15 m, multi-drop bus with other Modbus devices, or industrial noise that's interfering with the RS-232 link.
+
+**Steps:**
+
+1. **Reconfigure the H-100 RS-485 port from master to slave.** This is done via GenLink (Tools → Modbus → Port 2 → set to "Slave"). Note: this **disables the H-100's communication with any remote annunciators and HTS-485 transfer switches that were on that bus** — only do this if you've audited what else is on the RS-485 network.
+2. **Wire to the RS-485 terminal block:**
+
+   ```
+      USB-RS485 adapter           H-100 RS-485 terminal block
+      ────────────────            ──────────────────────────
+      A  (D+ / TX+)      ──────►  A  (D+)
+      B  (D− / TX−)      ──────►  B  (D−)
+      GND (signal gnd)   ──────►  COM / GND
+                                  │
+                                  └── 120 Ω termination across A↔B at this end
+      120 Ω at the adapter end ───┘ (usually a DIP switch on the module)
+   ```
+
+3. **Wiring rules:**
+   - **A↔A, B↔B.** If the line is dead, swap A and B at one end. Half of all RS-485 problems are polarity swaps.
+   - **Twisted pair only.** A and B must share the *same* twisted pair (e.g. blue / blue-white in Belden 9841). Don't use ribbon cable.
+   - **Single shield ground.** Connect the shield/drain wire to GND at *one* end only (the Pi end) — grounding both ends creates a ground loop.
+   - **120 Ω termination at both physical ends** of the bus, not in the middle.
+   - **Linear bus, no spurs > 30 cm.** Don't tee off branches.
+   - **Don't run alongside high-voltage.** Cross generator output cabling at 90° if you have to.
+4. **Update GenWatch config** to match the RS-485 port's settings. The H-100 RS-485 port's factory default before reconfiguration is **4800 baud, 8N2** (not 9600 8N1). When you reconfigure it as a slave you can usually set it to 9600 8N1 to match GenWatch's defaults — set both ends to the same values:
+
+   ```yaml
+   serial:
+     device: /dev/genwatch-modbus
+     baud: 9600       # or whatever you set on the panel
+     parity: N
+     stopbits: 1
+     bytesize: 8
+   modbus:
+     slave: 100       # whatever slave address the panel is set to
+   ```
 
 ---
 
@@ -144,7 +217,7 @@ sudo reboot
 
 ### 3.3 (Optional) Disable the on-board Bluetooth UART
 
-If you happen to be wiring the H-100 to the Pi's GPIO UART pins instead of using a USB-RS485 adapter (advanced — most users should not do this), the Pi 5 needs the GPIO UART explicitly enabled. **For the standard USB-RS485 setup documented here, skip this step.**
+If you happen to be wiring the H-100 to the Pi's GPIO UART pins instead of using a USB adapter (advanced — most users should not do this), the Pi 5 needs the GPIO UART explicitly enabled. **For the standard USB-adapter setup documented here, skip this step.**
 
 To enable GPIO UART:
 ```bash
@@ -158,7 +231,7 @@ The on-board UART then appears as `/dev/ttyAMA10` on Pi 5 (different from Pi 4's
 
 ## 4. Install GenWatch
 
-Plug your USB-RS485 adapter into one of the Pi's USB ports, then:
+Plug your USB-to-serial adapter (USB-DB9 for the recommended RS-232 path, or USB-RS485 for the advanced path) into one of the Pi's USB ports, then:
 
 ```bash
 # Clone the repo
@@ -178,7 +251,7 @@ The installer does the following idempotently — re-run any time you pull updat
 5. Creates the Python venv at `/opt/genwatch/venv` and installs backend deps.
 6. Copies the backend package to `/opt/genwatch/genwatch/`.
 7. Copies the built frontend to `/usr/share/genwatch/ui/`.
-8. Installs the udev rule that symlinks any supported RS-485 adapter to `/dev/genwatch-rs485`.
+8. Installs the udev rule that symlinks any supported USB-to-serial adapter (RS-232 cable or RS-485 module) to `/dev/genwatch-modbus`.
 9. Provisions `/etc/genwatch/config.yaml` with a random `jwt_secret`.
 10. Installs the systemd unit, runs the pre-flight diagnostics, and starts the service (after the admin password is set).
 
@@ -192,7 +265,7 @@ You should see something like:
 [genwatch] node: v20.10.0
 [genwatch] Creating system user genwatch …
 [genwatch] Building frontend bundle (this can take ~30 s on a Pi 4) …
-[genwatch] Installing udev rule for /dev/genwatch-rs485
+[genwatch] Installing udev rule for /dev/genwatch-modbus
 [genwatch] Running pre-flight diagnostics
 == GenWatch doctor (v0.1.0) ==
   Python:    3.11.x
@@ -201,7 +274,7 @@ You should see something like:
   Auth:      MISSING admin_password_hash — run: genwatch hash <password>
   Registers: /opt/genwatch/genwatch/registers/h100.yaml
              18 read + 4 write, slave=100
-  Serial:    /dev/genwatch-rs485 opens OK at 9600 8N1
+  Serial:    /dev/genwatch-modbus opens OK at 9600 8N1
   Modbus:    slave 100 responded with [2] (37ms)
 
 ⚠  ADMIN PASSWORD NOT SET
@@ -395,19 +468,29 @@ The SQLite schema is forward-compatible — `CREATE TABLE IF NOT EXISTS` everywh
 
 ### Symptom: `Modbus: NO RESPONSE` in `genwatch doctor` / "Comms lost" in UI
 
-A live Modbus link should respond within ~50 ms. If it doesn't:
+A live Modbus link should respond within ~50 ms. If it doesn't, work through these in order — the first three catch the vast majority of cases:
 
 | Check | Command / action |
 |-------|------------------|
-| Adapter plugged in and recognized? | `lsusb` should list it. `ls -l /dev/genwatch-rs485` should show a symlink to `/dev/ttyUSB0` or similar. |
-| Wrong polarity (A/B swapped)? | Most common. Swap the two wires at the controller end and re-test. |
-| Wrong baud rate or slave ID? | Verify on the H-100 panel itself. Mismatched baud = silence, mismatched slave ID = exception code 11 or silence. |
-| No termination? | Across A↔B at the controller end (and Pi end if your adapter has no built-in terminator). The line resistance A↔B should measure ~60 Ω with both terminators in (two 120 Ω in parallel). With no termination the bus looks like ~∞ Ω. |
-| Adapter doesn't auto-direction? | Cheap adapters need an RTS pin to toggle TX/RX direction. Buy one with hardware auto-direction (any of the chipsets in §1). |
-| Conflicting Modbus master? | If a Generac MLink or similar is already polling the same RS-485 bus, you'll see intermittent collisions. Disconnect the other master or use a separate port. |
-| Cable too long? | At 9600 baud, ~1000 m is the theoretical limit. In practice keep under 300 m on consumer cable. |
+| **Wrong port** (RS-232 vs RS-485) | The H-100 RS-232 port is the factory Modbus slave. The RS-485 terminal block (labeled A/B/COM or Mod-485) is the master port and will *not* respond unless you've explicitly reconfigured it via GenLink. Use the RS-232 port (DB9 or RJ-style — see §2.1). |
+| **Missing null-modem crossover** (RS-232) | If you're not using the Generac 0F7707 cable, you must have a DB9 null-modem adapter inline between the USB-DB9 cable and the panel. A straight-through cable will see silence — TX is talking to TX. |
+| **Adapter plugged in and recognized?** | `lsusb` should list it. `ls -l /dev/genwatch-modbus` should show a symlink to `/dev/ttyUSB0` or similar. |
+| Wrong baud rate or slave ID? | The H-100 RS-232 port's factory defaults are **9600 8N1, slave 100**. Verify on the panel via GenLink (Tools → Modbus). Mismatched baud = silence; mismatched slave ID = silence or exception code 11. |
+| GND wire missing? | RS-232 needs a signal ground reference. If only TX and RX are connected the line floats. The 0F7707 cable handles this; DIY wiring must include GND (DB9 pin 5↔5). |
+| Cable too long? | RS-232 max is ~15 m at 9600 baud. Beyond that, voltage levels degrade and you'll see intermittent silence. Use the RS-485 path (§2.5) for long runs. |
+| Adapter or driver flaky? | Avoid no-name PL2303 clones — recent Linux kernels blacklist counterfeits. Replace with an FTDI-based adapter. |
 
-### Symptom: `Serial: CANNOT OPEN /dev/genwatch-rs485 — Permission denied`
+**RS-485-specific (if you're on the RS-485 path):**
+
+| Check | Command / action |
+|-------|------------------|
+| Polarity (A/B) swapped? | Most common RS-485 fault. Swap the two wires at the controller end and re-test. |
+| No termination? | 120 Ω across A↔B at *both* ends, not the middle. Measure A↔B with the bus powered off — should read ~60 Ω (two 120 Ω in parallel). With no termination the bus looks like ~∞ Ω. |
+| Adapter doesn't auto-direction? | Cheap RS-485 adapters need RTS to toggle TX/RX direction. Use a module with hardware auto-direction. |
+| Conflicting Modbus master? | If you didn't reconfigure the H-100 RS-485 port from master to slave, the H-100 *is* the master and won't answer requests. If a Generac MLink is also on the bus you'll see collisions. |
+| H-100 RS-485 still in master mode? | Open GenLink, Tools → Modbus → Port 2, confirm role is "Slave" and address is what GenWatch's config says. |
+
+### Symptom: `Serial: CANNOT OPEN /dev/genwatch-modbus — Permission denied`
 
 The genwatch user must be in the `dialout` group:
 
@@ -418,7 +501,7 @@ sudo usermod -aG dialout genwatch
 sudo systemctl restart genwatch
 ```
 
-### Symptom: `Serial: /dev/genwatch-rs485 DOES NOT EXIST`
+### Symptom: `Serial: /dev/genwatch-modbus DOES NOT EXIST`
 
 The udev rule didn't match your adapter. List what's there:
 
@@ -428,8 +511,8 @@ lsusb -v 2>/dev/null | grep -E "idVendor|idProduct|iProduct"
 ```
 
 Either:
-- Add your VID:PID to `/etc/udev/rules.d/99-genwatch-rs485.rules` and run `sudo udevadm control --reload-rules && sudo udevadm trigger`, OR
-- Set `serial.device: /dev/ttyUSB0` (or whatever path lsusb showed) explicitly in `/etc/genwatch/config.yaml`.
+- Add your VID:PID to `/etc/udev/rules.d/99-genwatch-modbus.rules` and run `sudo udevadm control --reload-rules && sudo udevadm trigger`, OR
+- Set `serial.device: /dev/ttyUSB0` (or whatever path `ls` showed) explicitly in `/etc/genwatch/config.yaml`, then `sudo systemctl restart genwatch`.
 
 ### Symptom: Service flapping (restarting every minute or so)
 
@@ -437,7 +520,7 @@ Either:
 journalctl -u genwatch --since "5 minutes ago" --no-pager
 ```
 
-The systemd unit has a watchdog set to 60 s; if the app's poller hangs (e.g. waiting forever on a serial read) the watchdog will SIGKILL and systemd restarts the service. The boot event log in the DB shows the boot pattern. If the underlying problem is the RS-485 link going down and pymodbus blocking, run `genwatch doctor` while the service is stopped to isolate.
+The systemd unit has a watchdog set to 60 s; if the app's poller hangs (e.g. waiting forever on a serial read) the watchdog will SIGKILL and systemd restarts the service. The boot event log in the DB shows the boot pattern. If the underlying problem is the Modbus link going down and pymodbus blocking, run `sudo genwatch doctor` while the service is stopped to isolate.
 
 ### Symptom: SQLite "database is locked"
 
@@ -500,7 +583,8 @@ Pi 5 needs a true 5 V / 5 A supply. Cheap USB-C chargers brown out under USB per
 │   • events / alarms_active / audit / kv                          │
 │   • retention task aggregates and prunes every 5 min             │
 └─────────────────────────────┬───────────────────────────────────┘
-                              │ Modbus RTU (RS-485, 9600 8N1)
+                              │ Modbus RTU (RS-232 default; RS-485 advanced)
+                              │ 9600 8N1, slave 100
                               v
                         ┌──────────────┐
                         │ H-100        │ Generac H-100 controller
@@ -511,7 +595,7 @@ Pi 5 needs a true 5 V / 5 A supply. Cheap USB-C chargers brown out under USB per
 ### Reliability features
 
 - **systemd watchdog**: `Type=notify`, `WatchdogSec=60s`. The app pings `sd_notify(WATCHDOG=1)` every 30 s while the poller loop is healthy. If the poller hangs (e.g. a pymodbus deadlock on a flaky link), systemd SIGKILLs and restarts within 60 s.
-- **Refuse-to-start on RS-485 failure**: in production the service exits cleanly with a clear error if it can't open the serial port. Operators see "service down", not a silent simulator.
+- **Refuse-to-start on Modbus failure**: in production the service exits cleanly with a clear error if it can't open the serial port. Operators see "service down", not a silent simulator.
 - **Hardened unit**: `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectKernelTunables`, narrow `DeviceAllow` list, `MemoryMax=512M`, `TasksMax=128`.
 - **WAL-mode SQLite**: crash-safe, survives Pi power loss without corruption.
 - **Per-poll timeouts and retries** on every Modbus read.
@@ -586,7 +670,7 @@ npm run dev      # → http://127.0.0.1:5173 (proxies /api + /ws to :8000)
 # Login with password "dev"
 ```
 
-The mock client simulates a plausible H-100 — engine state machine, electrical output, alarm injection. Control buttons drive the mock, so the full operator flow works without an RS-485 adapter.
+The mock client simulates a plausible H-100 — engine state machine, electrical output, alarm injection. Control buttons drive the mock, so the full operator flow works without any hardware.
 
 ### Tests
 
@@ -619,7 +703,7 @@ frontend/
 
 deploy/
   systemd/genwatch.service    Hardened unit with sd_notify watchdog
-  udev/99-genwatch-rs485.rules Stable /dev/genwatch-rs485 symlink
+  udev/99-genwatch-modbus.rules Stable /dev/genwatch-modbus symlink
   scripts/install.sh           Idempotent installer
   config.yaml.example          Annotated config template
 

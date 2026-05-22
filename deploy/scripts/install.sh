@@ -11,7 +11,7 @@
 #   5. Install Python deps into /opt/genwatch/venv
 #   6. Copy backend package to /opt/genwatch
 #   7. Copy built frontend to /usr/share/genwatch/ui
-#   8. Install udev rule for /dev/genwatch-rs485 symlink
+#   8. Install udev rule for /dev/genwatch-modbus symlink
 #   9. Provision /etc/genwatch/config.yaml (with auto-generated jwt_secret)
 #  10. Install + enable systemd unit
 #
@@ -27,7 +27,8 @@ ETC_DIR=/etc/genwatch
 UI_DIR=/usr/share/genwatch/ui
 LOG_DIR=/var/log/genwatch
 USER=genwatch
-UDEV_RULE=/etc/udev/rules.d/99-genwatch-rs485.rules
+UDEV_RULE=/etc/udev/rules.d/99-genwatch-modbus.rules
+OLD_UDEV_RULE=/etc/udev/rules.d/99-genwatch-rs485.rules
 UNIT_FILE=/etc/systemd/system/genwatch.service
 
 # ─── helpers ──────────────────────────────────────────────────────────────
@@ -197,8 +198,12 @@ ln -sf "$APP_DIR/genwatch.sh" /usr/local/bin/genwatch
 chown -R "$USER:$USER" "$APP_DIR"
 
 # ─── 6. udev rule ─────────────────────────────────────────────────────────
-log "Installing udev rule for /dev/genwatch-rs485"
-install -m 0644 "$REPO_ROOT/deploy/udev/99-genwatch-rs485.rules" "$UDEV_RULE"
+log "Installing udev rule for /dev/genwatch-modbus"
+install -m 0644 "$REPO_ROOT/deploy/udev/99-genwatch-modbus.rules" "$UDEV_RULE"
+# Clean up old rs485-named rule from earlier installs.
+if [[ -f "$OLD_UDEV_RULE" ]]; then
+  rm -f "$OLD_UDEV_RULE"
+fi
 udevadm control --reload-rules
 udevadm trigger --subsystem-match=tty || true
 

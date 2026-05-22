@@ -64,14 +64,14 @@ ReadWritePaths=/var/lib/genwatch /etc/genwatch /var/log/genwatch
 # char-tty*: covers any USB-serial adapter regardless of /dev/ttyUSB index
 # ttyAMA10/ttyAMA0: Pi 5 / Pi 4 on-board UART
 # serial0/serial1: stable raspi aliases for the on-board UART
-# genwatch-rs485: udev symlink created by deploy/udev/99-genwatch-rs485.rules
+# genwatch-modbus: udev symlink created by deploy/udev/99-genwatch-modbus.rules
 DeviceAllow=char-ttyUSB rw
 DeviceAllow=char-ttyACM rw
 DeviceAllow=/dev/ttyAMA0 rw
 DeviceAllow=/dev/ttyAMA10 rw
 DeviceAllow=/dev/serial0 rw
 DeviceAllow=/dev/serial1 rw
-DeviceAllow=/dev/genwatch-rs485 rw
+DeviceAllow=/dev/genwatch-modbus rw
 
 # Resource caps — Pi 4 has 4 GB, Pi 5 has 4-8 GB. 512M is plenty for the
 # Python service + SQLite + buffered telemetry.

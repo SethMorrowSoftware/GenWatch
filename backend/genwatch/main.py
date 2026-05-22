@@ -102,9 +102,12 @@ async def lifespan(app: FastAPI):
         if not settings.mock:
             msg = (
                 f"Modbus serial connect failed on {settings.serial.device}. "
-                "Check the USB-RS485 adapter, A/B wiring, baud rate, and that "
-                "the 'genwatch' user is in the 'dialout' group. To run without "
-                "hardware (UI demo), set GENWATCH_MOCK=true."
+                "Check the USB-to-serial adapter is plugged in, the cable to "
+                "the H-100 panel is seated (RS-232 DB9 by default; RS-485 if "
+                "the panel is reconfigured), the baud/parity/stop-bits match "
+                "the panel, and the 'genwatch' user is in the 'dialout' group. "
+                "Run `sudo genwatch doctor` for an itemized check. To run "
+                "without hardware (UI demo), set GENWATCH_MOCK=true."
             )
             log.error(msg)
             raise RuntimeError(msg)

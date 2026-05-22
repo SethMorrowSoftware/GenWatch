@@ -1,0 +1,48 @@
+# GenWatch — stable symlink for the USB-to-Serial Modbus adapter.
+#
+# When this file is installed at /etc/udev/rules.d/99-genwatch-modbus.rules,
+# any supported adapter plugged into the Pi gets symlinked to
+#   /dev/genwatch-modbus
+# regardless of which /dev/ttyUSB<n> slot Linux assigned it. Point your
+# config.yaml at /dev/genwatch-modbus and reboots / re-plugging won't
+# break things.
+#
+# The same VID:PIDs are used for both:
+#   - USB-to-RS232 cables (talking to the H-100's factory-default
+#     Modbus *slave* port — the recommended setup), AND
+#   - USB-to-RS485 modules (for advanced installs that reconfigure the
+#     H-100 RS-485 port as a slave for longer-distance runs).
+#
+# Apply changes without rebooting:
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+#
+# Supported chipsets:
+#   - FTDI FT232 / FT231X / FT232H / FT4232  (VID 0403)
+#   - WCH CH340 / CH341                       (VID 1a86)
+#   - Silicon Labs CP2102 / CP2104            (VID 10c4)
+#   - Prolific PL2303                         (VID 067b)
+#
+# If your adapter isn't recognized, run `lsusb` while it's plugged in
+# to find its VID:PID and add a matching line below.
+
+# FTDI FT232 (most common — both RS-232 cables and RS-485 modules)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", SYMLINK+="genwatch-modbus", MODE="0660", GROUP="dialout"
+# FTDI FT232H
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6014", SYMLINK+="genwatch-modbus", MODE="0660", GROUP="dialout"
+# FTDI FT231X
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6015", SYMLINK+="genwatch-modbus", MODE="0660", GROUP="dialout"
+# FTDI FT4232H (1st port)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6011", SYMLINK+="genwatch-modbus", MODE="0660", GROUP="dialout"
+
+# WCH CH340/CH341 (common on budget USB-DB9 cables and RS-485 modules)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="genwatch-modbus", MODE="0660", GROUP="dialout"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="5523", SYMLINK+="genwatch-modbus", MODE="0660", GROUP="dialout"
+
+# Silicon Labs CP210x
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="genwatch-modbus", MODE="0660", GROUP="dialout"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea70", SYMLINK+="genwatch-modbus", MODE="0660", GROUP="dialout"
+
+# Prolific PL2303 (note: avoid no-name PL2303 clones with broken drivers)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="067b", ATTRS{idProduct}=="2303", SYMLINK+="genwatch-modbus", MODE="0660", GROUP="dialout"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="067b", ATTRS{idProduct}=="23a3", SYMLINK+="genwatch-modbus", MODE="0660", GROUP="dialout"
