@@ -13,16 +13,37 @@ class LoginBody(BaseModel):
     password: str
 
 
+def _client_ip(request: Request) -> str:
+    # Behind a reverse proxy this should read X-Forwarded-For. For a bare
+    # LAN deployment (the documented GenWatch topology) request.client is
+    # authoritative.
+    return request.client.host if request.client else "unknown"
+
+
 @router.post("/login")
 async def login(request: Request, body: LoginBody, response: Response) -> dict:
     settings = request.app.state.settings
     if not settings.auth.admin_password_hash:
         raise HTTPException(503, "auth not initialized — set admin_password_hash in config")
 
+    ip = _client_ip(request)
+    limiter = getattr(request.app.state, "login_limiter", None)
+    if limiter is not None and not limiter.check(ip):
+        retry = limiter.retry_after_s(ip)
+        request.app.state.db.write_audit("anonymous", "auth.login", f"ip={ip}", "", "rate_limited")
+        raise HTTPException(
+            429,
+            detail={"code": "rate_limited", "message": f"too many attempts; retry in {retry}s"},
+            headers={"Retry-After": str(retry)},
+        )
+
     if not verify_password(body.password, settings.auth.admin_password_hash):
         # Audit failed logins (no operator known yet, attribute to "anonymous")
-        request.app.state.db.write_audit("anonymous", "auth.login", "", "", "denied")
+        request.app.state.db.write_audit("anonymous", "auth.login", f"ip={ip}", "", "denied")
         raise HTTPException(401, "invalid password")
+
+    if limiter is not None:
+        limiter.reset(ip)
 
     token = issue_token(
         secret=settings.auth.jwt_secret,
