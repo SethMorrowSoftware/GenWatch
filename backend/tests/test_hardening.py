@@ -131,8 +131,9 @@ def test_notify_watchdog_interval_parses_usec(monkeypatch):
 
 def test_config_does_not_auto_mock_when_device_missing(monkeypatch, tmp_path):
     """When the serial device is absent and mock isn't requested, the
-    config layer must leave mock=False. Refusing-to-start is enforced
-    in main.lifespan; here we just verify the config plumbing."""
+    config layer must leave mock=False — we never silently switch to
+    fake data. The lifespan layer logs a clear error and starts in a
+    comms-lost state; here we just verify the config plumbing."""
     monkeypatch.delenv("GENWATCH_MOCK", raising=False)
     monkeypatch.setenv("GENWATCH_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("GENWATCH_SERIAL__DEVICE", "/dev/definitely-not-a-real-port")
@@ -167,6 +168,83 @@ def test_modbus_tcp_host_port_overridable_via_env(monkeypatch, tmp_path):
     s = load(None)
     assert s.modbus_tcp.host == "10.20.30.40"
     assert s.modbus_tcp.port == 10008
+
+
+# ─── Poller heartbeat + batch-fallback ───────────────────────────────────
+
+
+async def test_poller_stamps_prime_heartbeat_on_success(tmp_path):
+    """The poller must record a monotonic timestamp on each successful
+    prime poll. The systemd watchdog ticker uses this to decide whether
+    to keep pinging — a hung loop without a fresh heartbeat must let
+    systemd restart the unit."""
+    import time
+    from genwatch.modbus.client import MockModbusClient
+    from genwatch.modbus.poller import Poller
+    from genwatch.modbus.registers import load_register_map
+
+    regmap = load_register_map("genwatch/registers/h100.yaml")
+    client = MockModbusClient(regmap)
+    await client.connect()
+
+    async def cb(tier, reading, health):
+        pass
+
+    p = Poller(client, regmap, cb)
+    assert p.health.last_prime_good_monotonic is None
+    await p._poll_tier("prime", p._prime_batches)
+    assert p.health.last_prime_good_monotonic is not None
+    # Heartbeat is monotonic (not wall-clock) so NTP jumps can't fool the watchdog.
+    assert p.health.last_prime_good_monotonic <= time.monotonic()
+
+
+async def test_poller_falls_back_to_singles_when_batch_fails(tmp_path):
+    """A failing block read must not blank out the registers it covers.
+    The poller falls back to single-register reads so one bad address
+    can't take out an entire telemetry tier."""
+    from dataclasses import dataclass
+    from genwatch.modbus.client import ModbusResult
+    from genwatch.modbus.poller import Poller
+    from genwatch.modbus.registers import load_register_map
+
+    regmap = load_register_map("genwatch/registers/h100.yaml")
+
+    @dataclass
+    class FakeClient:
+        # Fail every multi-register batch, succeed every single read.
+        single_calls: int = 0
+
+        async def connect(self):
+            return True
+
+        async def close(self):
+            pass
+
+        async def read(self, addr, count, fc=3):
+            if count == 1:
+                self.single_calls += 1
+                return ModbusResult.success([0x1234], 1.0)
+            return ModbusResult.failure("simulated_batch_failure", 1.0)
+
+        async def write(self, *a, **kw):
+            return ModbusResult.failure("not_used")
+
+    fc = FakeClient()
+
+    async def cb(tier, reading, health):
+        pass
+
+    p = Poller(fc, regmap, cb)
+    await p._poll_tier("prime", p._prime_batches)
+    # The fan-out must have happened — every register in the prime tier
+    # has its single-read fallback exercised.
+    assert fc.single_calls > 0
+    # And the prime heartbeat is still stamped, since the fan-outs
+    # recovered some data.
+    assert p.health.last_prime_good_monotonic is not None
+
+
+# ─── Modbus client ────────────────────────────────────────────────────────
 
 
 async def test_tcp_client_reports_failure_when_bridge_unreachable():

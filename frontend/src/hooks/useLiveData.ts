@@ -27,6 +27,15 @@ export interface LiveState {
   status: StatusBody | null;
   history: Reading[];
   reconnects: number;
+  // Wall-clock instant (Date.now()) when we last received a snapshot or
+  // transition push from the server, or null if we've never received
+  // one. Consumers compute "stale" against this — never against
+  // status.serverTs, which is the controller's wall clock and can drift.
+  lastPushAt: number | null;
+  // True when the WebSocket is currently closed and waiting to
+  // reconnect. The UI uses this together with lastPushAt to decide
+  // whether to show a "STALE DATA" badge.
+  wsDown: boolean;
 }
 
 export function useLiveData(): LiveState {
@@ -36,6 +45,8 @@ export function useLiveData(): LiveState {
     status: null,
     history: [],
     reconnects: 0,
+    lastPushAt: null,
+    wsDown: false,
   });
   const historyRef = useRef<Reading[]>([]);
 
@@ -56,6 +67,7 @@ export function useLiveData(): LiveState {
           error: null,
           status: s,
           history: historyRef.current,
+          lastPushAt: Date.now(),
         }));
       } catch (e: any) {
         if (cancelled) return;
@@ -70,6 +82,7 @@ export function useLiveData(): LiveState {
 
       ws.onopen = () => {
         backoff = 1000;
+        setState((cur) => ({ ...cur, wsDown: false }));
       };
       ws.onmessage = (ev) => {
         if (cancelled) return;
@@ -84,7 +97,10 @@ export function useLiveData(): LiveState {
       };
       ws.onclose = () => {
         if (cancelled) return;
-        // Reconnect with exponential backoff (max 30s).
+        // Reconnect with exponential backoff (max 30s). Mark wsDown so
+        // the UI can surface a stale-data warning instead of pretending
+        // the last reading we have is still current.
+        setState((cur) => ({ ...cur, wsDown: true }));
         reconnectTimer = setTimeout(() => {
           backoff = Math.min(backoff * 1.8, 30000);
           setState((cur) => ({ ...cur, reconnects: cur.reconnects + 1 }));
@@ -99,6 +115,10 @@ export function useLiveData(): LiveState {
         if (!cur.status) return cur;
         let s: StatusBody = cur.status;
         let history = historyRef.current;
+        // Any inbound message proves the WS is delivering — keep the
+        // freshness clock on `Date.now()` (client wall clock) so the
+        // stale check can't be fooled by a controller clock that drifts.
+        const lastPushAt = Date.now();
 
         switch (msg.type) {
           case "snapshot": {
@@ -144,7 +164,7 @@ export function useLiveData(): LiveState {
             // No state change for these here; events view re-fetches.
             break;
         }
-        return { ...cur, status: s, history };
+        return { ...cur, status: s, history, lastPushAt };
       });
     };
 
