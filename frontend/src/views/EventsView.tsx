@@ -113,7 +113,7 @@ export function EventsView() {
                 <span className="ev-time">{relTime(e.ts)}</span>
                 <span className="ev-dot" data-sev={e.severity} />
                 <span className="ev-type">{e.type}</span>
-                <span className="ev-msg" dangerouslySetInnerHTML={{ __html: e.message }} />
+                <span className="ev-msg">{e.message}</span>
                 <span className="ev-meta">{e.meta ?? "—"}</span>
               </div>
             ))

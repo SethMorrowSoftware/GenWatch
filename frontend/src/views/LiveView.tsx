@@ -1,14 +1,15 @@
 // Live dashboard: hero, electrical, controls, engine, fuel, events.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api } from "../api/client";
 import { Card, Icon, LiveTick, Pill, Sparkline, fmt, formatTimeInState } from "../components/primitives";
-import type { ActiveAlarm, EngineState, Reading, StatusBody } from "../types";
+import type { ActiveAlarm, EngineState, EventRow, Reading, StatusBody } from "../types";
 import { ConfirmModal } from "./ConfirmModal";
 
 interface Props {
   status: StatusBody;
   history: Reading[];
+  operator: string;
 }
 
 const STATE_LABEL: Record<EngineState, string> = {
@@ -39,7 +40,7 @@ const STATE_BADGE: Record<EngineState, string> = {
   unknown: "—",
 };
 
-export function LiveView({ status, history }: Props) {
+export function LiveView({ status, history, operator }: Props) {
   const [confirmCmd, setConfirmCmd] = useState<"start" | "stop" | "exercise" | "transfer" | null>(null);
 
   const reading = status.reading;
@@ -61,7 +62,6 @@ export function LiveView({ status, history }: Props) {
               Auto · {status.exercise.time} {capitalize(status.exercise.day)} exercise
             </Pill>
           )}
-          <Pill tone="ok">1 HTS · {status.activeAlarms.length} annunciators</Pill>
         </div>
       </div>
 
@@ -85,7 +85,7 @@ export function LiveView({ status, history }: Props) {
 
       <ConfirmModal
         command={confirmCmd}
-        operator={(status as any)?.operatorName ?? "operator"}
+        operator={operator}
         onClose={() => setConfirmCmd(null)}
         onSuccess={() => setConfirmCmd(null)}
       />
@@ -442,9 +442,6 @@ function FuelMaintCard({ reading: r, status }: { reading: Reading; status: Statu
 }
 
 // ─── Events feed ─────────────────────────────────────────────────────────
-import { useEffect } from "react";
-import type { EventRow } from "../types";
-
 function EventsFeed({ limit = 6 }: { limit?: number }) {
   const [events, setEvents] = useState<EventRow[]>([]);
   useEffect(() => {
@@ -477,7 +474,7 @@ function EventsFeed({ limit = 6 }: { limit?: number }) {
             <span className="ev-time">{relTime(e.ts)}</span>
             <span className="ev-dot" data-sev={e.severity} />
             <span className="ev-type">{e.type}</span>
-            <span className="ev-msg" dangerouslySetInnerHTML={{ __html: e.message }} />
+            <span className="ev-msg">{e.message}</span>
             <span className="ev-meta">{e.meta ?? "—"}</span>
           </div>
         ))}

@@ -62,7 +62,7 @@ class StateMachine:
             self.db.write_event(
                 severity="ok",
                 type_="TRANSITION",
-                message=f"Engine state: <em>{old}</em> → <em>{new_state}</em>",
+                message=f"Engine state: {old} → {new_state}",
                 meta=None,
             )
             log.info("Engine state transition: %s -> %s", old, new_state)
@@ -81,7 +81,7 @@ class StateMachine:
                         self.db.write_event(
                             severity=ac.severity,
                             type_="ALARM",
-                            message=f"Alarm raised — <em>{ac.desc}</em>",
+                            message=f"Alarm raised — {ac.desc}",
                             meta=f"code {ac.code}",
                         )
                         emitted.append(
@@ -109,7 +109,7 @@ class StateMachine:
                         self.db.write_event(
                             severity="ok",
                             type_="ALARM",
-                            message=f"Alarm cleared — <em>{ac.desc}</em>",
+                            message=f"Alarm cleared — {ac.desc}",
                             meta=f"code {ac.code}",
                         )
                         emitted.append({
@@ -126,7 +126,7 @@ class StateMachine:
             self.db.write_event(
                 severity="warn" if comms.state != "healthy" else "ok",
                 type_="COMMS",
-                message=f"Comms <em>{comms.state}</em> · {comms.success_pct:.1f}% success",
+                message=f"Comms {comms.state} · {comms.success_pct:.1f}% success",
                 meta=None,
             )
             emitted.append({

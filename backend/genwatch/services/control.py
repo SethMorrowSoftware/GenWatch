@@ -162,7 +162,7 @@ class ControlService:
             self.db.write_event(
                 severity="warn",
                 type_="COMMAND",
-                message=f"Operator command <em>{verb}</em> — Modbus write failed",
+                message=f"Operator command {verb} — Modbus write failed",
                 meta=res.error or "",
             )
             if self.slack is not None:
@@ -179,7 +179,7 @@ class ControlService:
         self.db.write_event(
             severity="ok",
             type_="COMMAND",
-            message=f"Operator command <em>{verb}</em> — confirmed",
+            message=f"Operator command {verb} — confirmed",
             meta=operator,
         )
         if self.slack is not None:

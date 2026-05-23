@@ -208,7 +208,7 @@ async def lifespan(app: FastAPI):
                     return
                 # Ping only while the poller is running — if the poller has
                 # hung, we stop pinging and systemd will restart us.
-                if poller._running:  # type: ignore[attr-defined]
+                if poller.is_running:
                     notify.watchdog()
         watchdog_task = asyncio.create_task(_watchdog_loop(), name="sd-watchdog")
 

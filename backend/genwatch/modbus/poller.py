@@ -86,6 +86,10 @@ class Poller:
             len(self._prime_batches), len(self._base_batches),
         )
 
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
     # ---- lifecycle ----
     async def start(self) -> None:
         if self._running:

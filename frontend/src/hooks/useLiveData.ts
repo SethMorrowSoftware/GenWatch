@@ -76,7 +76,8 @@ export function useLiveData(): LiveState {
         let msg: LiveMessage;
         try {
           msg = JSON.parse(ev.data);
-        } catch {
+        } catch (e) {
+          console.warn("ws: failed to parse message", e);
           return;
         }
         applyMessage(msg);
