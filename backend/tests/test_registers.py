@@ -25,6 +25,49 @@ def test_loads_default_yaml(regmap):
     assert len(regmap.registers) >= 15
     assert "remote_start" in regmap.controls
     assert "remote_stop" in regmap.controls
+    # H-100 start/stop are FC16 multi-register writes at 0x019C
+    assert regmap.controls["remote_start"].fc == 16
+    assert regmap.controls["remote_start"].write_values == (0x0080, 0x0000, 0x0000)
+    assert regmap.controls["remote_stop"].write_values == (0x0000, 0x0000, 0x0000)
+
+
+def test_engine_state_bits_present(regmap):
+    states = {rule.state for rule in regmap.engine_state_bits}
+    assert {"running", "stopped", "cranking", "cooling", "exercising", "alarm"} <= states
+
+
+def test_alarm_bits_present(regmap):
+    codes = {a.code for a in regmap.alarm_bits}
+    assert "OVERCRANK" in codes
+    assert "COOLANT_TEMP_HIGH_ALARM" in codes
+
+
+def test_derive_engine_state_priority(regmap):
+    # Alarm bit beats running bit.
+    values = {
+        "output_status_1": 0x8000 | 0x2000,  # Common Alarm + Generator Running
+        "output_status_7": 0,
+    }
+    assert regmap.derive_engine_state(values) == "alarm"
+
+    # Cranking wins over stopped.
+    values = {"output_status_1": 0x0100, "output_status_7": 0x1000}
+    assert regmap.derive_engine_state(values) == "cranking"
+
+    # Cool-down.
+    values = {"output_status_1": 0, "output_status_7": 0x2000}
+    assert regmap.derive_engine_state(values) == "cooling"
+
+    # No state bits → unknown.
+    assert regmap.derive_engine_state({"output_status_1": 0, "output_status_7": 0}) == "unknown"
+
+
+def test_derive_active_alarms(regmap):
+    # Coolant Temp High Alarm bit in output_status_2.
+    active = regmap.derive_active_alarms({"output_status_2": 0x1000})
+    assert any(a.code == "COOLANT_TEMP_HIGH_ALARM" for a in active)
+    # Nothing set → empty.
+    assert regmap.derive_active_alarms({"output_status_2": 0}) == []
 
 
 def test_register_addresses_are_unique(regmap):
@@ -33,10 +76,13 @@ def test_register_addresses_are_unique(regmap):
 
 
 def test_control_addresses_distinct_from_reads(regmap):
+    # The H-100 has a few legitimate dual-purpose registers (write to
+    # trigger, read to check status). Whitelist those; flag any others.
+    DUAL_PURPOSE = {0x022B, 0x012E}  # QUIETTEST_STATUS, ALARM_ACK
     read_addrs = {r.addr for r in regmap.registers}
     ctl_addrs = {c.addr for c in regmap.controls.values()}
-    overlap = read_addrs & ctl_addrs
-    assert not overlap, f"control register overlaps with read register: {overlap}"
+    overlap = (read_addrs & ctl_addrs) - DUAL_PURPOSE
+    assert not overlap, f"unexpected control/read overlap at: {[hex(a) for a in overlap]}"
 
 
 @pytest.mark.parametrize(
@@ -89,5 +135,16 @@ def test_validate_register_map_detects_overlap_and_bad_fc(regmap):
 
     report = validate_register_map(regmap)
     assert not report.ok
-    assert any("overlap" in e for e in report.errors)
+    assert any("word overlap" in e for e in report.errors)
     assert any("unsupported write fc" in e for e in report.errors)
+
+
+def test_validate_register_map_control_read_share_is_warning():
+    # Dual-purpose H-100 registers (e.g. ack_alarm/exercise sharing addrs
+    # with their status reads) should surface as warnings, not errors.
+    # Load a fresh regmap — the module-scoped fixture gets mutated by
+    # the test above.
+    rm = load_register_map(Path(__file__).parent.parent / "genwatch/registers/h100.yaml")
+    report = validate_register_map(rm)
+    assert report.ok
+    assert any("shares address" in w for w in report.warnings)

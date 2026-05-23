@@ -44,8 +44,14 @@ async def alarm_codes(request: Request) -> dict:
     regmap = request.app.state.regmap
     return {
         "codes": [
-            {"code": a.code, "desc": a.desc, "severity": a.severity}
-            for a in regmap.alarm_codes
+            {
+                "code": a.code,
+                "desc": a.desc,
+                "severity": a.severity,
+                "register": a.register,
+                "mask": f"0x{a.mask:04X}",
+            }
+            for a in regmap.alarm_bits
         ]
     }
 

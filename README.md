@@ -432,9 +432,9 @@ You should see something like:
   Mock:      False
   Auth:      MISSING admin_password_hash — run: genwatch hash <password>
   Registers: /opt/genwatch/genwatch/registers/h100.yaml
-             18 read + 4 write, slave=100
+             35 read + 5 write, slave=100
   Serial:    /dev/genwatch-modbus opens OK at 9600 8N1
-  Modbus:    slave 100 responded with [2] (37ms)
+  Modbus:    slave 100 responded with [0] (37ms)
 
 ⚠  ADMIN PASSWORD NOT SET
 ```
@@ -500,18 +500,21 @@ The bundled `genwatch doctor` and `genwatch modbusdump` commands let you check t
 # Full pre-flight: config, serial port permissions, register map, DB, and a live Modbus probe
 sudo genwatch doctor
 
-# Read a sweep of 16 registers starting at 0x0001 (engine_state region)
-sudo -u genwatch genwatch modbusdump --addr 0x0001 --count 16
-# → 0x0001    2  0x0002      (engine_state — 2 = running)
-# → 0x0002    0  0x0000      (alarm_state)
-# → 0x0003    3  0x0003      (switch_state)
-# ...
+# Read a sweep of 16 registers starting at 0x0080 (status bitfield region)
+sudo -u genwatch genwatch modbusdump --addr 0x0080 --count 16
+# → 0x0080  0x8000  (input_status_1 — bit 0x8000 = "Switch In Auto")
+# → 0x0082  0x0100  (output_status_1 — bit 0x0100 = "Stopped")
+# → 0x0083  0x0000  (output_status_2 — no oil/coolant alarms)
+# → ...
 
-# Try the kW register specifically (default 0x0028)
-sudo -u genwatch genwatch modbusdump --addr 0x0028 --count 1
+# Try the kW register specifically (H-100 default 0x00AE, u32 / 2 regs)
+sudo -u genwatch genwatch modbusdump --addr 0x00AE --count 2
+
+# Frequency (scale 0.1 — raw 600 = 60.0 Hz)
+sudo -u genwatch genwatch modbusdump --addr 0x00B2 --count 2
 ```
 
-If `modbusdump` returns values but they don't match what you see on the H-100 panel, your firmware revision uses different addresses. See [§12 Adapting the register map](#12-adapting-the-register-map).
+If `modbusdump` returns values but they don't match what you see on the H-100 panel, you may have a G-Panel revision (addresses shift by 6–0x20) or a dealer-customized firmware. See [§12 Adapting the register map](#12-adapting-the-register-map).
 
 ---
 
@@ -526,7 +529,12 @@ The Live view is the operator console: engine state, electrical output, control 
 - **Quiet-Test**: 30-minute unloaded exercise. Idle exercise schedule shown at the top right.
 - **Transfer back**: while running, hand the load back to utility and cool down.
 
-All commands write to the H-100's control registers (`0x00A0..A3`) via FC06 and are audit-logged with the operator, timestamp, register, value, and result.
+All commands are FC16 multi-register writes:
+- **Start / Stop / Transfer** write a 3-register payload to `0x019C` (`START_BITS`) — e.g. start = `[0x0080, 0x0000, 0x0000]`, stop = `[0x0000, 0x0000, 0x0000]`, transfer = `[0x0080, 0x0000, 0x0080]`.
+- **Quiet-Test** writes `0x0001` to `0x022B` (`QUIETTEST_STATUS`); the same register reads back the test's running status.
+- **Acknowledge Alarm** writes `0x0001` to `0x012E` (`ALARM_ACK`).
+
+Every command is audit-logged with the operator, timestamp, register, the actual word values written, and the result.
 
 ### Views
 
@@ -777,8 +785,10 @@ Pi 5 needs a true 5 V / 5 A supply. Cheap USB-C chargers brown out under USB per
 │   └─ /api/registers  read/reload register map                    │
 │                                                                  │
 │  Two-tier Modbus poller:                                         │
-│   • prime (1.5 s): engine_state, alarm_state, switch_state       │
-│   • base  (15 s):  RPM, V, A, Hz, kW, oil P, coolant, batt,…    │
+│   • prime (1.5 s): output_status_1..8 bitfields, key switch,     │
+│                    quiet-test status, alarm count                │
+│   • base  (15 s):  RPM, V, A, Hz, kW, oil P/T, coolant, batt,…  │
+│  Engine state + active alarms derived from the bitfield bits.    │
 │  Coalesces contiguous registers into a single Modbus read.       │
 │                                                                  │
 │  State machine + control service:                                │
@@ -818,15 +828,24 @@ Pi 5 needs a true 5 V / 5 A supply. Cheap USB-C chargers brown out under USB per
 
 ## 12. Adapting the register map
 
-The shipped `backend/genwatch/registers/h100.yaml` matches the addresses in Generac's reference docs for current H-100 firmware. Older or dealer-customized firmware may differ. To find your real addresses:
+The shipped `backend/genwatch/registers/h100.yaml` is derived from the [`jgyates/genmon`](https://github.com/jgyates/genmon/blob/master/genmonlib/generac_HPanel.py) project's `generac_HPanel.py` — a field-tested open-source H-100 integration cross-checked against the [Monico H100 Combined Data Map](https://www.monicoinc.com/downloads/H100_Combined_Data_Map-WEB.xls). If you're seeing wrong values on a real panel, the most likely causes (in order) are:
+
+1. **It's actually a G-Panel, not an H-100.** Generac's industrial line includes a G-Panel sibling controller. Addresses shift by 6–0x20 — see `GPanelReg` in genmon's source. Symptom: the telemetry block reads as garbage but the link is healthy.
+2. **Dealer-customized firmware** with different addresses for a few sensors.
+3. **A scale factor difference** — values look 10× or 100× off but otherwise correct.
+
+To investigate:
 
 ```bash
-# Read a sweep of 16 holding registers starting at 0x0001
-sudo -u genwatch genwatch modbusdump --addr 0x0001 --count 16
+# Sweep the status bitfield region (state, alarms, key switch)
+sudo -u genwatch genwatch modbusdump --addr 0x0080 --count 16
+
+# Sweep the telemetry block (engine + AC output)
+sudo -u genwatch genwatch modbusdump --addr 0x008A --count 48
 
 # Probe common H-100 register regions
-for a in 0x0001 0x0010 0x0020 0x0028 0x0030 0x00A0; do
-  sudo -u genwatch genwatch modbusdump --addr $a --count 8
+for a in 0x0080 0x008A 0x009E 0x00AE 0x012F 0x0130 0x019C 0x022B; do
+  sudo -u genwatch genwatch modbusdump --addr $a --count 4
 done
 ```
 
@@ -857,7 +876,12 @@ Or restart the service to fully rebind the poller batching:
 sudo systemctl restart genwatch
 ```
 
-The YAML schema is documented in comments at the top of `h100.yaml` — `addr`, `fc`, `type` (`u16`/`s16`/`u32`/`s32`/`bitfld`/`enum`), `scale`, `tier` (`prime`/`base`), `group`, `unit`, `warn_range`, `alarm_range`.
+The YAML schema is documented in comments at the top of `h100.yaml`. Key sections:
+
+- **`registers`** — per register: `addr`, `fc` (3/4), `type` (`u16`/`s16`/`u32`/`s32`/`bitfld`/`enum`), `scale`, `tier` (`prime`/`base`), `group`, `unit`, `warn_range`, `alarm_range`. Most H-100 telemetry slots are 2-register `u32` blocks; the meaningful value lives in the low word and the decoder reads them as big-endian.
+- **`engine_state_bits`** — priority-ordered rules mapping bitfield bits to engine states (`stopped` / `cranking` / `running` / `cooling` / `exercising` / `alarm`). First matching rule wins.
+- **`alarm_bits`** — flat table of alarm bits across `output_status_2..8`. Each entry has `register`, `mask`, `code`, `desc`, `severity` (`alarm`/`warn`). Multiple alarms can be active simultaneously.
+- **`controls`** — write-gated commands. Single-register writes use `value: N` with `fc: 6`; multi-register writes (H-100 start/stop/transfer at `0x019C`) use `values: [w1, w2, w3]` with `fc: 16`.
 
 ---
 

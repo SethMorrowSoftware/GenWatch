@@ -153,9 +153,18 @@ class ControlService:
         # Consume token (atomic with state check)
         await self.consume_token(token, operator)
 
-        # Write the Modbus register.
-        log.warning("CONTROL %s by %s -> %s @0x%04X = %d", verb, operator, ctl.name, ctl.addr, ctl.value)
-        res = await self.client.write(ctl.addr, ctl.value, fc=ctl.fc)
+        # Write the Modbus register(s). FC16 multi-register writes use `values`;
+        # FC06/FC16 single-register writes use a one-element list.
+        write_words = list(ctl.write_values)
+        log.warning(
+            "CONTROL %s by %s -> %s @0x%04X fc=%d values=%s",
+            verb, operator, ctl.name, ctl.addr, ctl.fc,
+            [f"0x{w:04X}" for w in write_words],
+        )
+        if len(write_words) == 1 and ctl.fc == 6:
+            res = await self.client.write(ctl.addr, write_words[0], fc=6)
+        else:
+            res = await self.client.write(ctl.addr, fc=ctl.fc, values=write_words)
         ts = time.time()
         if not res.ok:
             self.db.write_audit(operator, f"control.{verb}", res.error or "modbus_write_failed", token, "failed")
@@ -172,7 +181,7 @@ class ControlService:
         self.db.write_audit(
             operator,
             f"control.{verb}",
-            f"reg={ctl.name}@0x{ctl.addr:04X}=value:{ctl.value}",
+            f"reg={ctl.name}@0x{ctl.addr:04X} fc{ctl.fc} values={[hex(w) for w in write_words]}",
             token,
             "ok",
         )
@@ -184,4 +193,10 @@ class ControlService:
         )
         if self.slack is not None:
             await self.slack.alert_command(verb, operator, "ok", ts)
-        return {"ok": True, "verb": verb, "register": ctl.name, "addr": ctl.addr, "value": ctl.value}
+        return {
+            "ok": True,
+            "verb": verb,
+            "register": ctl.name,
+            "addr": ctl.addr,
+            "values": write_words,
+        }

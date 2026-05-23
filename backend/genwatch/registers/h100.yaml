@@ -2,36 +2,50 @@
 #
 # WHY THIS FILE EXISTS
 # --------------------
-# The Generac H-100 controller exposes Modbus RTU over RS-485 on its rear
-# Modbus port. The register layout below matches what is shipped in the
-# design handoff and is consistent with publicly documented H-100 / HSB
-# implementations. However: real installations vary by firmware version
-# and by what the dealer has enabled. Treat this file as the *default*
-# and override per-site by editing the values and reloading from the
-# Settings UI (or by editing /etc/genwatch/registers/h100.yaml on disk
-# and POST /api/registers/reload).
+# The Generac H-100 controller exposes Modbus RTU on its RS-232 PC port
+# (factory default: slave 100, 9600 8N1, FC03 holding registers).
+#
+# The addresses below come from the jgyates/genmon project's
+# `generac_HPanel.py` — a field-tested open-source H-100 integration
+# that has been validated against real panels for years. They are the
+# de-facto community reference. Cross-checked against the Monico Inc.
+# "H100 Combined Data Map" published with their commercial gateway.
+#   https://github.com/jgyates/genmon/blob/master/genmonlib/generac_HPanel.py
+#   https://www.monicoinc.com/downloads/H100_Combined_Data_Map-WEB.xls
+#
+# An earlier version of this file shipped Generac *Evolution* (residential)
+# addresses by mistake — completely different address space. If your panel
+# is actually a G-Panel rather than H-100 the addresses shift by 6-0x20;
+# the genmon source documents both layouts.
 #
 # CONVENTIONS
 # -----------
-#   addr   : Modbus register address (decimal). Hex shown in name comments.
+#   addr   : Modbus register address. Hex (0x...) preferred.
 #   fc     : Function code. 3=read holding, 4=read input, 6=write single,
 #            16=write multiple.
 #   type   : u16 | s16 | u32 | s32 | bitfld | enum
-#   scale  : multiply raw integer by this to get engineering units
-#            (e.g. 0.1 means raw 1798 -> 179.8). Default 1.
-#   tier   : prime | base. Prime registers poll fast (state & alarms),
-#            base registers poll slower (slow-changing telemetry).
-#   group  : free-text grouping for the Settings UI register table.
-#   warn_range / alarm_range : optional [lo, hi] tuples. If the decoded
-#            value falls outside the range, GenWatch raises a soft warning
-#            or alarm event. Engine hardware safeties remain primary.
+#            (H-100 packs most 16-bit sensors into u32 slots — the
+#             meaningful value lives in the low word.)
+#   scale  : multiply raw integer by this to get engineering units.
+#   tier   : prime | base. Prime polls fast (state/alarm bits),
+#            base polls slow (telemetry).
 #
-# SAFETY
-# ------
-# Write-gated registers (FC06) are *commands*. They are protected by the
-# confirm-token flow in /api/control/*. Do NOT add registers to this file
-# with fc:6 unless they are intentional control surfaces — anything with
-# fc:6 is exposed to the operator as a control button on the Live view.
+# STATE AND ALARMS ARE BITFIELDS, NOT ENUMS
+# -----------------------------------------
+# The H-100 does *not* expose engine state as a single integer enum.
+# State is derived from bits across two registers:
+#   - output_status_1 (0x0082)   — "Generator Running", "Stopped", etc.
+#   - output_status_7 (0x0088)   — "Cranking", "In Cool Down", etc.
+# See `engine_state_bits` below for the priority-ordered decode rules.
+#
+# Alarms are similarly bit-flagged across output_status_2..8. Multiple
+# alarms can be active simultaneously. See `alarm_bits` below.
+#
+# CONTROL WRITES
+# --------------
+# Start/Stop/Transfer use FC16 (write multiple) at 0x019C, writing 3
+# registers at once with specific bit patterns. quiettest and ackalarm
+# are single-register FC16 writes. See `controls` below.
 
 site:
   id: SITE-23
@@ -47,82 +61,160 @@ site:
     quiet: true
 
 modbus:
-  slave: 100        # 0x64
-  read_fc: 3        # 0x03 — read holding (H-100 default)
+  slave: 100        # 0x64 — H-100 factory default
+  read_fc: 3        # FC03 read holding (H-100 default)
   prime_poll_ms: 1500
   base_poll_ms: 15000
   timeout_s: 1.5
   retries: 2
-  backoff_s: [0.25, 0.5, 1.0]   # per retry attempt
+  backoff_s: [0.25, 0.5, 1.0]
 
-# ─── State / alarm decoding tables ────────────────────────────────────────
-# Raw register -> engine state enum. The H-100 typically reports a small
-# enum in 0x0001. Adjust the right-hand keys if your firmware differs;
-# the canonical states are: stopped | cranking | running | exercising |
-# cooling | alarm.
-engine_state_map:
-  0: stopped
-  1: cranking
-  2: running
-  3: running     # H-100 sometimes splits "running unloaded" vs "on load"
-  4: exercising
-  5: cooling
-  6: alarm
-  255: alarm     # firmware fault sentinel
+# ─── Engine state derivation ──────────────────────────────────────────────
+# Rules are evaluated in order; the first one whose `bits_set` are ALL
+# set in the named register wins. "alarm" rule should come first so a
+# faulted-while-running engine reports "alarm" not "running".
+engine_state_bits:
+  - { state: alarm,      register: output_status_1, mask: 0x8000 }   # Common Alarm
+  - { state: cranking,   register: output_status_7, mask: 0x1000 }   # Cranking
+  - { state: cooling,    register: output_status_7, mask: 0x2000 }   # In Cool Down
+  - { state: exercising, register: output_status_7, mask: 0x0020 }   # Internal Exercise Active
+  - { state: running,    register: output_status_1, mask: 0x2000 }   # Generator Running
+  - { state: stopped,    register: output_status_1, mask: 0x0100 }   # Stopped
 
-# alarm_state register — anything non-zero means an alarm is active.
-# The bitfield/value -> human description is in alarm_codes below.
-alarm_codes:
-  - { code: "0x40", desc: "Overcrank",              severity: alarm }
-  - { code: "0x41", desc: "Overspeed",              severity: alarm }
-  - { code: "0x42", desc: "Low Oil Pressure",       severity: alarm }
-  - { code: "0x43", desc: "High Engine Temp",       severity: alarm }
-  - { code: "0x44", desc: "Emergency Stop",         severity: alarm }
-  - { code: "0x52", desc: "Low Coolant Level",      severity: alarm }
-  - { code: "0x60", desc: "Low Battery",            severity: warn  }
-  - { code: "0x61", desc: "Charger Failure",        severity: warn  }
-  - { code: "0x70", desc: "Comms Loss (RS-485)",    severity: warn  }
-  - { code: "0x71", desc: "HTS-1 Not Responding",   severity: warn  }
+# ─── Alarm decoding ───────────────────────────────────────────────────────
+# Each entry is one bit in one of the output_status_N bitfield registers.
+# When the bit is set, the alarm is active. Multiple can be active at
+# once; the state machine tracks them as a set.
+alarm_bits:
+  # output_status_1 (0x0082) — top-level
+  - { register: output_status_1, mask: 0x8000, code: "COMMON_ALARM",        desc: "Common Alarm",                  severity: alarm }
+  - { register: output_status_1, mask: 0x4000, code: "COMMON_WARNING",      desc: "Common Warning",                severity: warn  }
+  - { register: output_status_1, mask: 0x0200, code: "STOPPED_IN_ALARM",    desc: "Stopped in Alarm",              severity: alarm }
+  - { register: output_status_1, mask: 0x0010, code: "OVERCRANK",           desc: "Overcrank",                     severity: alarm }
+  - { register: output_status_1, mask: 0x0008, code: "OIL_INHIBIT",         desc: "Oil Inhibit Alarm",             severity: alarm }
+  - { register: output_status_1, mask: 0x0002, code: "OIL_TEMP_HIGH_ALARM", desc: "Oil Temp High Alarm",           severity: alarm }
+  - { register: output_status_1, mask: 0x0001, code: "OIL_TEMP_LOW_ALARM",  desc: "Oil Temp Low Alarm",            severity: alarm }
+  # output_status_2 (0x0083) — oil/coolant
+  - { register: output_status_2, mask: 0x8000, code: "OIL_TEMP_HIGH_WARN",  desc: "Oil Temp High Warning",         severity: warn  }
+  - { register: output_status_2, mask: 0x4000, code: "OIL_TEMP_LOW_WARN",   desc: "Oil Temp Low Warning",          severity: warn  }
+  - { register: output_status_2, mask: 0x2000, code: "OIL_TEMP_FAULT",      desc: "Oil Temp Sensor Fault",         severity: warn  }
+  - { register: output_status_2, mask: 0x1000, code: "COOLANT_TEMP_HIGH_ALARM", desc: "Coolant Temp High Alarm",   severity: alarm }
+  - { register: output_status_2, mask: 0x0800, code: "COOLANT_TEMP_LOW_ALARM",  desc: "Coolant Temp Low Alarm",    severity: alarm }
+  - { register: output_status_2, mask: 0x0400, code: "COOLANT_TEMP_HIGH_WARN",  desc: "Coolant Temp High Warning", severity: warn  }
+  - { register: output_status_2, mask: 0x0200, code: "COOLANT_TEMP_LOW_WARN",   desc: "Coolant Temp Low Warning",  severity: warn  }
+  - { register: output_status_2, mask: 0x0100, code: "COOLANT_TEMP_FAULT",  desc: "Coolant Temp Sensor Fault",     severity: warn  }
+  - { register: output_status_2, mask: 0x0080, code: "OIL_PRESSURE_HIGH_ALARM", desc: "Oil Pressure High Alarm",   severity: alarm }
+  - { register: output_status_2, mask: 0x0040, code: "OIL_PRESSURE_LOW_ALARM",  desc: "Oil Pressure Low Alarm",    severity: alarm }
+  - { register: output_status_2, mask: 0x0020, code: "OIL_PRESSURE_HIGH_WARN",  desc: "Oil Pressure High Warning", severity: warn  }
+  - { register: output_status_2, mask: 0x0010, code: "OIL_PRESSURE_LOW_WARN",   desc: "Oil Pressure Low Warning",  severity: warn  }
+  - { register: output_status_2, mask: 0x0008, code: "OIL_PRESSURE_FAULT", desc: "Oil Pressure Sensor Fault",      severity: warn  }
+  - { register: output_status_2, mask: 0x0004, code: "COOLANT_LEVEL_HIGH_ALARM", desc: "Coolant Level High Alarm", severity: alarm }
+  - { register: output_status_2, mask: 0x0002, code: "COOLANT_LEVEL_LOW_ALARM",  desc: "Coolant Level Low Alarm",  severity: alarm }
+  - { register: output_status_2, mask: 0x0001, code: "COOLANT_LEVEL_HIGH_WARN",  desc: "Coolant Level High Warning", severity: warn }
+  # output_status_3 (0x0084) — coolant level / fuel / throttle
+  - { register: output_status_3, mask: 0x8000, code: "COOLANT_LEVEL_LOW_WARN",   desc: "Coolant Level Low Warning", severity: warn }
+  - { register: output_status_3, mask: 0x4000, code: "COOLANT_LEVEL_FAULT",  desc: "Coolant Level Sensor Fault",    severity: warn  }
+  - { register: output_status_3, mask: 0x2000, code: "FUEL_LEVEL_HIGH_ALARM", desc: "Fuel Level High Alarm",        severity: alarm }
+  - { register: output_status_3, mask: 0x1000, code: "FUEL_LEVEL_LOW_ALARM",  desc: "Fuel Level Low Alarm",         severity: alarm }
+  - { register: output_status_3, mask: 0x0800, code: "FUEL_LEVEL_HIGH_WARN",  desc: "Fuel Level High Warning",      severity: warn  }
+  - { register: output_status_3, mask: 0x0400, code: "FUEL_LEVEL_LOW_WARN",   desc: "Fuel Level Low Warning",       severity: warn  }
+  - { register: output_status_3, mask: 0x0200, code: "FUEL_LEVEL_FAULT",      desc: "Fuel Level Sensor Fault",      severity: warn  }
+  - { register: output_status_3, mask: 0x0008, code: "THROTTLE_HIGH_ALARM",   desc: "Throttle Position High Alarm", severity: alarm }
+  - { register: output_status_3, mask: 0x0004, code: "THROTTLE_LOW_ALARM",    desc: "Throttle Position Low Alarm",  severity: alarm }
+  # output_status_4 (0x0085) — battery
+  - { register: output_status_4, mask: 0x8000, code: "THROTTLE_FAULT",        desc: "Throttle Position Fault",      severity: warn  }
+  - { register: output_status_4, mask: 0x0010, code: "BATT_VOLT_HIGH_ALARM",  desc: "Battery Voltage High Alarm",   severity: alarm }
+  - { register: output_status_4, mask: 0x0008, code: "BATT_VOLT_LOW_ALARM",   desc: "Battery Voltage Low Alarm",    severity: alarm }
+  - { register: output_status_4, mask: 0x0004, code: "BATT_VOLT_HIGH_WARN",   desc: "Battery Voltage High Warning", severity: warn  }
+  - { register: output_status_4, mask: 0x0002, code: "BATT_VOLT_LOW_WARN",    desc: "Battery Voltage Low Warning",  severity: warn  }
+  - { register: output_status_4, mask: 0x0001, code: "BATT_VOLT_FAULT",       desc: "Battery Voltage Sensor Fault", severity: warn  }
+  # output_status_5 (0x0086) — AC output
+  - { register: output_status_5, mask: 0x1000, code: "AVG_VOLT_HIGH_ALARM",   desc: "Average Voltage High Alarm",   severity: alarm }
+  - { register: output_status_5, mask: 0x0800, code: "AVG_VOLT_LOW_ALARM",    desc: "Average Voltage Low Alarm",    severity: alarm }
+  - { register: output_status_5, mask: 0x0010, code: "FREQ_HIGH_ALARM",       desc: "Generator Frequency High Alarm", severity: alarm }
+  - { register: output_status_5, mask: 0x0008, code: "FREQ_LOW_ALARM",        desc: "Generator Frequency Low Alarm",  severity: alarm }
+  # output_status_6 (0x0087) — RPM and DI
+  - { register: output_status_6, mask: 0x8000, code: "RPM_HIGH_ALARM",        desc: "Engine RPM High Alarm",        severity: alarm }
+  - { register: output_status_6, mask: 0x4000, code: "RPM_LOW_ALARM",         desc: "Engine RPM Low Alarm",         severity: alarm }
+  - { register: output_status_6, mask: 0x0800, code: "RPM_FAULT",             desc: "Engine RPM Sensor Fault",      severity: warn  }
+  - { register: output_status_6, mask: 0x0040, code: "BATT_CHARGER_FAIL",     desc: "Battery Charger Fail (DI-1)",  severity: warn  }
+  # output_status_7 (0x0088) — operational
+  - { register: output_status_7, mask: 0x0800, code: "NEEDS_SERVICE",         desc: "Needs Service",                severity: warn  }
+  - { register: output_status_7, mask: 0x0400, code: "SHUTDOWN",              desc: "Shutdown",                     severity: alarm }
+  - { register: output_status_7, mask: 0x0200, code: "VOLT_PHASE_ROTATION",   desc: "Check Voltage Phase Rotation", severity: warn  }
+  - { register: output_status_7, mask: 0x0100, code: "CURR_PHASE_ROTATION",   desc: "Check Current Phase Rotation", severity: warn  }
+  # output_status_8 (0x0089)
+  - { register: output_status_8, mask: 0x0200, code: "RPM_MISSING",           desc: "RPM Signal Missing",           severity: alarm }
 
 # ─── Read registers ───────────────────────────────────────────────────────
-# Prime tier — polled every prime_poll_ms (state, alarms, switch).
-# Base tier  — polled every base_poll_ms (slow telemetry).
 registers:
-  # Prime poll · 1.5 s
-  - { name: engine_state,   addr: 0x0001, fc: 3, type: u16,    tier: prime, group: "State", unit: enum }
-  - { name: alarm_state,    addr: 0x0002, fc: 3, type: u16,    tier: prime, group: "State", unit: enum }
-  - { name: switch_state,   addr: 0x0003, fc: 3, type: bitfld, tier: prime, group: "State", unit: bits }
+  # Prime · 1.5 s — bitfields used for state + alarm derivation
+  - { name: input_status_1,    addr: 0x0080, fc: 3, type: bitfld, tier: prime, group: "State", unit: bits }
+  - { name: output_status_1,   addr: 0x0082, fc: 3, type: bitfld, tier: prime, group: "State", unit: bits }
+  - { name: output_status_2,   addr: 0x0083, fc: 3, type: bitfld, tier: prime, group: "Alarms", unit: bits }
+  - { name: output_status_3,   addr: 0x0084, fc: 3, type: bitfld, tier: prime, group: "Alarms", unit: bits }
+  - { name: output_status_4,   addr: 0x0085, fc: 3, type: bitfld, tier: prime, group: "Alarms", unit: bits }
+  - { name: output_status_5,   addr: 0x0086, fc: 3, type: bitfld, tier: prime, group: "Alarms", unit: bits }
+  - { name: output_status_6,   addr: 0x0087, fc: 3, type: bitfld, tier: prime, group: "Alarms", unit: bits }
+  - { name: output_status_7,   addr: 0x0088, fc: 3, type: bitfld, tier: prime, group: "State", unit: bits }
+  - { name: output_status_8,   addr: 0x0089, fc: 3, type: bitfld, tier: prime, group: "Alarms", unit: bits }
 
-  # Base poll · 15 s — engine telemetry
-  - { name: rpm,            addr: 0x0010, fc: 3, type: u16, tier: base, group: "Engine", unit: rpm,  warn_range: [1750, 1850] }
-  - { name: oil_pressure,   addr: 0x0011, fc: 3, type: u16, tier: base, group: "Engine", unit: psi,  warn_range: [35, 80] }
-  - { name: coolant_temp,   addr: 0x0012, fc: 3, type: u16, tier: base, group: "Engine", unit: F,    warn_range: [170, 210], alarm_range: [120, 235] }
-  - { name: battery_volts,  addr: 0x0013, fc: 3, type: u16, tier: base, group: "Engine", unit: V,    scale: 0.1, warn_range: [12.6, 14.6] }
+  # Base · 15 s — engine telemetry
+  # The H-100 returns these as 2-register (u32) slots. The meaningful
+  # value sits in the low word; the high word is reserved/zero. Decoding
+  # as u32 big-endian gives the correct integer for both single- and
+  # large-value sensors (e.g. engine_hours).
+  - { name: oil_temp,          addr: 0x008A, fc: 3, type: u32, tier: base, group: "Engine", unit: F }
+  - { name: coolant_temp,      addr: 0x008C, fc: 3, type: u32, tier: base, group: "Engine", unit: F,    warn_range: [170, 210], alarm_range: [120, 235] }
+  - { name: oil_pressure,      addr: 0x008E, fc: 3, type: u32, tier: base, group: "Engine", unit: psi,  warn_range: [35, 80] }
+  - { name: coolant_level,     addr: 0x0090, fc: 3, type: u32, tier: base, group: "Engine", unit: pct }
+  - { name: fuel_level_pct,    addr: 0x0092, fc: 3, type: u32, tier: base, group: "Engine", unit: pct }
+  - { name: throttle_position, addr: 0x0096, fc: 3, type: u32, tier: base, group: "Engine", unit: pct }
+  - { name: o2_sensor,         addr: 0x0098, fc: 3, type: u32, tier: base, group: "Engine", unit: pct }
+  - { name: batt_charge_current, addr: 0x009A, fc: 3, type: u32, tier: base, group: "Engine", unit: A }
+  - { name: battery_volts,     addr: 0x009C, fc: 3, type: u32, tier: base, group: "Engine", unit: V,    scale: 0.01, warn_range: [12.6, 14.6] }
 
-  # Base poll · 15 s — electrical (line-to-line voltages on phases A/B/C)
-  - { name: gen_voltage_ab, addr: 0x0020, fc: 3, type: u16, tier: base, group: "Electrical", unit: V }
-  - { name: gen_voltage_bc, addr: 0x0021, fc: 3, type: u16, tier: base, group: "Electrical", unit: V }
-  - { name: gen_voltage_ca, addr: 0x0022, fc: 3, type: u16, tier: base, group: "Electrical", unit: V }
-  - { name: gen_current_a,  addr: 0x0023, fc: 3, type: u16, tier: base, group: "Electrical", unit: A }
-  - { name: gen_current_b,  addr: 0x0024, fc: 3, type: u16, tier: base, group: "Electrical", unit: A }
-  - { name: gen_current_c,  addr: 0x0025, fc: 3, type: u16, tier: base, group: "Electrical", unit: A }
-  - { name: frequency,      addr: 0x0026, fc: 3, type: u16, tier: base, group: "Electrical", unit: Hz, scale: 0.1 }
-  - { name: total_kw,       addr: 0x0028, fc: 3, type: u16, tier: base, group: "Electrical", unit: kW }
+  # Base · 15 s — AC output
+  - { name: gen_current_a,     addr: 0x009E, fc: 3, type: u32, tier: base, group: "Electrical", unit: A }
+  - { name: gen_current_b,     addr: 0x00A0, fc: 3, type: u32, tier: base, group: "Electrical", unit: A }
+  - { name: gen_current_c,     addr: 0x00A2, fc: 3, type: u32, tier: base, group: "Electrical", unit: A }
+  - { name: avg_current,       addr: 0x00A4, fc: 3, type: u32, tier: base, group: "Electrical", unit: A }
+  - { name: gen_voltage_ab,    addr: 0x00A6, fc: 3, type: u32, tier: base, group: "Electrical", unit: V }
+  - { name: gen_voltage_bc,    addr: 0x00A8, fc: 3, type: u32, tier: base, group: "Electrical", unit: V }
+  - { name: gen_voltage_ca,    addr: 0x00AA, fc: 3, type: u32, tier: base, group: "Electrical", unit: V }
+  - { name: avg_voltage,       addr: 0x00AC, fc: 3, type: u32, tier: base, group: "Electrical", unit: V }
+  - { name: total_kw,          addr: 0x00AE, fc: 3, type: u32, tier: base, group: "Electrical", unit: kW }
+  - { name: power_factor,      addr: 0x00B0, fc: 3, type: u32, tier: base, group: "Electrical", unit: pf, scale: 0.01 }
+  - { name: frequency,         addr: 0x00B2, fc: 3, type: u32, tier: base, group: "Electrical", unit: Hz, scale: 0.1 }
+  - { name: rpm,               addr: 0x00B4, fc: 3, type: u32, tier: base, group: "Engine", unit: rpm,  warn_range: [1750, 1850] }
 
-  # Base poll · 60 s — accumulators
-  - { name: run_hours,      addr: 0x0030, fc: 3, type: u32, tier: base, group: "Maintenance", unit: h, scale: 0.1 }
-  - { name: start_count,    addr: 0x0032, fc: 3, type: u32, tier: base, group: "Maintenance", unit: count }
-  - { name: fuel_level_pct, addr: 0x0034, fc: 3, type: u16, tier: base, group: "Maintenance", unit: pct }
+  # Base · 15 s — counters / status
+  - { name: active_alarm_count, addr: 0x012F, fc: 3, type: u16, tier: prime, group: "State", unit: count }
+  - { name: run_hours,         addr: 0x0130, fc: 3, type: u32, tier: base, group: "Maintenance", unit: h }
+  - { name: engine_status_code, addr: 0x0132, fc: 3, type: u16, tier: prime, group: "State", unit: enum }
+  - { name: key_switch_state,  addr: 0x01A0, fc: 3, type: bitfld, tier: prime, group: "State", unit: bits }
+  - { name: quiettest_status,  addr: 0x022B, fc: 3, type: u16, tier: prime, group: "State", unit: enum }
 
-# ─── Write-gated control registers ────────────────────────────────────────
-# Each command writes value -> register via FC06. The confirm-token flow
-# enforces operator role + acknowledgement + token freshness before any
-# write fires. The "value" below is what gets written when the command is
-# invoked — most H-100 controllers latch on rising edge so writing 1 once
-# is sufficient. Adjust per site if your firmware requires a different
-# magic number.
+  # NOTE: start_count is not exposed in the H-100 Modbus map. The UI
+  # field will read as null until/unless we surface it from the event
+  # log. Leaving the name out of the YAML so we don't poll a dead addr.
+
+# ─── Control writes ───────────────────────────────────────────────────────
+# start / stop / starttransfer use FC16 to write THREE consecutive
+# registers at 0x019C (START_BITS, START_BITS_2, START_BITS_3). Each
+# command has a specific bit pattern. quiettest and ackalarm are
+# single-register FC16 writes to their own registers.
+#
+# Bit patterns from genmon's `SetGeneratorRemoteCommand`:
+#   start          → [0x0080, 0x0000, 0x0000] at 0x019C
+#   stop           → [0x0000, 0x0000, 0x0000] at 0x019C
+#   starttransfer  → [0x0080, 0x0000, 0x0080] at 0x019C
+#   quiettest      → [0x0001]                  at 0x022B
+#   quietteststop  → [0x0000]                  at 0x022B
+#   ackalarm       → [0x0001]                  at 0x012E
 controls:
-  - { name: remote_start, addr: 0x00A0, fc: 6, value: 1, desc: "Crank engine and transfer to generator" }
-  - { name: remote_stop,  addr: 0x00A1, fc: 6, value: 1, desc: "Initiate cool-down then engine-off" }
-  - { name: exercise,     addr: 0x00A2, fc: 6, value: 1, desc: "Begin 30-minute unloaded quiet test" }
-  - { name: transfer,     addr: 0x00A3, fc: 6, value: 1, desc: "HTS-1 transfer back to utility" }
+  - { name: remote_start, addr: 0x019C, fc: 16, values: [0x0080, 0x0000, 0x0000], desc: "Remote start (no transfer)" }
+  - { name: remote_stop,  addr: 0x019C, fc: 16, values: [0x0000, 0x0000, 0x0000], desc: "Remote stop / cool-down" }
+  - { name: transfer,     addr: 0x019C, fc: 16, values: [0x0080, 0x0000, 0x0080], desc: "Remote start + transfer to generator" }
+  - { name: exercise,     addr: 0x022B, fc: 16, values: [0x0001], desc: "Begin quiet test (unloaded exercise)" }
+  - { name: ack_alarm,    addr: 0x012E, fc: 16, values: [0x0001], desc: "Acknowledge/clear alarm" }
