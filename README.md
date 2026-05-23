@@ -685,6 +685,8 @@ cd genwatch
 cd backend
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+# Optional (recommended for local checks):
+# .venv/bin/pip install -r requirements-dev.txt
 GENWATCH_MOCK=true \
 GENWATCH_AUTH__JWT_SECRET=$(.venv/bin/python -m genwatch gensecret) \
 GENWATCH_AUTH__ADMIN_PASSWORD_HASH=$(.venv/bin/python -m genwatch hash dev) \
@@ -705,7 +707,7 @@ The mock client simulates a plausible H-100 — engine state machine, electrical
 
 ```bash
 cd backend
-.venv/bin/pip install pytest==8.3.4 pytest-asyncio==0.25.0 httpx==0.28.1
+.venv/bin/pip install -r requirements-dev.txt
 .venv/bin/python -m pytest tests/ -v
 # Test categories: register decode + batching, e2e mock control flow,
 # rate-limit, events retention, sd_notify, refuse-to-start safety, Slack notifier
