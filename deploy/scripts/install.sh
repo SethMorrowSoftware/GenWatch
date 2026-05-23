@@ -147,6 +147,13 @@ install -d -m 0755 -o "$USER" -g "$USER" "$APP_DIR" "$DATA_DIR" "$LOG_DIR"
 install -d -m 0755 "$UI_DIR"
 install -d -m 0750 -o "$USER" -g "$USER" "$ETC_DIR"
 
+# `install -d` doesn't reach inside a pre-existing dir, so any db.sqlite
+# / *.log / config.yaml left over from a previous run (possibly created
+# as root by a manual `genwatch doctor`) would keep its old owner and
+# break the service with "attempt to write a readonly database". Force
+# consistent ownership on every install.
+chown -R "$USER:$USER" "$DATA_DIR" "$LOG_DIR" "$ETC_DIR"
+
 # ─── 4. Frontend bundle ───────────────────────────────────────────────────
 # Build if dist is missing or older than any source file.
 build_needed=0
