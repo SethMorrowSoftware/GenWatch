@@ -33,6 +33,23 @@ class SerialConfig(BaseModel):
     timeout_s: float = 1.5
 
 
+class ModbusTcpConfig(BaseModel):
+    """Network bridge to the H-100's serial port.
+
+    Used when ``transport: tcp`` — typically a Lantronix UDS/EDS/xDirect
+    or similar terminal server that tunnels raw bytes between a TCP
+    socket and a physical RS-232/RS-485 port. The H-100 frames Modbus
+    **RTU** on the wire, so the framer must stay 'rtu' even though the
+    transport is TCP — this is *not* Modbus/TCP.
+    """
+
+    host: str = "192.168.1.249"
+    port: int = 10001  # Lantronix raw-TCP default (Channel 1)
+    timeout_s: float = 1.5
+    connect_timeout_s: float = 3.0
+    framer: Literal["rtu", "socket"] = "rtu"
+
+
 class ModbusConfig(BaseModel):
     slave: int = 100
     read_fc: Literal[3, 4] = 3
@@ -107,7 +124,13 @@ class Settings(BaseSettings):
     # /dev/ttyUSB0 exists so the service still boots for development.
     mock: bool = False
 
+    # Which Modbus link to use:
+    #   "tcp"    — Modbus-RTU over a network serial bridge (Lantronix etc.); uses modbus_tcp.
+    #   "serial" — direct USB-to-serial cable on this host; uses serial.
+    transport: Literal["serial", "tcp"] = "tcp"
+
     serial: SerialConfig = Field(default_factory=SerialConfig)
+    modbus_tcp: ModbusTcpConfig = Field(default_factory=ModbusTcpConfig)
     modbus: ModbusConfig = Field(default_factory=ModbusConfig)
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)

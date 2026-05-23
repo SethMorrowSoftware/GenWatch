@@ -8,6 +8,10 @@ A single-pane operator console with live engine state, electrical output, two-st
 
 **Physical layer:** the H-100 has both an **RS-232** port (factory-default Modbus *slave*, 9600 8N1, address 100 — this is what GenLink uses, and what Castle Generator Monitor uses by default) and an **RS-485** port (factory-default Modbus *master* to remote annunciators and HTS transfer switches at 4800 8N2 — not directly usable until the panel is reconfigured). The default install path documented below targets the RS-232 port because that's how the H-100 ships from the factory. An advanced RS-485 path is documented in [§2.5](#25-advanced-rs-485-instead-of-rs-232).
 
+**Transport options:** the Pi can reach the H-100's RS-232/RS-485 port two ways:
+- **TCP bridge (default).** A Lantronix UDS/EDS/xDirect (or Moxa NPort / ser2net) sits next to the generator, owns the serial cable, and exposes it as a raw-TCP socket on the LAN. The Pi connects to that socket. See [§2.6](#26-network-serial-bridge-lantronix--moxa--ser2net). This is the path most installs should use — the Pi can live indoors away from generator heat.
+- **Direct USB serial.** Pi sits at the generator pad with a USB-to-serial cable into the panel. Simpler, no network in the critical path, but the Pi has to be inside the ~15 m RS-232 cable limit.
+
 ![architecture diagram — see docs/HARDWARE for wiring](#)
 
 > **Reliability:** Test coverage lives under `backend/tests/` (register parsing/decoding, hardening, Slack notifier, and end-to-end mock flow). systemd hardened unit with sd_notify watchdog. Service refuses to start if the Modbus link is unreachable (no silent fallback to mock). Login rate-limited. SQLite WAL with crash-safe retention. Audit log on every control command.
@@ -90,6 +94,8 @@ For a field-deployed monitoring station that's expected to run for years, **buy 
 ## 2. Wiring the Modbus link
 
 The H-100 has both an RS-232 port (factory-default Modbus *slave* — the recommended Castle Generator Monitor path) and an RS-485 port (factory-default Modbus *master* — not directly usable until reconfigured). They are **not interchangeable** — RS-232 is ±5–12 V single-ended; RS-485 is differential 0–5 V. Wiring an RS-485 module to the RS-232 port (or vice versa) won't work.
+
+§2.1–§2.5 cover the **direct USB-serial path** (Pi at the generator pad, USB cable into the panel). If you already have a **Lantronix / Moxa / ser2net network serial bridge** in front of the H-100 — or want to install one so the Pi can live indoors — skip to [§2.6](#26-network-serial-bridge-lantronix--moxa--ser2net). You'll still need the 0F7707 or its DIY equivalent (§2.3) to connect the bridge to the panel.
 
 ### 2.1 Identify the RS-232 port on your H-100
 
@@ -182,6 +188,53 @@ Use this only if you have a clear reason: cable run longer than ~15 m, multi-dro
    modbus:
      slave: 100       # whatever slave address the panel is set to
    ```
+
+### 2.6 Network serial bridge (Lantronix / Moxa / ser2net)
+
+If a Lantronix UDS/EDS/xDirect (or Moxa NPort, Digi PortServer, a second Pi running ser2net, etc.) is already wired to the H-100's serial port and exposed on your LAN, you can skip the USB-to-serial cable on this Pi entirely. The bridge tunnels raw bytes between a TCP socket and the physical RS-232/RS-485 line; the H-100 still frames Modbus **RTU** on the wire — so this is *not* Modbus/TCP (which uses a different frame and port 502).
+
+**What you keep / drop from the BOM:**
+- **Drop** the USB-to-DB9 adapter (#5b). The Pi only needs Ethernet/Wi-Fi.
+- **Keep** the **Generac 0F7707** (or the DIY null-modem + panel adapter from §2.3). The bridge has a standard DB9; the H-100's panel connector and required null-modem crossover still need to be handled. The gray "PC" end of the 0F7707 plugs into the bridge's DB9.
+- **Add** the bridge itself (e.g. Lantronix UDS-1100 ≈ $200) and an Ethernet drop at the generator pad.
+
+**Power matters.** The bridge needs to be on the **generator's** load side or its own UPS — otherwise during a utility outage it dies and GenWatch goes blind exactly when you most want telemetry. Same applies to any network switch between the Pi and the bridge.
+
+**Lantronix configuration (web UI on `http://<bridge-ip>`):**
+
+1. **Serial settings** (Channel 1 → Serial Settings) — match the H-100: **9600 baud, 8 data bits, No parity, 1 stop bit, Flow control: None**. If you're on the RS-485 path with factory-default panel settings, use 4800 8N2 instead.
+2. **Connect Mode** (Channel 1 → Connection) — **Active Connection: None**, **Passive Connection: Yes**, **Local Port: 10001** (the Lantronix default). This makes the bridge listen for incoming TCP and forward bytes to the serial port.
+3. **Packing** (Channel 1 → Connection → Pack Control) — set **Idle Gap Time** low (≈ 10 ms). Modbus RTU's end-of-frame is a 3.5-character silence; aggressive packing/Nagle will split frames mid-packet and break framing. Disable Send Frame Immediate only if you observe problems.
+4. **Security** — change the **enable password** under Setup → Security, and (if your firmware supports it) disable Telnet config on **port 9999** from the WAN side. Lantronix devices historically ship with no password and an open config port; treat the bridge like any other admin-accessible network device.
+
+**GenWatch config** (`/etc/genwatch/config.yaml`):
+
+```yaml
+transport: tcp
+modbus_tcp:
+  host: 192.168.1.249   # your Lantronix's IP or hostname
+  port: 10001           # Channel 1 Local Port from step 2
+  timeout_s: 1.5        # bump to 3-5s if you see "timeout" in /api/comms
+  connect_timeout_s: 3.0
+  framer: rtu
+```
+
+After editing, restart: `sudo systemctl restart genwatch`. The Settings UI also lets you flip transport between **TCP bridge** and **USB serial** under Settings → Modbus Link; a service restart is still required after saving.
+
+**Verifying the link** before starting GenWatch:
+
+```bash
+# Confirm the Lantronix is reachable
+ping -c 3 192.168.1.249
+
+# Confirm the raw-TCP port is open
+nc -vz 192.168.1.249 10001     # → "succeeded" means listening
+
+# Optional: poll one Modbus register through the bridge (requires the mbpoll tool)
+mbpoll -m rtu -a 100 -r 1 -c 1 -t 4:hex -P none 192.168.1.249:10001
+```
+
+If `nc` fails, check the bridge's Connect Mode (step 2 above) and any firewall between the Pi and the bridge. If `nc` succeeds but Modbus reads time out, the most common cause is packing settings (step 3) splitting frames — drop Idle Gap Time and try again.
 
 ---
 

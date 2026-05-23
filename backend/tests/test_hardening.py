@@ -138,3 +138,50 @@ def test_config_does_not_auto_mock_when_device_missing(monkeypatch, tmp_path):
     monkeypatch.setenv("GENWATCH_SERIAL__DEVICE", "/dev/definitely-not-a-real-port")
     s = load(None)
     assert s.mock is False
+
+
+# ─── Transport selection (serial vs tcp) ────────────────────────────────
+
+
+def test_transport_defaults_to_tcp(monkeypatch, tmp_path):
+    """The default transport is TCP — most deploys use a Lantronix bridge."""
+    monkeypatch.delenv("GENWATCH_TRANSPORT", raising=False)
+    monkeypatch.setenv("GENWATCH_DATA_DIR", str(tmp_path))
+    s = load(None)
+    assert s.transport == "tcp"
+    assert s.modbus_tcp.port == 10001
+    assert s.modbus_tcp.framer == "rtu"
+
+
+def test_transport_can_be_set_to_serial_via_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("GENWATCH_TRANSPORT", "serial")
+    monkeypatch.setenv("GENWATCH_DATA_DIR", str(tmp_path))
+    s = load(None)
+    assert s.transport == "serial"
+
+
+def test_modbus_tcp_host_port_overridable_via_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("GENWATCH_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("GENWATCH_MODBUS_TCP__HOST", "10.20.30.40")
+    monkeypatch.setenv("GENWATCH_MODBUS_TCP__PORT", "10008")
+    s = load(None)
+    assert s.modbus_tcp.host == "10.20.30.40"
+    assert s.modbus_tcp.port == 10008
+
+
+async def test_tcp_client_reports_failure_when_bridge_unreachable():
+    """Reads must not raise — they return a ModbusResult with ok=False
+    so the poller can surface a 'comms lost' state instead of crashing."""
+    from genwatch.modbus.client import TcpRtuModbusClient
+
+    # 127.0.0.1:1 — privileged port nobody's listening on
+    c = TcpRtuModbusClient(
+        host="127.0.0.1", port=1, framer="rtu",
+        timeout_s=0.5, connect_timeout_s=0.5,
+        slave=100, retries=0, backoff_s=[0.1],
+    )
+    ok = await c.connect()
+    assert ok is False
+    r = await c.read(0x0001, 1)
+    assert r.ok is False
+    assert r.error  # some error string is set

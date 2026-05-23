@@ -33,7 +33,7 @@ from .api import status as status_routes
 from .api import telemetry as telemetry_routes
 from .api import ws as ws_routes
 from .db import Database
-from .modbus.client import MockModbusClient, ModbusClient, SerialModbusClient
+from .modbus.client import MockModbusClient, ModbusClient, SerialModbusClient, TcpRtuModbusClient
 from .modbus.poller import Poller
 from .modbus.registers import load_register_map
 from .services import notify
@@ -82,6 +82,17 @@ async def lifespan(app: FastAPI):
     if settings.mock:
         log.warning("Modbus MOCK mode — no real RS-485 traffic (GENWATCH_MOCK=true)")
         client: ModbusClient = MockModbusClient(regmap)
+    elif settings.transport == "tcp":
+        client = TcpRtuModbusClient(
+            host=settings.modbus_tcp.host,
+            port=settings.modbus_tcp.port,
+            framer=settings.modbus_tcp.framer,
+            timeout_s=settings.modbus_tcp.timeout_s,
+            connect_timeout_s=settings.modbus_tcp.connect_timeout_s,
+            slave=regmap.slave,
+            retries=regmap.retries,
+            backoff_s=regmap.backoff_s,
+        )
     else:
         client = SerialModbusClient(
             device=settings.serial.device,
@@ -101,15 +112,29 @@ async def lifespan(app: FastAPI):
         # cabling/permission problem instead of silently running a mock
         # that looks live. systemd will retry per its restart policy.
         if not settings.mock:
-            msg = (
-                f"Modbus serial connect failed on {settings.serial.device}. "
-                "Check the USB-to-serial adapter is plugged in, the cable to "
-                "the H-100 panel is seated (RS-232 DB9 by default; RS-485 if "
-                "the panel is reconfigured), the baud/parity/stop-bits match "
-                "the panel, and the 'genwatch' user is in the 'dialout' group. "
-                "Run `sudo genwatch doctor` for an itemized check. To run "
-                "without hardware (UI demo), set GENWATCH_MOCK=true."
-            )
+            if settings.transport == "tcp":
+                msg = (
+                    f"Modbus TCP connect to {settings.modbus_tcp.host}:{settings.modbus_tcp.port} failed. "
+                    "Check the Lantronix (or other serial-bridge) is powered and "
+                    "reachable on the LAN (`ping` the host), that Channel 1 → "
+                    "Connection → Connect Mode is 'Always' / passive raw-TCP on "
+                    "this port, that the serial side of the bridge is wired and "
+                    "configured for 9600 8N1 to match the H-100, and that no "
+                    "firewall is between this Pi and the bridge. To fall back "
+                    "to a direct USB-to-serial cable, set `transport: serial` "
+                    "in /etc/genwatch/config.yaml. To run without hardware (UI "
+                    "demo), set GENWATCH_MOCK=true."
+                )
+            else:
+                msg = (
+                    f"Modbus serial connect failed on {settings.serial.device}. "
+                    "Check the USB-to-serial adapter is plugged in, the cable to "
+                    "the H-100 panel is seated (RS-232 DB9 by default; RS-485 if "
+                    "the panel is reconfigured), the baud/parity/stop-bits match "
+                    "the panel, and the 'genwatch' user is in the 'dialout' group. "
+                    "Run `sudo genwatch doctor` for an itemized check. To run "
+                    "without hardware (UI demo), set GENWATCH_MOCK=true."
+                )
             log.error(msg)
             raise RuntimeError(msg)
         raise RuntimeError("mock client failed to connect — this should never happen")
@@ -188,7 +213,13 @@ async def lifespan(app: FastAPI):
     app.state.version = __version__
     app.state.started_at = time.time()
 
-    db.write_event("info", "BOOT", f"Castle Generator Monitor v{__version__} starting", "mock" if settings.mock else "live")
+    if settings.mock:
+        boot_mode = "mock"
+    elif settings.transport == "tcp":
+        boot_mode = f"live · tcp {settings.modbus_tcp.host}:{settings.modbus_tcp.port}"
+    else:
+        boot_mode = f"live · serial {settings.serial.device}"
+    db.write_event("info", "BOOT", f"Castle Generator Monitor v{__version__} starting", boot_mode)
     await slack.start()
     await poller.start()
     await retention.start()
