@@ -4,7 +4,8 @@ Usage:
   python -m genwatch serve         # run the service
   python -m genwatch hash <pw>     # bcrypt-hash a password for config
   python -m genwatch gensecret     # generate a jwt_secret
-  python -m genwatch modbusdump    # quick on-bus diagnostic
+  python -m genwatch modbusdump    # single-block read for diagnostics
+  python -m genwatch scan          # walk a range of addresses, classify each
   python -m genwatch doctor        # pre-flight diagnostics (hardware, config, DB)
   python -m genwatch version       # print version
 """
@@ -54,6 +55,9 @@ def main() -> int:
 
     if cmd == "modbusdump":
         return _modbusdump(args[1:])
+
+    if cmd == "scan":
+        return _scan(args[1:])
 
     if cmd == "doctor":
         return _doctor(args[1:])
@@ -327,6 +331,204 @@ def _modbusdump(args: list[str]) -> int:
         return 0
 
     return asyncio.run(run())
+
+
+def _scan(args: list[str]) -> int:
+    """Walk a range of Modbus addresses, classify each register.
+
+    Tries batched reads for speed; falls back to single-register reads
+    when a batch returns an exception (so one bad address doesn't lose
+    15 good neighbors). Tries both FC3 (holding) and FC4 (input) by
+    default. Decodes any ASCII bytes inline so model/serial strings
+    embedded in the register space are easy to spot.
+
+    The service holds the Lantronix's only TCP socket, so stop it first:
+        sudo systemctl stop genwatch
+        sudo PYTHONPATH=/opt/genwatch /opt/genwatch/venv/bin/python -m \\
+            genwatch scan --start 0x0000 --end 0x07FF
+        sudo systemctl start genwatch
+    """
+    import argparse
+    import asyncio
+    import time
+
+    from .config import load
+    from .modbus.registers import load_register_map
+
+    p = argparse.ArgumentParser(prog="genwatch scan")
+    p.add_argument("--config", default=None)
+    p.add_argument("--start", type=lambda x: int(x, 0), default=0x0000,
+                   help="First address to scan (default 0x0000)")
+    p.add_argument("--end", type=lambda x: int(x, 0), default=0x07FF,
+                   help="Last address (inclusive, default 0x07FF = 2048 regs)")
+    p.add_argument("--batch", type=int, default=16,
+                   help="Words per batched read; fall back to 1 on error (default 16)")
+    p.add_argument("--fc", default="3,4",
+                   help="Function codes to try, comma-separated (default '3,4')")
+    p.add_argument("--slave", type=int, default=None,
+                   help="Override slave ID from register map")
+    p.add_argument("--out", default=None,
+                   help="Also write summary to this file")
+    opts = p.parse_args(args)
+
+    settings = load(opts.config)
+    rm = load_register_map(settings.register_file_path)
+    if opts.slave is not None:
+        rm.slave = opts.slave  # type: ignore[misc]
+
+    fcs = [int(x) for x in opts.fc.split(",") if x.strip()]
+    total_regs = opts.end - opts.start + 1
+    print(f"== Modbus scan ==")
+    print(f"  Transport: {settings.transport}")
+    if settings.transport == "tcp":
+        print(f"  Target:    {settings.modbus_tcp.host}:{settings.modbus_tcp.port}")
+    else:
+        print(f"  Target:    {settings.serial.device}")
+    print(f"  Slave:     {rm.slave} (0x{rm.slave:02X})")
+    print(f"  Range:     0x{opts.start:04X}-0x{opts.end:04X} ({total_regs} registers)")
+    print(f"  Func:      {fcs}")
+    print(f"  Batch:     {opts.batch}")
+    print()
+
+    async def scan_one_fc(fc: int) -> dict[int, int | str]:
+        """Return {addr: value_or_error_tag} for one function code."""
+        client = _build_client_from_settings(settings, rm, retries=1)
+        if not await client.connect():
+            print(f"  fc={fc}: connect failed (is the service holding the socket?)")
+            return {}
+
+        result: dict[int, int | str] = {}
+        addr = opts.start
+        t0 = time.time()
+        last_print = t0
+        try:
+            while addr <= opts.end:
+                count = min(opts.batch, opts.end - addr + 1)
+                r = await client.read(addr, count, fc=fc)
+                if r.ok and r.words is not None:
+                    for i, w in enumerate(r.words):
+                        result[addr + i] = w
+                    addr += count
+                else:
+                    # batch failed; walk one at a time so we keep neighbors
+                    for a in range(addr, addr + count):
+                        if a > opts.end:
+                            break
+                        rr = await client.read(a, 1, fc=fc)
+                        if rr.ok and rr.words is not None:
+                            result[a] = rr.words[0]
+                        else:
+                            result[a] = rr.error or "err"
+                    addr += count
+
+                now = time.time()
+                if now - last_print > 2.0:
+                    done = addr - opts.start
+                    pct = 100 * done / total_regs
+                    print(f"  fc={fc}: {done}/{total_regs} ({pct:.0f}%) elapsed {now-t0:.0f}s")
+                    last_print = now
+        finally:
+            await client.close()
+
+        print(f"  fc={fc}: done in {time.time()-t0:.1f}s")
+        return result
+
+    async def run() -> dict[int, dict[int, int | str]]:
+        out: dict[int, dict[int, int | str]] = {}
+        for fc in fcs:
+            out[fc] = await scan_one_fc(fc)
+        return out
+
+    by_fc = asyncio.run(run())
+
+    # ── Summarize ────────────────────────────────────────────────────────
+    lines: list[str] = []
+
+    def emit(s: str = "") -> None:
+        print(s)
+        lines.append(s)
+
+    emit()
+    emit("== Results ==")
+    for fc in fcs:
+        results = by_fc.get(fc, {})
+        if not results:
+            emit(f"\nfc={fc}: no data")
+            continue
+
+        live: list[tuple[int, int]] = []
+        zeros: list[int] = []
+        errors: dict[str, list[int]] = {}
+        for a in sorted(results):
+            v = results[a]
+            if isinstance(v, int):
+                if v == 0:
+                    zeros.append(a)
+                else:
+                    live.append((a, v))
+            else:
+                errors.setdefault(v, []).append(a)
+
+        emit(f"\nfc={fc}: {len(live)} non-zero, {len(zeros)} zero, "
+             f"{sum(len(v) for v in errors.values())} error")
+
+        if live:
+            emit("\n  Non-zero registers:")
+            # Try to detect ASCII runs (printable bytes in big-endian word order).
+            i = 0
+            while i < len(live):
+                addr_i, val_i = live[i]
+                hi, lo = (val_i >> 8) & 0xFF, val_i & 0xFF
+                if 0x20 <= hi <= 0x7E and 0x20 <= lo <= 0x7E:
+                    # Look ahead for more printable words at consecutive addrs.
+                    j = i
+                    buf = bytearray()
+                    while j < len(live) and live[j][0] == addr_i + (j - i):
+                        v = live[j][1]
+                        h, l = (v >> 8) & 0xFF, v & 0xFF
+                        if 0x20 <= h <= 0x7E and 0x20 <= l <= 0x7E:
+                            buf.append(h); buf.append(l)
+                            j += 1
+                        else:
+                            break
+                    if j - i >= 2:  # at least 4 ASCII bytes
+                        emit(f"    0x{addr_i:04X}-0x{addr_i + (j - i) - 1:04X}  "
+                             f"ASCII '{buf.decode('ascii').rstrip()}'")
+                        i = j
+                        continue
+                emit(f"    0x{addr_i:04X}  {val_i:6d}  0x{val_i:04X}")
+                i += 1
+
+        if zeros:
+            emit(f"\n  Zero registers ({len(zeros)}): "
+                 f"{_compact_ranges(zeros)}")
+
+        for tag, addrs in errors.items():
+            emit(f"\n  {tag} ({len(addrs)}): {_compact_ranges(addrs)}")
+
+    if opts.out:
+        with open(opts.out, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"\n[saved to {opts.out}]")
+
+    return 0
+
+
+def _compact_ranges(addrs: list[int]) -> str:
+    """Compress [1,2,3,5,6,9] -> '0x0001-0x0003, 0x0005-0x0006, 0x0009'."""
+    if not addrs:
+        return ""
+    addrs = sorted(addrs)
+    out: list[str] = []
+    start = prev = addrs[0]
+    for a in addrs[1:]:
+        if a == prev + 1:
+            prev = a
+            continue
+        out.append(f"0x{start:04X}" if start == prev else f"0x{start:04X}-0x{prev:04X}")
+        start = prev = a
+    out.append(f"0x{start:04X}" if start == prev else f"0x{start:04X}-0x{prev:04X}")
+    return ", ".join(out)
 
 
 if __name__ == "__main__":
