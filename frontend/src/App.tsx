@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api/client";
-import { Icon } from "./components/primitives";
+import { BrandMark, Icon } from "./components/primitives";
 import { useLiveData } from "./hooks/useLiveData";
 import type { MeBody } from "./types";
 import { EventsView } from "./views/EventsView";
@@ -22,7 +22,12 @@ export function App() {
   }, []);
 
   if (!auth) {
-    return <div style={{ padding: 24, color: "var(--text-3)" }}>Loading…</div>;
+    return (
+      <div className="boot-screen">
+        <BrandMark size={48} />
+        <div className="boot-spinner" />
+      </div>
+    );
   }
   if (!auth.authenticated) {
     return <LoginView onLoggedIn={() => api.me().then(setAuth)} />;
@@ -76,8 +81,11 @@ function Shell({ auth, view, setView, onLogout }: {
     <div className="app">
       <header className="topbar">
         <div className="brand">
-          <div className="brand-mark" />
-          <div className="brand-name">GenWatch <span>v0.1</span></div>
+          <BrandMark />
+          <div className="brand-name">
+            <span className="brand-title">Castle</span>
+            <span className="brand-sub">Generator Monitor</span>
+          </div>
         </div>
         <nav className="nav" role="tablist">
           {navItems.map((n) => (
@@ -111,7 +119,10 @@ function Shell({ auth, view, setView, onLogout }: {
 
       <main className="main">
         {live.loading && !tickedStatus && (
-          <div style={{ padding: 24, color: "var(--text-3)" }}>Connecting to GenWatch…</div>
+          <div className="connecting">
+            <div className="connecting-spinner" />
+            <span>Connecting to controller…</span>
+          </div>
         )}
         {live.error && (
           <div className="alarm-strip" style={{ marginBottom: 14 }}>
@@ -128,12 +139,18 @@ function Shell({ auth, view, setView, onLogout }: {
 
       <footer className="foot">
         <span>
-          GenWatch · running on raspberry-pi · python 3.11 · uvicorn · pymodbus
+          Castle Generator Monitor <span className="foot-ver">v0.1</span>
+          {tickedStatus && (
+            <>
+              <span className="foot-sep" />
+              {tickedStatus.site.id} · {tickedStatus.site.name}
+            </>
+          )}
         </span>
         <span className="mono">
-          {comms?.state === "lost" ? "comms lost" : `prime ${(comms?.rateMs ?? 1500) / 1000}s`}
-          {" · "}
-          {tickedStatus ? `${tickedStatus.site.id} · ${tickedStatus.site.name}` : ""}
+          {comms?.state === "lost"
+            ? "comms lost"
+            : `poll ${(comms?.rateMs ?? 1500) / 1000}s`}
         </span>
       </footer>
     </div>

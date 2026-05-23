@@ -78,7 +78,7 @@ def _doctor(args: list[str]) -> int:
     opts = p.parse_args(args)
 
     rc = 0
-    print(f"== GenWatch doctor (v{__version__}) ==")
+    print(f"== Castle Generator Monitor — doctor (v{__version__}) ==")
     print(f"  Python:   {sys.version.split()[0]}")
 
     # --- Config ---

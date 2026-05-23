@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { api, ApiError } from "../api/client";
-import { Icon } from "../components/primitives";
+import { BrandMark, Icon } from "../components/primitives";
 
 export function LoginView({ onLoggedIn }: { onLoggedIn: () => void }) {
   const [password, setPassword] = useState("");
@@ -27,44 +27,43 @@ export function LoginView({ onLoggedIn }: { onLoggedIn: () => void }) {
   };
 
   return (
-    <div style={{
-      minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center",
-      padding: 24,
-    }}>
-      <form onSubmit={submit} style={{
-        width: 360, padding: 28, background: "var(--panel)",
-        border: "1px solid var(--border)", borderRadius: "var(--rad-l)",
-        boxShadow: "var(--shadow)",
-        display: "flex", flexDirection: "column", gap: 14,
-      }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <div className="brand-mark" />
-          <div className="brand-name">GenWatch <span>v0.1</span></div>
+    <div className="login-shell">
+      <form onSubmit={submit} className="login-card">
+        <div className="login-brand">
+          <BrandMark size={56} />
+          <div>
+            <div className="login-title">Castle Generator Monitor</div>
+            <div className="login-sub">Operator Console · v0.1</div>
+          </div>
         </div>
-        <p style={{ color: "var(--text-3)", fontSize: 13, margin: 0 }}>
+        <p className="login-prompt">
           Sign in to view live telemetry and issue control commands.
         </p>
-        <input
-          className="input"
-          type="password"
-          autoFocus
-          placeholder="Admin password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          style={{ padding: "10px 12px", fontSize: 14, fontFamily: "var(--sans)" }}
-        />
+        <label className="login-field">
+          <span>Admin password</span>
+          <input
+            className="input login-input"
+            type="password"
+            autoFocus
+            placeholder="••••••••"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+        </label>
         {error && (
-          <div style={{
-            padding: 10, background: "color-mix(in oklch, var(--red) 10%, var(--panel-2))",
-            color: "var(--red)", borderRadius: 7, fontSize: 12.5,
-            border: "1px solid color-mix(in oklch, var(--red) 35%, var(--border))",
-          }}>{error}</div>
+          <div className="login-error" role="alert">
+            <Icon name="x" size={14} />
+            <span>{error}</span>
+          </div>
         )}
-        <button type="submit" className="btn btn-primary" disabled={submitting || !password}
-                style={{ justifyContent: "center", padding: "10px 16px" }}>
+        <button type="submit" className="btn btn-primary login-submit"
+                disabled={submitting || !password}>
           <Icon name="lock" size={14} /> {submitting ? "Signing in…" : "Sign in"}
         </button>
       </form>
+      <div className="login-foot">
+        Hardware safeties at the H-100 panel remain primary.
+      </div>
     </div>
   );
 }

@@ -188,7 +188,7 @@ async def lifespan(app: FastAPI):
     app.state.version = __version__
     app.state.started_at = time.time()
 
-    db.write_event("info", "BOOT", f"GenWatch v{__version__} starting", "mock" if settings.mock else "live")
+    db.write_event("info", "BOOT", f"Castle Generator Monitor v{__version__} starting", "mock" if settings.mock else "live")
     await slack.start()
     await poller.start()
     await retention.start()
@@ -227,7 +227,7 @@ async def lifespan(app: FastAPI):
         await retention.stop()
         await slack.stop()
         await client.close()
-        db.write_event("info", "BOOT", "GenWatch stopped", None)
+        db.write_event("info", "BOOT", "Castle Generator Monitor stopped", None)
 
 
 async def _forward_to_slack(slack: SlackNotifier, evt: dict) -> None:
@@ -295,7 +295,7 @@ def _reading_to_ui(values: dict) -> dict:
 def create_app() -> FastAPI:
     setup_logging()
     app = FastAPI(
-        title="GenWatch",
+        title="Castle Generator Monitor",
         version=__version__,
         description="Generac H-100 monitoring and control over Modbus RTU",
         lifespan=lifespan,

@@ -387,10 +387,10 @@ function SlackSection({
       </div>
 
       <div className="field-row">
-        <div className="lbl">Channel <span className="desc">e.g. #genwatch-alerts or C0123ABCD</span></div>
+        <div className="lbl">Channel <span className="desc">e.g. #generator-alerts or C0123ABCD</span></div>
         <input
           className="input"
-          placeholder="#genwatch-alerts"
+          placeholder="#generator-alerts"
           value={v.channel}
           onChange={(e) => set({ channel: e.target.value })}
         />
