@@ -1,7 +1,49 @@
 // Shared visual primitives: Icon, Pill, Sparkline, LineChart, Card, Modal,
-// LiveTick, Switch. Ported from the prototype's components.jsx with types.
+// LiveTick, Switch, BrandMark.
 
-import { CSSProperties, PropsWithChildren, ReactNode } from "react";
+import { CSSProperties, PropsWithChildren, ReactNode, useState } from "react";
+
+// ─── BrandMark ────────────────────────────────────────────────────────────
+// Renders /logo.png when present. Falls back to a built-in castle silhouette
+// so the UI still looks finished if the asset hasn't been dropped in yet.
+export const BrandMark = ({ size = 28 }: { size?: number }) => {
+  const [failed, setFailed] = useState(false);
+  if (failed) return <CastleFallback size={size} />;
+  return (
+    <img
+      src="/logo.png"
+      alt="Castle Generator Monitor"
+      width={size}
+      height={size}
+      className="brand-mark-img"
+      onError={() => setFailed(true)}
+    />
+  );
+};
+
+const CastleFallback = ({ size }: { size: number }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 32 32"
+    className="brand-mark-svg"
+    aria-hidden="true"
+  >
+    <defs>
+      <linearGradient id="bm-bg" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stopColor="var(--blue)" stopOpacity="0.9" />
+        <stop offset="100%" stopColor="var(--blue-d)" stopOpacity="0.9" />
+      </linearGradient>
+    </defs>
+    <rect x="1" y="1" width="30" height="30" rx="7" fill="url(#bm-bg)" />
+    <path
+      d="M6 22 V14 H8 V12 H10 V14 H13 V11 H15 V13 H17 V11 H19 V14 H22 V12 H24 V14 H26 V22 Z"
+      fill="var(--bg)"
+      opacity="0.95"
+    />
+    <rect x="14" y="17" width="4" height="5" fill="url(#bm-bg)" />
+  </svg>
+);
 
 // ─── Icons ────────────────────────────────────────────────────────────────
 // Same inline SVG paths as the prototype. We could swap to lucide-react,

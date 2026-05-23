@@ -109,24 +109,30 @@
     -webkit-backdrop-filter: blur(14px) saturate(140%);
     border-bottom: 1px solid var(--border);
   }
-  .brand { display: flex; align-items: center; gap: 10px; white-space: nowrap; }
-  .brand-mark {
-    width: 28px; height: 28px; border-radius: 7px;
-    background:
-      linear-gradient(180deg, rgba(255,255,255,0.10), rgba(255,255,255,0) 50%),
-      conic-gradient(from 140deg at 50% 50%, oklch(0.80 0.16 148), oklch(0.78 0.13 220), oklch(0.80 0.16 148));
-    box-shadow: 0 0 0 1px var(--border-2), 0 6px 14px -6px oklch(0.55 0.18 200 / 0.5);
-    position: relative;
+  .brand { display: flex; align-items: center; gap: 11px; white-space: nowrap; }
+  .brand-mark-img, .brand-mark-svg {
+    width: 28px; height: 28px;
+    border-radius: 7px;
+    object-fit: contain;
+    display: block;
+    flex-shrink: 0;
   }
-  .brand-mark::after {
-    content: ""; position: absolute; inset: 7px;
-    border-radius: 3px;
-    background: var(--bg);
-    box-shadow: 0 0 0 1.5px var(--text);
+  .brand-mark-img {
+    box-shadow: 0 0 0 1px var(--border), 0 4px 12px -6px rgba(0,0,0,0.4);
+    background: var(--panel-2);
   }
-  :root[data-theme="light"] .brand-mark::after { background: var(--panel); }
-  .brand-name { font-weight: 600; letter-spacing: -0.01em; font-size: 15px; white-space: nowrap; line-height: 1.1; }
-  .brand-name span { color: var(--text-3); font-weight: 400; margin-left: 4px; font-size: 12px; }
+  :root[data-theme="light"] .brand-mark-img { background: var(--panel); }
+  .brand-mark-svg {
+    box-shadow: 0 0 0 1px var(--border-2), 0 6px 14px -6px oklch(0.55 0.18 220 / 0.45);
+  }
+  .brand-name { display: flex; flex-direction: column; line-height: 1.05; }
+  .brand-title {
+    font-weight: 600; letter-spacing: -0.015em; font-size: 14.5px; color: var(--text);
+  }
+  .brand-sub {
+    font-weight: 400; font-size: 10.5px; color: var(--text-3);
+    text-transform: uppercase; letter-spacing: 0.08em; margin-top: 1px;
+  }
 
   .nav { display: flex; align-items: center; gap: 2px; justify-self: center;
     background: var(--panel); border: 1px solid var(--border); border-radius: 999px; padding: 4px; }
@@ -146,7 +152,14 @@
 
   .topbar-right { display: flex; align-items: center; gap: 10px; }
   .clock { font-family: var(--mono); font-size: 12px; color: var(--text-2); padding: 0 10px; border-right: 1px solid var(--border); height: 20px; line-height: 20px; }
-  .user-chip { display: flex; align-items: center; gap: 8px; padding: 4px 10px 4px 4px; background: var(--panel); border: 1px solid var(--border); border-radius: 999px; font-size: 12.5px; white-space: nowrap; }
+  .user-chip {
+    display: flex; align-items: center; gap: 8px;
+    padding: 4px 10px 4px 4px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 999px;
+    font-size: 12.5px; white-space: nowrap;
+    transition: background 120ms, border-color 120ms;
+  }
+  .user-chip:hover { background: var(--panel-2); border-color: var(--border-2); }
   .user-chip .avatar { width: 22px; height: 22px; border-radius: 50%; background:
     linear-gradient(135deg, oklch(0.55 0.13 220), oklch(0.45 0.10 280));
     color: white; font-size: 10.5px; font-weight: 600; display: flex; align-items: center; justify-content: center; letter-spacing: 0.03em; }
@@ -605,14 +618,23 @@
 
   /* footer */
   .foot {
-    border-top: 1px solid var(--border); padding: 14px 20px;
+    border-top: 1px solid var(--border); padding: 13px 20px;
     color: var(--text-3); font-size: 11.5px;
     display: flex; justify-content: space-between; align-items: center; gap: 12px;
     background: var(--panel);
     white-space: nowrap;
   }
-  .foot > span { overflow: hidden; text-overflow: ellipsis; }
+  .foot > span { overflow: hidden; text-overflow: ellipsis; display: inline-flex; align-items: center; gap: 8px; }
   .foot .mono { color: var(--text-2); }
+  .foot-ver {
+    font-family: var(--mono); font-size: 10.5px; color: var(--text-4);
+    padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border);
+    margin-left: 2px;
+  }
+  .foot-sep {
+    width: 3px; height: 3px; border-radius: 50%; background: var(--text-4);
+    margin: 0 4px; flex-shrink: 0;
+  }
 
   /* alarm strip */
   .alarm-strip {
@@ -671,4 +693,106 @@
     .hero-left { border-right: 0; border-bottom: 1px solid var(--border); }
     .settings-grid { grid-template-columns: 1fr; }
     .settings-side { position: static; flex-direction: row; overflow-x: auto; }
+  }
+
+  /* ─── Boot screen ──────────────────────────────────────────────────── */
+  .boot-screen {
+    min-height: 100vh;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 22px;
+    background:
+      radial-gradient(700px 400px at 50% 40%, color-mix(in oklch, var(--blue) 6%, transparent), transparent 70%),
+      var(--bg);
+  }
+  .boot-spinner {
+    width: 18px; height: 18px; border-radius: 50%;
+    border: 2px solid var(--border-2);
+    border-top-color: var(--text-2);
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ─── Connecting placeholder ───────────────────────────────────────── */
+  .connecting {
+    display: flex; align-items: center; gap: 12px;
+    padding: 20px 22px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--rad);
+    color: var(--text-2); font-size: 13px;
+  }
+  .connecting-spinner {
+    width: 14px; height: 14px; border-radius: 50%;
+    border: 1.6px solid var(--border-2);
+    border-top-color: var(--text-2);
+    animation: spin 0.9s linear infinite;
+  }
+
+  /* ─── Login screen ─────────────────────────────────────────────────── */
+  .login-shell {
+    min-height: 100vh;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: 24px;
+    gap: 18px;
+    background:
+      radial-gradient(800px 500px at 30% 20%, color-mix(in oklch, var(--blue) 7%, transparent), transparent 65%),
+      radial-gradient(700px 400px at 80% 80%, color-mix(in oklch, var(--green) 4%, transparent), transparent 60%),
+      var(--bg);
+  }
+  .login-card {
+    width: 380px; max-width: 100%;
+    padding: 26px 28px 24px;
+    background: color-mix(in oklch, var(--panel) 94%, transparent);
+    border: 1px solid var(--border);
+    border-radius: var(--rad-l);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,0.03) inset,
+      0 20px 60px -20px rgba(0,0,0,0.45),
+      0 0 0 1px color-mix(in oklch, var(--blue) 6%, transparent);
+    display: flex; flex-direction: column; gap: 16px;
+    backdrop-filter: blur(8px);
+  }
+  .login-brand {
+    display: flex; align-items: center; gap: 14px;
+    padding-bottom: 14px; border-bottom: 1px solid var(--border);
+  }
+  .login-brand .brand-mark-img,
+  .login-brand .brand-mark-svg { width: 48px; height: 48px; border-radius: 10px; }
+  .login-title {
+    font-size: 18px; font-weight: 600; letter-spacing: -0.015em;
+    color: var(--text); line-height: 1.1;
+  }
+  .login-sub {
+    font-size: 11px; color: var(--text-3);
+    text-transform: uppercase; letter-spacing: 0.08em; margin-top: 4px;
+  }
+  .login-prompt {
+    margin: 0; color: var(--text-3); font-size: 13px; line-height: 1.5;
+  }
+  .login-field { display: flex; flex-direction: column; gap: 6px; }
+  .login-field > span {
+    font-size: 11px; color: var(--text-3);
+    text-transform: uppercase; letter-spacing: 0.08em;
+  }
+  .login-input {
+    padding: 11px 13px; font-size: 14px; font-family: var(--sans);
+    background: var(--panel-2);
+  }
+  .login-input:focus {
+    border-color: color-mix(in oklch, var(--blue) 50%, var(--border));
+    box-shadow: 0 0 0 3px color-mix(in oklch, var(--blue) 18%, transparent);
+  }
+  .login-error {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 12px;
+    background: color-mix(in oklch, var(--red) 10%, var(--panel-2));
+    color: var(--red); border-radius: 7px; font-size: 12.5px;
+    border: 1px solid color-mix(in oklch, var(--red) 35%, var(--border));
+  }
+  .login-submit {
+    justify-content: center; padding: 11px 16px; margin-top: 4px;
+  }
+  .login-foot {
+    color: var(--text-4); font-size: 11.5px;
+    letter-spacing: 0.02em;
   }

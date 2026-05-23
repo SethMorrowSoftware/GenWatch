@@ -1,10 +1,12 @@
-# GenWatch
+# Castle Generator Monitor
 
 Professional monitoring and control software for the **Generac H-100** industrial generator, running on a **Raspberry Pi 5**.
 
 A single-pane operator console with live engine state, electrical output, two-step-confirm controls (start / stop / quiet-test / transfer), time-series history, alarms, and on-device configuration of the serial port, register map, and retention policy. Communicates with the H-100 controller over Modbus RTU.
 
-**Physical layer:** the H-100 has both an **RS-232** port (factory-default Modbus *slave*, 9600 8N1, address 100 — this is what GenLink uses, and what GenWatch uses by default) and an **RS-485** port (factory-default Modbus *master* to remote annunciators and HTS transfer switches at 4800 8N2 — not directly usable until the panel is reconfigured). The default install path documented below targets the RS-232 port because that's how the H-100 ships from the factory. An advanced RS-485 path is documented in [§2.5](#25-advanced-rs-485-instead-of-rs-232).
+> **Note on naming:** The product was previously called *GenWatch*. The internal Python package, systemd unit, CLI, and on-disk paths (`/etc/genwatch/`, `/dev/genwatch-modbus`, `genwatch.service`, the `genwatch` CLI) retain those identifiers to keep existing deployments and udev rules stable. Only the product name, UI, and operator-facing copy have been rebranded.
+
+**Physical layer:** the H-100 has both an **RS-232** port (factory-default Modbus *slave*, 9600 8N1, address 100 — this is what GenLink uses, and what Castle Generator Monitor uses by default) and an **RS-485** port (factory-default Modbus *master* to remote annunciators and HTS transfer switches at 4800 8N2 — not directly usable until the panel is reconfigured). The default install path documented below targets the RS-232 port because that's how the H-100 ships from the factory. An advanced RS-485 path is documented in [§2.5](#25-advanced-rs-485-instead-of-rs-232).
 
 ![architecture diagram — see docs/HARDWARE for wiring](#)
 
@@ -17,12 +19,12 @@ A single-pane operator console with live engine state, electrical output, two-st
 1. [What you need (Bill of Materials)](#1-what-you-need-bill-of-materials)
 2. [Wiring the Modbus link](#2-wiring-the-modbus-link)
 3. [Prepare the Raspberry Pi 5](#3-prepare-the-raspberry-pi-5)
-4. [Install GenWatch](#4-install-genwatch)
+4. [Install Castle Generator Monitor](#4-install-castle-generator-monitor)
 5. [Initial configuration](#5-initial-configuration)
 6. [Verify the Modbus link](#6-verify-the-modbus-link)
 7. [Operation](#7-operation)
 8. [Security recommendations](#8-security-recommendations)
-9. [Updating GenWatch](#9-updating-genwatch)
+9. [Updating Castle Generator Monitor](#9-updating-castle-generator-monitor)
 10. [Troubleshooting](#10-troubleshooting)
 11. [Architecture overview](#11-architecture-overview)
 12. [Adapting the register map](#12-adapting-the-register-map)
@@ -87,7 +89,7 @@ For a field-deployed monitoring station that's expected to run for years, **buy 
 
 ## 2. Wiring the Modbus link
 
-The H-100 has both an RS-232 port (factory-default Modbus *slave* — the recommended GenWatch path) and an RS-485 port (factory-default Modbus *master* — not directly usable until reconfigured). They are **not interchangeable** — RS-232 is ±5–12 V single-ended; RS-485 is differential 0–5 V. Wiring an RS-485 module to the RS-232 port (or vice versa) won't work.
+The H-100 has both an RS-232 port (factory-default Modbus *slave* — the recommended Castle Generator Monitor path) and an RS-485 port (factory-default Modbus *master* — not directly usable until reconfigured). They are **not interchangeable** — RS-232 is ±5–12 V single-ended; RS-485 is differential 0–5 V. Wiring an RS-485 module to the RS-232 port (or vice versa) won't work.
 
 ### 2.1 Identify the RS-232 port on your H-100
 
@@ -139,7 +141,7 @@ Hardware handshake (RTS/CTS/DTR/DSR) is **not** required by the H-100 Modbus sla
 | Stop bits | **1** |
 | Read function code | **3** (read holding registers) |
 
-These are GenWatch's defaults too. If a previous integrator changed them on your panel, either restore them via GenLink or update `/etc/genwatch/config.yaml` to match what your panel is actually set to.
+These are Castle Generator Monitor's defaults too. If a previous integrator changed them on your panel, either restore them via GenLink or update `/etc/genwatch/config.yaml` to match what your panel is actually set to.
 
 ### 2.5 Advanced — RS-485 instead of RS-232
 
@@ -168,7 +170,7 @@ Use this only if you have a clear reason: cable run longer than ~15 m, multi-dro
    - **120 Ω termination at both physical ends** of the bus, not in the middle.
    - **Linear bus, no spurs > 30 cm.** Don't tee off branches.
    - **Don't run alongside high-voltage.** Cross generator output cabling at 90° if you have to.
-4. **Update GenWatch config** to match the RS-485 port's settings. The H-100 RS-485 port's factory default before reconfiguration is **4800 baud, 8N2** (not 9600 8N1). When you reconfigure it as a slave you can usually set it to 9600 8N1 to match GenWatch's defaults — set both ends to the same values:
+4. **Update Castle Generator Monitor config** to match the RS-485 port's settings. The H-100 RS-485 port's factory default before reconfiguration is **4800 baud, 8N2** (not 9600 8N1). When you reconfigure it as a slave you can usually set it to 9600 8N1 to match the monitor's defaults — set both ends to the same values:
 
    ```yaml
    serial:
@@ -194,7 +196,7 @@ Use this only if you have a clear reason: cable run longer than ~15 m, multi-dro
    - OS: **Raspberry Pi OS (64-bit)** → *Raspberry Pi OS Lite (64-bit)* recommended if you don't need the desktop. Standard works too.
 4. Click the gear icon → **OS customization** and set:
    - Hostname: `genwatch` (so it's reachable at `genwatch.local` via mDNS)
-   - Username + password (this is the Pi's *Linux* login, distinct from GenWatch's operator login)
+   - Username + password (this is the Pi's *Linux* login, distinct from the Castle Generator Monitor operator login)
    - SSID/password for Wi-Fi (or skip if using Ethernet)
    - Enable SSH with password authentication
    - Locale, timezone
@@ -229,7 +231,7 @@ The on-board UART then appears as `/dev/ttyAMA10` on Pi 5 (different from Pi 4's
 
 ---
 
-## 4. Install GenWatch
+## 4. Install Castle Generator Monitor
 
 Plug your USB-to-serial adapter (USB-DB9 for the recommended RS-232 path, or USB-RS485 for the advanced path) into one of the Pi's USB ports, then:
 
@@ -267,7 +269,7 @@ You should see something like:
 [genwatch] Building frontend bundle (this can take ~30 s on a Pi 4) …
 [genwatch] Installing udev rule for /dev/genwatch-modbus
 [genwatch] Running pre-flight diagnostics
-== GenWatch doctor (v0.1.0) ==
+== Castle Generator Monitor — doctor (v0.1.0) ==
   Python:    3.11.x
   Config:    /etc/genwatch/config.yaml
   Mock:      False
@@ -397,7 +399,7 @@ journalctl -u genwatch --since "10 min ago"
 
 ## 8. Security recommendations
 
-GenWatch is designed for a **trusted LAN** deployment. By default it listens on `0.0.0.0:8000` over plain HTTP; cookies are not `Secure`. This is appropriate for a Pi sitting in the same building as the generator on a private network. Do not expose port 8000 to the public internet without the following:
+Castle Generator Monitor is designed for a **trusted LAN** deployment. By default it listens on `0.0.0.0:8000` over plain HTTP; cookies are not `Secure`. This is appropriate for a Pi sitting in the same building as the generator on a private network. Do not expose port 8000 to the public internet without the following:
 
 ### 8.1 Use Tailscale for remote access
 
@@ -408,7 +410,7 @@ sudo tailscale up
 
 Tailscale gives you an encrypted private mesh; the Pi gets an IP like `100.x.y.z` reachable only from your other Tailscale devices. Combined with [Tailscale ACLs](https://tailscale.com/kb/1018/acls) this is more than sufficient for most field deployments. You can also enable HTTPS via Tailscale's `tailscale cert` if you want browser-trusted TLS.
 
-### 8.2 Or terminate TLS with Caddy in front of GenWatch
+### 8.2 Or terminate TLS with Caddy in front of the monitor
 
 ```bash
 sudo apt-get install -y caddy
@@ -420,7 +422,7 @@ EOF
 sudo systemctl restart caddy
 ```
 
-Caddy will auto-fetch a Let's Encrypt cert if the hostname resolves publicly. Then change the GenWatch cookie to `secure=True` (line 30 in `backend/genwatch/api/auth.py`).
+Caddy will auto-fetch a Let's Encrypt cert if the hostname resolves publicly. Then change the cookie to `secure=True` (line 30 in `backend/genwatch/api/auth.py`).
 
 ### 8.3 Firewall
 
@@ -431,7 +433,7 @@ sudo ufw allow from 192.168.0.0/16 to any port 8000
 sudo ufw enable
 ```
 
-Restricts the GenWatch port to your LAN ranges.
+Restricts the monitor's port to your LAN ranges.
 
 ### 8.4 Built-in defenses
 
@@ -442,7 +444,7 @@ Restricts the GenWatch port to your LAN ranges.
 
 ---
 
-## 9. Updating GenWatch
+## 9. Updating Castle Generator Monitor
 
 For production updates, use this sequence so you don't lose observability:
 
@@ -508,7 +510,7 @@ A live Modbus link should respond within ~50 ms. If it doesn't, work through the
 | No termination? | 120 Ω across A↔B at *both* ends, not the middle. Measure A↔B with the bus powered off — should read ~60 Ω (two 120 Ω in parallel). With no termination the bus looks like ~∞ Ω. |
 | Adapter doesn't auto-direction? | Cheap RS-485 adapters need RTS to toggle TX/RX direction. Use a module with hardware auto-direction. |
 | Conflicting Modbus master? | If you didn't reconfigure the H-100 RS-485 port from master to slave, the H-100 *is* the master and won't answer requests. If a Generac MLink is also on the bus you'll see collisions. |
-| H-100 RS-485 still in master mode? | Open GenLink, Tools → Modbus → Port 2, confirm role is "Slave" and address is what GenWatch's config says. |
+| H-100 RS-485 still in master mode? | Open GenLink, Tools → Modbus → Port 2, confirm role is "Slave" and address is what the monitor's config says. |
 
 ### Symptom: `Serial: CANNOT OPEN /dev/genwatch-modbus — Permission denied`
 

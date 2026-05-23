@@ -188,19 +188,19 @@ class SlackNotifier:
             return False, "channel not set"
         blocks = _build_blocks(
             severity="info",
-            title=":test_tube: GenWatch test message",
+            title=":test_tube: Castle Generator Monitor — test message",
             fields=[
                 ("Site", self._site()),
                 ("When", time.strftime("%Y-%m-%d %H:%M:%S %Z").strip() or "(unknown)"),
             ],
         )
-        fallback = f"GenWatch test message from {self._site()}"
+        fallback = f"Castle Generator Monitor test message from {self._site()}"
         ok, err = await self._send(blocks, fallback, timeout=self.SEND_TIMEOUT_S)
         return ok, "ok" if ok else err
 
     # ---- internals ----------------------------------------------------
     def _site(self) -> str:
-        return self.cfg.site_label or self.site_name or "GenWatch"
+        return self.cfg.site_label or self.site_name or "Castle Generator Monitor"
 
     async def _enqueue(
         self,
@@ -344,7 +344,7 @@ def _build_blocks(*, severity: str, title: str, fields: list[tuple[str, str]]) -
         {
             "type": "context",
             "elements": [
-                {"type": "mrkdwn", "text": f"_severity:_ `{severity}` · _via GenWatch_"}
+                {"type": "mrkdwn", "text": f"_severity:_ `{severity}` · _via Castle Generator Monitor_"}
             ],
         }
     )
