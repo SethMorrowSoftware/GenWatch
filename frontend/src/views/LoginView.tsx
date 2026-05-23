@@ -62,6 +62,7 @@ export function LoginView({ onLoggedIn }: { onLoggedIn: () => void }) {
         </button>
       </form>
       <div className="login-foot">
+        <span className="dot" />
         Hardware safeties at the H-100 panel remain primary.
       </div>
     </div>
