@@ -190,7 +190,7 @@ rsync -a --delete \
 ln -sf "$APP_DIR/venv/bin/python" "$APP_DIR/python"
 cat >"$APP_DIR/genwatch.sh" <<'SH'
 #!/usr/bin/env bash
-exec /opt/genwatch/venv/bin/python -m genwatch "$@"
+exec env PYTHONPATH=/opt/genwatch /opt/genwatch/venv/bin/python -m genwatch "$@"
 SH
 chmod +x "$APP_DIR/genwatch.sh"
 ln -sf "$APP_DIR/genwatch.sh" /usr/local/bin/genwatch
@@ -238,6 +238,7 @@ set +e
 sudo -u "$USER" \
   GENWATCH_CONFIG_PATH="$ETC_DIR/config.yaml" \
   GENWATCH_DATA_DIR="$DATA_DIR" \
+  PYTHONPATH="$APP_DIR" \
   "$APP_DIR/venv/bin/python" -m genwatch doctor || true
 set -e
 
