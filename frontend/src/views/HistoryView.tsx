@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
-import { Card, LineChart, LiveTick, Pill, fmt } from "../components/primitives";
+import { Card, EmptyState, LineChart, LiveTick, Pill, Skeleton, fmt } from "../components/primitives";
 
 type MetricKey = "kw" | "rpm" | "hz" | "oilP" | "coolT" | "batt" | "vAB" | "iA";
 type RangeKey = "10M" | "1H" | "6H" | "24H" | "7D" | "30D";
@@ -91,34 +91,53 @@ export function HistoryView() {
           ))}
         </div>
 
-        <div className="chart-wrap" style={{ opacity: loading ? 0.7 : 1, transition: "opacity 200ms" }}>
+        <div className="chart-wrap" style={{ opacity: loading && data.length >= 2 ? 0.5 : 1, transition: "opacity 200ms" }}>
           {data.length >= 2 ? (
             <LineChart series={[{ data, name: m.label }]} colors={[m.color]} xLabels={xLabels} height={320} />
+          ) : loading ? (
+            <div style={{ height: 320, padding: "16px 4px", display: "flex", flexDirection: "column", justifyContent: "space-between" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", padding: "0 16px 8px" }}>
+                <Skeleton width={48} height={12} />
+                <Skeleton width={64} height={12} />
+              </div>
+              <Skeleton width="100%" height={220} radius={8} />
+              <div style={{ display: "flex", justifyContent: "space-between", padding: "8px 16px 0", gap: 8 }}>
+                {Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} width={40} height={10} />)}
+              </div>
+            </div>
           ) : (
-            <div style={{ height: 320, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-3)" }}>
-              {loading ? "Loading…" : "No telemetry in this range yet — the generator hasn't been polled for that long."}
+            <div style={{ height: 320, display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <EmptyState
+                icon="spark"
+                title="No telemetry in this range yet"
+                desc="The generator hasn't been polled for this duration. Try a shorter range, or come back after the next poll."
+              />
             </div>
           )}
         </div>
 
-        <div className="grid g-4" style={{ padding: "10px 14px 14px", borderTop: "1px solid var(--border)", gap: 0 }}>
-          <StatTile label="min" value={fmt(min, m.digits)} unit={m.unit} />
-          <StatTile label="avg" value={fmt(avg, m.digits)} unit={m.unit} />
-          <StatTile label="max" value={fmt(max, m.digits)} unit={m.unit} />
-          <StatTile label="now" value={fmt(now, m.digits)} unit={m.unit} live />
+        <div className="grid g-4" style={{ padding: "10px 0", borderTop: "1px solid var(--border)", gap: 0 }}>
+          <StatTile label="min" value={fmt(min, m.digits)} unit={m.unit} loading={loading && !data.length} />
+          <StatTile label="avg" value={fmt(avg, m.digits)} unit={m.unit} loading={loading && !data.length} />
+          <StatTile label="max" value={fmt(max, m.digits)} unit={m.unit} loading={loading && !data.length} />
+          <StatTile label="now" value={fmt(now, m.digits)} unit={m.unit} live loading={loading && !data.length} />
         </div>
       </Card>
     </>
   );
 }
 
-function StatTile({ label, value, unit, live }: { label: string; value: string; unit: string; live?: boolean }) {
+function StatTile({ label, value, unit, live, loading }: { label: string; value: string; unit: string; live?: boolean; loading?: boolean }) {
   return (
-    <div style={{ padding: "10px 14px", borderRight: "1px solid var(--border)" }}>
+    <div style={{ padding: "12px 16px", borderRight: "1px solid var(--border)" }}>
       <div className="label-row"><span>{label}</span>{live && <LiveTick rateMs={1500} />}</div>
-      <div className="mono" style={{ fontSize: 22, fontWeight: 500, marginTop: 4, letterSpacing: "-0.01em" }}>
-        {value}<span style={{ fontSize: 12, color: "var(--text-3)", marginLeft: 4, fontWeight: 400 }}>{unit}</span>
-      </div>
+      {loading ? (
+        <div style={{ marginTop: 6 }}><Skeleton width={80} height={22} /></div>
+      ) : (
+        <div className="mono" style={{ fontSize: 22, fontWeight: 500, marginTop: 4, letterSpacing: "-0.01em" }}>
+          {value}<span style={{ fontSize: 12, color: "var(--text-3)", marginLeft: 4, fontWeight: 400 }}>{unit}</span>
+        </div>
+      )}
     </div>
   );
 }

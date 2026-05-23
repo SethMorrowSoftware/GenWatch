@@ -55,7 +55,8 @@ type IconName =
   | "play" | "stop" | "refresh" | "chevron" | "check" | "x" | "arrow"
   | "switch_" | "lock" | "user" | "filter" | "download" | "plus"
   | "flame" | "drop" | "spark" | "wave" | "cable" | "cpu" | "bookmark"
-  | "folder" | "list" | "plug" | "bars";
+  | "folder" | "list" | "plug" | "bars"
+  | "sun" | "moon" | "info" | "inbox" | "search" | "logout";
 
 export const Icon = ({ name, size = 16, stroke = 1.6 }: { name: IconName; size?: number; stroke?: number }) => {
   const p = (d: string) => (
@@ -95,6 +96,12 @@ export const Icon = ({ name, size = 16, stroke = 1.6 }: { name: IconName; size?:
     list:      <>{p("M4 6h16M4 12h16M4 18h16")}</>,
     plug:      <>{p("M9 7V3M15 7V3M6 7h12v4a6 6 0 1 1-12 0V7zM12 17v4")}</>,
     bars:      <>{p("M4 4v16M4 20h16")}{p("M9 14v4M14 10v8M19 6v12")}</>,
+    sun:       <>{c(12,12,4)}{p("M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41")}</>,
+    moon:      <>{p("M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z")}</>,
+    info:      <>{c(12,12,9)}{p("M12 8h0M11 12h1v5h1")}</>,
+    inbox:     <>{p("M4 13h4l2 3h4l2-3h4")}{p("M4 13l3-8h10l3 8v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z")}</>,
+    search:    <>{c(11,11,7)}{p("M16 16l5 5")}</>,
+    logout:    <>{p("M16 17l5-5-5-5M21 12H9M9 5H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h4")}</>,
   };
   return <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true">{paths[name]}</svg>;
 };
@@ -234,13 +241,48 @@ export const Card = ({
       <div className="card-head">
         <div>
           <h3>{title}</h3>
-          {sub && <div style={{ fontSize: 11, color: "var(--text-3)", marginTop: 2, textTransform: "none", letterSpacing: 0, whiteSpace: "nowrap" }}>{sub}</div>}
+          {sub && <div className="card-sub">{sub}</div>}
         </div>
         {actions && <div className="actions">{actions}</div>}
       </div>
     )}
     <div className={`card-body ${flush ? "flush" : ""} ${tight ? "tight" : ""}`}>{children}</div>
   </div>
+);
+
+// ─── Skeleton ────────────────────────────────────────────────────────────
+export const Skeleton = ({
+  width, height = 14, radius = 6, style,
+}: { width?: number | string; height?: number | string; radius?: number; style?: CSSProperties }) => (
+  <span className="skeleton" style={{ width, height, borderRadius: radius, ...style }} />
+);
+
+// ─── EmptyState ──────────────────────────────────────────────────────────
+export const EmptyState = ({
+  icon, title, desc, action,
+}: { icon?: IconName; title: ReactNode; desc?: ReactNode; action?: ReactNode }) => (
+  <div className="empty-state">
+    {icon && <span className="icon-wrap"><Icon name={icon} size={20} stroke={1.6} /></span>}
+    <div className="title">{title}</div>
+    {desc && <div className="desc">{desc}</div>}
+    {action}
+  </div>
+);
+
+// ─── IconButton ──────────────────────────────────────────────────────────
+export const IconButton = ({
+  icon, onClick, title, variant, size = 14, "aria-label": ariaLabel,
+}: {
+  icon: IconName;
+  onClick?: () => void;
+  title?: string;
+  variant?: "ghost";
+  size?: number;
+  "aria-label"?: string;
+}) => (
+  <button className="icon-btn" data-variant={variant} onClick={onClick} title={title} aria-label={ariaLabel ?? title}>
+    <Icon name={icon} size={size} />
+  </button>
 );
 
 // ─── Modal ───────────────────────────────────────────────────────────────

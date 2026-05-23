@@ -5,7 +5,7 @@
 
 import { Fragment, useEffect, useState } from "react";
 import { api } from "../api/client";
-import { Card, Icon, Pill, Switch } from "../components/primitives";
+import { Card, Icon, Pill, Skeleton, Switch } from "../components/primitives";
 import type { SlackConfigView, SlackUpdate } from "../types";
 
 type Section = "serial" | "modbus" | "registers" | "retention" | "alerts";
@@ -32,7 +32,7 @@ export function SettingsView() {
     api.config().then(setCfg).catch((e) => setError(e?.message ?? "failed to load config"));
   }, []);
 
-  if (!cfg) return <div style={{ padding: 24 }}>Loading settings…</div>;
+  if (!cfg) return <SettingsLoadingSkeleton />;
 
   const effective = {
     serial: { ...cfg.serial, ...(dirty.serial || {}) },
@@ -226,7 +226,25 @@ function RegisterMapSection() {
   const refresh = async () => setData(await api.registers());
   useEffect(() => { refresh(); }, []);
 
-  if (!data) return <div style={{ padding: 18, color: "var(--text-3)" }}>Loading…</div>;
+  if (!data) {
+    return (
+      <Card title="Register map" sub="loading…" flush>
+        <div style={{ padding: "10px 0" }}>
+          {Array.from({ length: 8 }).map((_, i) => (
+            <div key={i} style={{ display: "grid", gridTemplateColumns: "80px 1fr 50px 80px 80px 80px 80px", gap: 12, padding: "10px 16px" }}>
+              <Skeleton width="100%" height={12} />
+              <Skeleton width="70%" height={12} />
+              <Skeleton width="100%" height={12} />
+              <Skeleton width="100%" height={12} />
+              <Skeleton width="60%" height={12} />
+              <Skeleton width="50%" height={12} />
+              <Skeleton width="100%" height={12} />
+            </div>
+          ))}
+        </div>
+      </Card>
+    );
+  }
 
   const grouped: Record<string, typeof data.registers> = {};
   for (const r of data.registers) (grouped[r.group] ||= []).push(r);
@@ -514,6 +532,38 @@ function SlackToggle({
       <div className="lbl">{label} <span className="desc">{desc}</span></div>
       <Switch value={!!value} onChange={onChange} />
     </div>
+  );
+}
+
+function SettingsLoadingSkeleton() {
+  return (
+    <>
+      <div className="page-head">
+        <div>
+          <Skeleton width={140} height={22} />
+          <div style={{ marginTop: 6 }}><Skeleton width={280} height={13} /></div>
+        </div>
+      </div>
+      <div className="settings-grid">
+        <nav className="settings-side">
+          {Array.from({ length: 5 }).map((_, i) => (
+            <div key={i} style={{ padding: "9px 12px" }}><Skeleton width="80%" height={14} /></div>
+          ))}
+        </nav>
+        <div className="settings-section">
+          <div className="settings-head">
+            <Skeleton width={120} height={16} />
+            <div style={{ marginTop: 8 }}><Skeleton width="80%" height={13} /></div>
+          </div>
+          {Array.from({ length: 4 }).map((_, i) => (
+            <div key={i} className="field-row">
+              <Skeleton width={140} height={14} />
+              <Skeleton width="100%" height={34} radius={8} />
+            </div>
+          ))}
+        </div>
+      </div>
+    </>
   );
 }
 

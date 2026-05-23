@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api/client";
-import { BrandMark, Icon } from "./components/primitives";
+import { BrandMark, Icon, IconButton } from "./components/primitives";
 import { useLiveData } from "./hooks/useLiveData";
 import type { MeBody } from "./types";
 import { EventsView } from "./views/EventsView";
@@ -12,14 +12,51 @@ import { LoginView } from "./views/LoginView";
 import { SettingsView } from "./views/SettingsView";
 
 type View = "live" | "history" | "events" | "settings";
+type Theme = "dark" | "light";
+
+const THEME_KEY = "genwatch.theme";
+
+function readTheme(): Theme {
+  try {
+    const v = localStorage.getItem(THEME_KEY);
+    if (v === "light" || v === "dark") return v;
+  } catch { /* ignore */ }
+  return "dark";
+}
+
+function writeTheme(t: Theme) {
+  try { localStorage.setItem(THEME_KEY, t); } catch { /* ignore */ }
+}
+
+function applyTheme(t: Theme, animate: boolean) {
+  const root = document.documentElement;
+  if (animate) {
+    root.setAttribute("data-theme-switching", "1");
+    window.setTimeout(() => root.removeAttribute("data-theme-switching"), 280);
+  }
+  if (t === "light") root.setAttribute("data-theme", "light");
+  else root.removeAttribute("data-theme");
+}
 
 export function App() {
   const [auth, setAuth] = useState<MeBody | null>(null);
   const [view, setView] = useState<View>("live");
+  const [theme, setTheme] = useState<Theme>(readTheme);
 
   useEffect(() => {
     api.me().then(setAuth).catch(() => setAuth({ authenticated: false }));
   }, []);
+
+  useEffect(() => { applyTheme(theme, false); }, []);
+
+  const toggleTheme = () => {
+    setTheme((t) => {
+      const next: Theme = t === "dark" ? "light" : "dark";
+      applyTheme(next, true);
+      writeTheme(next);
+      return next;
+    });
+  };
 
   if (!auth) {
     return (
@@ -32,18 +69,40 @@ export function App() {
   if (!auth.authenticated) {
     return <LoginView onLoggedIn={() => api.me().then(setAuth)} />;
   }
-  return <Shell auth={auth} view={view} setView={setView} onLogout={async () => { await api.logout(); setAuth({ authenticated: false }); }} />;
+  return (
+    <Shell
+      auth={auth}
+      view={view}
+      setView={setView}
+      theme={theme}
+      onToggleTheme={toggleTheme}
+      onLogout={async () => { await api.logout(); setAuth({ authenticated: false }); }}
+    />
+  );
 }
 
-function Shell({ auth, view, setView, onLogout }: {
-  auth: MeBody; view: View; setView: (v: View) => void; onLogout: () => Promise<void>;
+function Shell({ auth, view, setView, theme, onToggleTheme, onLogout }: {
+  auth: MeBody;
+  view: View;
+  setView: (v: View) => void;
+  theme: Theme;
+  onToggleTheme: () => void;
+  onLogout: () => Promise<void>;
 }) {
   const live = useLiveData();
   const [clock, setClock] = useState(new Date());
+  const [scrolled, setScrolled] = useState(false);
 
   useEffect(() => {
     const t = setInterval(() => setClock(new Date()), 1000);
     return () => clearInterval(t);
+  }, []);
+
+  useEffect(() => {
+    const onScroll = () => setScrolled(window.scrollY > 4);
+    onScroll();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
   }, []);
 
   const navItems: Array<{ id: View; label: string; icon: any }> = [
@@ -77,9 +136,12 @@ function Shell({ auth, view, setView, onLogout }: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status, clock]);
 
+  const commsLabel = comms ? `${comms.successPct.toFixed(1)}%` : "—";
+  const commsRate = comms ? `${(comms.rateMs / 1000).toFixed(1)}s` : "—";
+
   return (
     <div className="app">
-      <header className="topbar">
+      <header className="topbar" data-scrolled={scrolled ? "1" : "0"}>
         <div className="brand">
           <BrandMark />
           <div className="brand-name">
@@ -87,33 +149,41 @@ function Shell({ auth, view, setView, onLogout }: {
             <span className="brand-sub">Generator Monitor</span>
           </div>
         </div>
-        <nav className="nav" role="tablist">
+        <nav className="nav" role="tablist" aria-label="Primary">
           {navItems.map((n) => (
-            <button key={n.id} aria-current={view === n.id ? "page" : undefined}
-                    onClick={() => setView(n.id)} role="tab">
+            <button key={n.id}
+                    aria-current={view === n.id ? "page" : undefined}
+                    onClick={() => setView(n.id)}
+                    role="tab">
               <Icon name={n.icon} size={13} stroke={1.8} />
-              {n.label}
+              <span className="lbl-text">{n.label}</span>
               {n.id === "events" && activeAlarmCount > 0 && (
-                <span style={{
-                  marginLeft: 4, width: 16, height: 16, borderRadius: 999,
-                  background: "var(--red)", color: "white", fontSize: 10,
-                  fontWeight: 600, display: "inline-flex", alignItems: "center", justifyContent: "center",
-                }}>{activeAlarmCount}</span>
+                <span className="nav-badge" aria-label={`${activeAlarmCount} active alarms`}>
+                  {activeAlarmCount}
+                </span>
               )}
             </button>
           ))}
         </nav>
         <div className="topbar-right">
-          <div className="comms-badge" data-state={comms?.state ?? "lost"}>
+          <div className="comms-badge" data-state={comms?.state ?? "lost"}
+               title={`Modbus comms: ${comms?.state ?? "lost"} · ${commsLabel} success · ${commsRate} poll`}>
             <span className="pulse" />
-            <span>Comms · {comms ? `${comms.successPct.toFixed(1)}%` : "—"}</span>
-            <span className="mono">{comms ? `${(comms.rateMs / 1000).toFixed(1)}s` : "—"}</span>
+            <span>Comms · {commsLabel}</span>
+            <span className="mono">{commsRate}</span>
           </div>
-          <span className="clock">{dateStr}</span>
-          <div className="user-chip" onClick={onLogout} title="Sign out" style={{ cursor: "pointer" }}>
+          <span className="clock" title={clock.toString()}>{dateStr}</span>
+          <IconButton
+            icon={theme === "dark" ? "sun" : "moon"}
+            onClick={onToggleTheme}
+            title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+            variant="ghost"
+          />
+          <button className="user-chip" onClick={onLogout} title="Sign out" aria-label="Sign out">
             <span className="avatar">{(auth.operator ?? "??").slice(0, 2).toUpperCase()}</span>
-            {auth.operator ?? "operator"} <span className="role">{auth.role ?? "viewer"}</span>
-          </div>
+            <span>{auth.operator ?? "operator"}</span>
+            <span className="role">{auth.role ?? "viewer"}</span>
+          </button>
         </div>
       </header>
 
@@ -131,10 +201,14 @@ function Shell({ auth, view, setView, onLogout }: {
             <span>{live.error}</span>
           </div>
         )}
-        {tickedStatus && view === "live" && <LiveView status={tickedStatus} history={live.history} operator={auth.operator ?? "operator"} />}
-        {tickedStatus && view === "history" && <HistoryView />}
-        {tickedStatus && view === "events" && <EventsView />}
-        {tickedStatus && view === "settings" && <SettingsView />}
+        {tickedStatus && (
+          <div className="view" key={view}>
+            {view === "live" && <LiveView status={tickedStatus} history={live.history} operator={auth.operator ?? "operator"} />}
+            {view === "history" && <HistoryView />}
+            {view === "events" && <EventsView />}
+            {view === "settings" && <SettingsView />}
+          </div>
+        )}
       </main>
 
       <footer className="foot">

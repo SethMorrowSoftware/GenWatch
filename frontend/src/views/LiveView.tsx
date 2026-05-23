@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api } from "../api/client";
-import { Card, Icon, LiveTick, Pill, Sparkline, fmt, formatTimeInState } from "../components/primitives";
+import { Card, EmptyState, Icon, LiveTick, Pill, Sparkline, fmt, formatTimeInState } from "../components/primitives";
 import type { ActiveAlarm, EngineState, EventRow, Reading, StatusBody } from "../types";
 import { ConfirmModal } from "./ConfirmModal";
 
@@ -462,7 +462,11 @@ function EventsFeed({ limit = 6 }: { limit?: number }) {
   if (!events.length) {
     return (
       <Card title="Recent Events" flush>
-        <div style={{ padding: 14, color: "var(--text-3)", fontSize: 12 }}>No events yet.</div>
+        <EmptyState
+          icon="inbox"
+          title="No events yet"
+          desc="Operator commands, alarms and state transitions will appear here as they happen."
+        />
       </Card>
     );
   }
@@ -484,9 +488,13 @@ function EventsFeed({ limit = 6 }: { limit?: number }) {
 }
 
 export function relTime(ts: number): string {
-  const dt = Date.now() / 1000 - ts;
-  const h = Math.floor(dt / 3600).toString().padStart(2, "0");
-  const m = Math.floor((dt % 3600) / 60).toString().padStart(2, "0");
-  const s = Math.floor(dt % 60).toString().padStart(2, "0");
-  return `—${h}:${m}:${s}`;
+  const dt = Math.max(0, Date.now() / 1000 - ts);
+  if (dt < 60) return `${Math.floor(dt)}s ago`;
+  if (dt < 3600) return `${Math.floor(dt / 60)}m ago`;
+  if (dt < 86400) {
+    const h = Math.floor(dt / 3600);
+    const m = Math.floor((dt % 3600) / 60);
+    return `${h}h ${m.toString().padStart(2, "0")}m ago`;
+  }
+  return `${Math.floor(dt / 86400)}d ago`;
 }

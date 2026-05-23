@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api } from "../api/client";
-import { Card, Icon, Pill } from "../components/primitives";
+import { Card, EmptyState, Icon, Pill, Skeleton } from "../components/primitives";
 import type { EventRow, Severity } from "../types";
 import { relTime } from "./LiveView";
 
@@ -83,21 +83,15 @@ export function EventsView() {
 
       <Card flush>
         <div className="filters">
-          <span style={{
-            color: "var(--text-3)", fontSize: 11, textTransform: "uppercase",
-            letterSpacing: "0.08em", marginRight: 4, alignSelf: "center",
-          }}>Severity</span>
+          <span className="filter-section-label">Severity</span>
           {ALL_SEVS.map((s) => (
             <button key={s} className="filter-chip" aria-pressed={filters[s]} onClick={() => toggle(s)}>
               <i style={{ width: 6, height: 6, borderRadius: "50%", background: `var(--${sevColor(s)})` }} />
               {capitalize(s)}
             </button>
           ))}
-          <span style={{ width: 1, height: 16, background: "var(--border)", margin: "0 4px", alignSelf: "center" }} />
-          <span style={{
-            color: "var(--text-3)", fontSize: 11, textTransform: "uppercase",
-            letterSpacing: "0.08em", marginRight: 4, alignSelf: "center",
-          }}>Type</span>
+          <span className="filter-sep" />
+          <span className="filter-section-label">Type</span>
           {types.map((t) => (
             <button key={t} className="filter-chip" aria-pressed={t === typeFilter} onClick={() => setTypeFilter(t)}>
               {t}
@@ -106,7 +100,13 @@ export function EventsView() {
         </div>
         <div>
           {loading && !events.length ? (
-            <div style={{ padding: 14, color: "var(--text-3)", fontSize: 12 }}>Loading events…</div>
+            <EventsSkeleton />
+          ) : list.length === 0 ? (
+            <EmptyState
+              icon="inbox"
+              title="No events match these filters"
+              desc="Try widening the severity or type filter. Events are kept for the configured audit window."
+            />
           ) : (
             list.map((e) => (
               <div key={e.id} className="ev-row">
@@ -144,4 +144,20 @@ function capitalize(s: string) { return s ? s[0].toUpperCase() + s.slice(1) : s;
 
 function sevColor(s: Severity): string {
   return { alarm: "red", warn: "amber", info: "blue", ok: "green" }[s];
+}
+
+function EventsSkeleton() {
+  return (
+    <div>
+      {Array.from({ length: 6 }).map((_, i) => (
+        <div key={i} className="ev-row" style={{ alignItems: "center" }}>
+          <Skeleton width={72} height={12} />
+          <Skeleton width={10} height={10} radius={999} />
+          <Skeleton width={74} height={12} />
+          <Skeleton width={260 + (i % 3) * 60} height={12} />
+          <Skeleton width={68} height={12} />
+        </div>
+      ))}
+    </div>
+  );
 }
