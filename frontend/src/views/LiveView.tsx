@@ -393,7 +393,7 @@ function ControlsPanel({ state, onCommand }: {
                     border: "1px solid var(--border)", fontSize: 12, color: "var(--text-3)",
                     display: "flex", gap: 10, alignItems: "flex-start" }}>
         <Icon name="lock" size={14} />
-        <div>Commands write to <span className="mono" style={{ color: "var(--text-2)" }}>0x00A0–A3</span> via FC06.
+        <div>Commands write to <span className="mono" style={{ color: "var(--text-2)" }}>0x019C / 0x022B / 0x012E</span> via FC16.
              Engine hardware safeties (panel) remain primary.</div>
       </div>
     </Card>
