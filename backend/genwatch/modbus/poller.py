@@ -36,11 +36,16 @@ log = logging.getLogger("genwatch.modbus.poller")
 class CommsHealth:
     state: str = "healthy"   # healthy | degraded | lost
     success_pct: float = 100.0
-    last_good_at: float | None = None
+    last_good_at: float | None = None        # wall-clock, for UI display
     last_attempt_at: float | None = None
     rate_ms: int = 1500
     p95_latency_ms: float = 0.0
     consecutive_failures: int = 0
+    # Monotonic timestamp of the last successful *prime* poll. Used by
+    # the systemd watchdog so a wall-clock jump (NTP, DST) can't either
+    # mask a hung loop or trigger a phantom restart. None until first
+    # prime poll succeeds.
+    last_prime_good_monotonic: float | None = None
 
 
 @dataclass
@@ -154,27 +159,46 @@ class Poller:
                 await asyncio.sleep(1.0)
             except asyncio.CancelledError:
                 break
-            if self.health.last_good_at is None:
+            mono_last = self.health.last_prime_good_monotonic
+            if mono_last is None:
                 continue
-            silence = time.time() - self.health.last_good_at
+            silence = time.monotonic() - mono_last
             if silence > threshold and self.health.state != "lost":
                 self.health.state = "lost"
-                log.warning("Comms LOST — %.1fs since last good poll", silence)
+                log.warning("Comms LOST — %.1fs since last good prime poll", silence)
 
     # ---- batch execution ----
     async def _poll_tier(self, tier: str, batches: list[tuple[int, int]]) -> None:
         if not batches:
             return
+        # Maps start-of-batch addr → words successfully read covering that range.
+        # A batch may be served by either the original block read or by a
+        # fan-out fallback that re-reads each register individually.
         results: list[tuple[int, ModbusResult]] = []
+        any_batch_ok = False
         for start, count in batches:
             r = await self.client.read(start, count, fc=self.regmap.read_fc)
-            results.append((start, r))
             self._record(r)
+            if r.ok:
+                results.append((start, r))
+                any_batch_ok = True
+                continue
+            # Batch read failed. Rather than blanking every register in the
+            # batch for this cycle, fall back to single-register reads so
+            # that one bad register (or a transient exception code on a
+            # specific address) can't take out an entire telemetry block.
+            log.debug(
+                "batch %#06x+%d failed (%s) — falling back to single-register reads",
+                start, count, r.error or "?",
+            )
+            fb_words = await self._fallback_singles(start, count)
+            if fb_words is not None:
+                results.append((start, ModbusResult.success(fb_words, r.elapsed_ms)))
+                any_batch_ok = True
 
         # Decode every register whose address falls within a successful batch.
         new_values: dict[str, float | int] = dict(self.reading.values)
         for reg in self.regmap.tier(tier):
-            # find batch covering reg.addr
             for start, r in results:
                 if not r.ok or r.words is None:
                     continue
@@ -187,10 +211,38 @@ class Poller:
                     break
 
         self.reading = Reading(values=new_values, ts=time.time())
+
+        # Heartbeat for the systemd watchdog: only stamp on a *prime* poll
+        # cycle that produced at least one good batch. A wholly failed
+        # prime cycle means downstream consumers (state machine, UI) are
+        # operating on stale data and we should let the watchdog notice.
+        if tier == "prime" and any_batch_ok:
+            self.health.last_prime_good_monotonic = time.monotonic()
+
         try:
             await self.callback(tier, self.reading, self.health)
         except Exception as e:  # noqa: BLE001
             log.exception("poll callback failed: %s", e)
+
+    async def _fallback_singles(self, start: int, count: int) -> list[int] | None:
+        """Re-read a failed batch one register at a time.
+
+        Returns a list of `count` words covering [start, start+count), with
+        sentinel 0 substituted for any individual address that still fails.
+        Returns None if *every* single-register read failed (link is truly
+        down — let the caller skip this batch entirely).
+        """
+        words: list[int] = []
+        any_ok = False
+        for offset in range(count):
+            r = await self.client.read(start + offset, 1, fc=self.regmap.read_fc)
+            self._record(r)
+            if r.ok and r.words:
+                words.append(int(r.words[0]))
+                any_ok = True
+            else:
+                words.append(0)
+        return words if any_ok else None
 
     # ---- comms health ----
     def _record(self, r: ModbusResult) -> None:

@@ -27,10 +27,17 @@ Environment=PYTHONUNBUFFERED=1
 
 ExecStart=/opt/genwatch/venv/bin/python -m genwatch serve
 
-# Reliability: restart on any failure, exponential backoff.
+# Reliability: restart on any failure. The service is built to stay up
+# even when the Modbus link is down (it surfaces a "comms lost" state in
+# the UI and keeps retrying the link in the background), so a restart
+# here almost always means a hard process crash — pace it slowly enough
+# that we don't burn the SD card with journal churn on a permanent
+# fault, but quickly enough that a transient crash recovers in under a
+# minute. With RestartSec=30 the StartLimit window catches a hard
+# crash-loop after ~5 minutes of restarts.
 Restart=always
-RestartSec=5
-StartLimitIntervalSec=300
+RestartSec=30
+StartLimitIntervalSec=600
 StartLimitBurst=10
 
 # Watchdog: systemd will SIGKILL and restart the unit if the app stops

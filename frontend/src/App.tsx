@@ -139,6 +139,18 @@ function Shell({ auth, view, setView, theme, onToggleTheme, onLogout }: {
   const commsLabel = comms ? `${comms.successPct.toFixed(1)}%` : "—";
   const commsRate = comms ? `${(comms.rateMs / 1000).toFixed(1)}s` : "—";
 
+  // Stale-data detection: if the WebSocket is down OR we haven't
+  // received a push within ~3 poll intervals, the numbers on screen are
+  // no longer "live" and the operator needs to know. The `clock` 1 Hz
+  // tick recomputes this so the badge appears even if no other state
+  // changes. Threshold floors at 6s so a brief network hiccup on a slow
+  // poll cadence doesn't flash the warning.
+  const staleThresholdMs = Math.max(6000, (comms?.rateMs ?? 1500) * 3);
+  const sinceLastPushMs = live.lastPushAt == null ? Infinity : Date.now() - live.lastPushAt;
+  const stale = (live.wsDown || sinceLastPushMs > staleThresholdMs) && !!status;
+  // Reference `clock` so the memoizer recomputes once per second.
+  void clock;
+
   return (
     <div className="app">
       <header className="topbar" data-scrolled={scrolled ? "1" : "0"}>
@@ -166,6 +178,21 @@ function Shell({ auth, view, setView, theme, onToggleTheme, onLogout }: {
           ))}
         </nav>
         <div className="topbar-right">
+          {stale && (
+            <div
+              className="comms-badge"
+              data-state="lost"
+              title={
+                live.wsDown
+                  ? "Live connection to server is down — values shown are last known."
+                  : `No live updates for ${Math.round(sinceLastPushMs / 1000)}s — values shown may be stale.`
+              }
+              style={{ borderColor: "var(--red)" }}
+            >
+              <span className="pulse" />
+              <span>STALE DATA</span>
+            </div>
+          )}
           <div className="comms-badge" data-state={comms?.state ?? "lost"}
                title={`Modbus comms: ${comms?.state ?? "lost"} · ${commsLabel} success · ${commsRate} poll`}>
             <span className="pulse" />

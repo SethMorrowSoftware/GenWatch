@@ -60,11 +60,13 @@ async def lifespan(app: FastAPI):
     settings = cfgmod.load(os.environ.get("GENWATCH_CONFIG_PATH"))
     if not settings.auth.jwt_secret:
         # Generate an ephemeral secret so the service still runs without
-        # config — tokens won't survive restarts but the service is usable.
+        # config. The actual value is never logged — anyone with read
+        # access to the journal would otherwise be able to mint tokens
+        # until the next restart.
         settings = settings.model_copy(
             update={"auth": settings.auth.model_copy(update={"jwt_secret": secrets.token_hex(32)})}
         )
-        log.warning("auth.jwt_secret was empty — generated an ephemeral one. Set it in config.yaml for persistence.")
+        log.warning("auth.jwt_secret was empty — generated an ephemeral one (tokens won't survive restart). Set it in config.yaml for persistence.")
 
     # Locate register file
     reg_path = Path(settings.modbus.register_file)
@@ -108,36 +110,28 @@ async def lifespan(app: FastAPI):
 
     connected = await client.connect()
     if not connected:
-        # Production safety: refuse to start so the operator notices the
-        # cabling/permission problem instead of silently running a mock
-        # that looks live. systemd will retry per its restart policy.
-        if not settings.mock:
-            if settings.transport == "tcp":
-                msg = (
-                    f"Modbus TCP connect to {settings.modbus_tcp.host}:{settings.modbus_tcp.port} failed. "
-                    "Check the Lantronix (or other serial-bridge) is powered and "
-                    "reachable on the LAN (`ping` the host), that Channel 1 → "
-                    "Connection → Connect Mode is 'Always' / passive raw-TCP on "
-                    "this port, that the serial side of the bridge is wired and "
-                    "configured for 9600 8N1 to match the H-100, and that no "
-                    "firewall is between this Pi and the bridge. To fall back "
-                    "to a direct USB-to-serial cable, set `transport: serial` "
-                    "in /etc/genwatch/config.yaml. To run without hardware (UI "
-                    "demo), set GENWATCH_MOCK=true."
-                )
-            else:
-                msg = (
-                    f"Modbus serial connect failed on {settings.serial.device}. "
-                    "Check the USB-to-serial adapter is plugged in, the cable to "
-                    "the H-100 panel is seated (RS-232 DB9 by default; RS-485 if "
-                    "the panel is reconfigured), the baud/parity/stop-bits match "
-                    "the panel, and the 'genwatch' user is in the 'dialout' group. "
-                    "Run `sudo genwatch doctor` for an itemized check. To run "
-                    "without hardware (UI demo), set GENWATCH_MOCK=true."
-                )
-            log.error(msg)
-            raise RuntimeError(msg)
-        raise RuntimeError("mock client failed to connect — this should never happen")
+        if settings.mock:
+            # The mock client should never fail to connect — if it has,
+            # something is structurally broken and we want a hard stop.
+            raise RuntimeError("mock client failed to connect — this should never happen")
+        # Real-hardware connect failure: do NOT exit. systemd would just
+        # restart us every few seconds, hammering the journal and making
+        # the UI unreachable during the outage. Instead, start in a
+        # known-degraded state. The poller will keep trying to reconnect
+        # via _ensure_connected on every read; the operator can see
+        # "comms lost" in the UI and use it to diagnose. This matches
+        # genmon's behaviour: stay up, surface the fault.
+        if settings.transport == "tcp":
+            target = f"tcp {settings.modbus_tcp.host}:{settings.modbus_tcp.port}"
+        else:
+            target = f"serial {settings.serial.device}"
+        log.error(
+            "Modbus connect to %s failed at startup. Service will continue "
+            "and keep retrying in the background; the UI will show comms "
+            "as LOST until the link comes up. Run `sudo genwatch doctor` "
+            "to diagnose cabling/bridge/config.",
+            target,
+        )
 
     bus = EventBus()
     state_machine = StateMachine(regmap, db, bus)
@@ -230,17 +224,43 @@ async def lifespan(app: FastAPI):
     watchdog_task: asyncio.Task | None = None
     interval = notify.watchdog_interval_s()
     if interval and interval > 0:
+        # We only ping while a *prime* poll has completed within the last
+        # `stale_after` seconds — chosen to be longer than the prime
+        # cadence plus a generous reconnect window, but shorter than
+        # systemd's WatchdogSec so a real hang triggers a restart.
+        # A simple `poller.is_running` flag isn't enough: a deadlocked
+        # poll task keeps the flag True while telemetry freezes.
+        stale_after = max(10.0, (regmap.prime_poll_ms / 1000.0) * 6.0)
+
         async def _watchdog_loop() -> None:
-            log.info("sd_notify watchdog ticker every %.1fs", interval)
+            log.info(
+                "sd_notify watchdog ticker every %.1fs (stale_after=%.1fs)",
+                interval, stale_after,
+            )
             while True:
                 try:
                     await asyncio.sleep(interval)
                 except asyncio.CancelledError:
                     return
-                # Ping only while the poller is running — if the poller has
-                # hung, we stop pinging and systemd will restart us.
-                if poller.is_running:
+                if not poller.is_running:
+                    continue
+                mono_last = poller.health.last_prime_good_monotonic
+                # On first start the link may legitimately take a while to
+                # come up; we ping during this grace period so systemd
+                # doesn't kill us before the first prime poll completes.
+                if mono_last is None:
                     notify.watchdog()
+                    continue
+                silence = time.monotonic() - mono_last
+                if silence <= stale_after:
+                    notify.watchdog()
+                else:
+                    # Stop pinging — systemd will SIGKILL and restart us.
+                    log.warning(
+                        "watchdog: prime poll silent for %.1fs (>%.1fs); "
+                        "withholding ping so systemd can restart",
+                        silence, stale_after,
+                    )
         watchdog_task = asyncio.create_task(_watchdog_loop(), name="sd-watchdog")
 
     try:

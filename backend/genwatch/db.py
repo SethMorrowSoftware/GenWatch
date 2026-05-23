@@ -137,7 +137,13 @@ class Database:
         c = sqlite3.connect(self.path, isolation_level=None, timeout=10)
         c.row_factory = sqlite3.Row
         c.execute("PRAGMA journal_mode=WAL")
-        c.execute("PRAGMA synchronous=NORMAL")
+        # synchronous=FULL: in WAL mode this fsyncs the WAL on every
+        # commit, so a power cut on the Pi cannot lose alarm / control
+        # audit / events rows that just completed. The perf cost on our
+        # write volume (~1 row/15s telemetry, sparse events) is
+        # negligible compared to the integrity benefit on a device that
+        # shares power with the generator it's monitoring.
+        c.execute("PRAGMA synchronous=FULL")
         c.execute("PRAGMA temp_store=MEMORY")
         c.execute("PRAGMA cache_size=-8000")  # 8 MiB
         c.execute("PRAGMA foreign_keys=ON")
