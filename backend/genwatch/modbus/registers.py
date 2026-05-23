@@ -6,6 +6,10 @@ This module is intentionally self-contained: it knows how to turn a list
 of raw 16-bit registers fetched from pymodbus into Python values, and
 how to group those registers into "prime" / "base" polling batches so
 the poller can issue contiguous reads where possible.
+
+State and alarms on the H-100 are bitfield-derived, not enum-derived.
+`derive_engine_state` and `derive_active_alarms` apply the YAML's
+`engine_state_bits` and `alarm_bits` rules to a Reading-style dict.
 """
 from __future__ import annotations
 
@@ -44,18 +48,32 @@ class ControlDef:
     addr: int
     fc: int = 6
     value: int = 1
+    values: tuple[int, ...] = ()  # FC16 multi-register write; takes precedence over `value`
     desc: str = ""
+
+    @property
+    def write_values(self) -> tuple[int, ...]:
+        """The actual word sequence to put on the wire."""
+        return self.values if self.values else (self.value,)
 
 
 @dataclass(frozen=True)
-class AlarmCode:
-    code: str   # "0x52"
+class AlarmBit:
+    """One alarm bit inside a bitfield register."""
+    register: str
+    mask: int
+    code: str
     desc: str
     severity: Literal["alarm", "warn"] = "alarm"
 
-    @property
-    def value(self) -> int:
-        return int(self.code, 16) if self.code.startswith("0x") else int(self.code)
+
+@dataclass(frozen=True)
+class StateBitRule:
+    """Engine-state derivation rule: if mask is set in `register`, the
+    engine is in `state`. First match wins (rules are priority-ordered)."""
+    state: str
+    register: str
+    mask: int
 
 
 @dataclass(frozen=True)
@@ -83,8 +101,8 @@ class RegisterMap:
     timeout_s: float
     retries: int
     backoff_s: list[float]
-    engine_state_map: dict[int, str]
-    alarm_codes: list[AlarmCode]
+    engine_state_bits: list[StateBitRule]
+    alarm_bits: list[AlarmBit]
     registers: list[RegisterDef]
     controls: dict[str, ControlDef]
     raw: dict = field(default_factory=dict)  # for /api/registers GET
@@ -96,15 +114,31 @@ class RegisterMap:
     def tier(self, t: RegTier) -> list[RegisterDef]:
         return [r for r in self.registers if r.tier == t]
 
-    def engine_state_for(self, raw: int | None) -> str:
-        if raw is None:
-            return "unknown"
-        return self.engine_state_map.get(raw, "unknown")
+    # ---- bitfield-based state / alarm derivation ----
+    def derive_engine_state(self, values: dict[str, float | int]) -> str:
+        """Return the first state whose mask is set, or 'unknown'.
 
-    def alarm_for(self, raw: int | None) -> AlarmCode | None:
-        if not raw:
-            return None
-        return next((a for a in self.alarm_codes if a.value == raw), None)
+        Rules are evaluated in YAML order. If the referenced register
+        hasn't been polled yet, that rule is skipped silently.
+        """
+        for rule in self.engine_state_bits:
+            raw = values.get(rule.register)
+            if raw is None:
+                continue
+            if (int(raw) & rule.mask) == rule.mask:
+                return rule.state
+        return "unknown"
+
+    def derive_active_alarms(self, values: dict[str, float | int]) -> list[AlarmBit]:
+        """Return all alarm bits that are currently set."""
+        active: list[AlarmBit] = []
+        for ab in self.alarm_bits:
+            raw = values.get(ab.register)
+            if raw is None:
+                continue
+            if int(raw) & ab.mask:
+                active.append(ab)
+        return active
 
 
 @dataclass(frozen=True)
@@ -124,6 +158,10 @@ def _coerce_addr(v) -> int:
     if s.lower().startswith("0x"):
         return int(s, 16)
     return int(s)
+
+
+def _coerce_mask(v) -> int:
+    return _coerce_addr(v)
 
 
 def _coerce_range(v):
@@ -164,6 +202,16 @@ def validate_register_map(rm: RegisterMap) -> MapValidation:
                 errors.append(f"register word overlap at 0x{w:04X}: '{prior}' vs '{r.name}'")
             occupied_words[w] = r.name
 
+    # State/alarm rules must reference real registers
+    for rule in rm.engine_state_bits:
+        if rule.register not in by_name:
+            errors.append(f"engine_state_bits rule references unknown register: {rule.register}")
+    for ab in rm.alarm_bits:
+        if ab.register not in by_name:
+            errors.append(f"alarm_bits rule references unknown register: {ab.register}")
+        if ab.mask <= 0 or ab.mask > 0xFFFF:
+            errors.append(f"alarm_bits rule '{ab.code}' has invalid mask 0x{ab.mask:X}")
+
     control_names: set[str] = set()
     for c in rm.controls.values():
         if c.name in control_names or c.name in by_name:
@@ -174,7 +222,17 @@ def validate_register_map(rm: RegisterMap) -> MapValidation:
         if c.addr < 0 or c.addr > 0xFFFF:
             errors.append(f"control '{c.name}' addr out of 16-bit range: {c.addr}")
         if c.addr in occupied_words:
-            errors.append(f"control '{c.name}' overlaps read register '{occupied_words[c.addr]}' at 0x{c.addr:04X}")
+            # Some H-100 registers are dual-purpose: writing triggers an
+            # action, reading exposes status (e.g. QUIETTEST_STATUS at
+            # 0x022B, ALARM_ACK at 0x012E). Surface as a warning so this
+            # is visible in /api/registers/verify but doesn't block load.
+            warnings.append(
+                f"control '{c.name}' shares address 0x{c.addr:04X} with read register "
+                f"'{occupied_words[c.addr]}' (intentional for H-100 dual-purpose registers; "
+                f"verify if this control was added recently)"
+            )
+        if c.fc == 6 and len(c.write_values) != 1:
+            errors.append(f"control '{c.name}' fc:6 requires exactly one value (got {len(c.write_values)})")
 
     if not rm.registers:
         errors.append("register map has no read registers")
@@ -213,16 +271,24 @@ def load_register_map(path: Path | str) -> RegisterMap:
     retries = int(mb.get("retries", 2))
     backoff = list(mb.get("backoff_s", [0.25, 0.5, 1.0]))
 
-    esm_raw = data.get("engine_state_map") or {}
-    engine_state_map = {int(k): str(v).lower() for k, v in esm_raw.items()}
+    engine_state_bits = [
+        StateBitRule(
+            state=str(r["state"]).lower(),
+            register=str(r["register"]),
+            mask=_coerce_mask(r["mask"]),
+        )
+        for r in (data.get("engine_state_bits") or [])
+    ]
 
-    alarm_codes = [
-        AlarmCode(
+    alarm_bits = [
+        AlarmBit(
+            register=str(a["register"]),
+            mask=_coerce_mask(a["mask"]),
             code=str(a["code"]),
             desc=str(a.get("desc", "")),
             severity=str(a.get("severity", "alarm")),
         )
-        for a in (data.get("alarm_codes") or [])
+        for a in (data.get("alarm_bits") or [])
     ]
 
     registers: list[RegisterDef] = []
@@ -244,11 +310,17 @@ def load_register_map(path: Path | str) -> RegisterMap:
 
     controls: dict[str, ControlDef] = {}
     for c in data.get("controls") or []:
+        values_raw = c.get("values")
+        if values_raw:
+            values_tuple = tuple(_coerce_mask(v) for v in values_raw)
+        else:
+            values_tuple = ()
         d = ControlDef(
             name=c["name"],
             addr=_coerce_addr(c["addr"]),
             fc=int(c.get("fc", 6)),
             value=int(c.get("value", 1)),
+            values=values_tuple,
             desc=str(c.get("desc", "")),
         )
         controls[d.name] = d
@@ -263,8 +335,8 @@ def load_register_map(path: Path | str) -> RegisterMap:
         timeout_s=timeout_s,
         retries=retries,
         backoff_s=backoff,
-        engine_state_map=engine_state_map,
-        alarm_codes=alarm_codes,
+        engine_state_bits=engine_state_bits,
+        alarm_bits=alarm_bits,
         registers=registers,
         controls=controls,
         raw=data,

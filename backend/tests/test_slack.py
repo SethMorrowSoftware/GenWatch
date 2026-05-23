@@ -454,7 +454,12 @@ async def test_state_machine_emits_comms_event(tmp_path):
 
 
 async def test_state_machine_alarm_cleared_includes_desc(tmp_path):
-    """alarm-cleared events should now include the description."""
+    """alarm-cleared events should now include the description.
+
+    Uses the H-100 bitfield alarm model: setting Coolant Temp High Alarm
+    (output_status_2 bit 0x1000) and then clearing it should emit a
+    transition + an alarm-cleared event with the full description.
+    """
     from genwatch.modbus.poller import CommsHealth, Reading
     from genwatch.modbus.registers import load_register_map
     from genwatch.services.state import EventBus, StateMachine
@@ -465,10 +470,13 @@ async def test_state_machine_alarm_cleared_includes_desc(tmp_path):
     )
     sm = StateMachine(regmap, db, EventBus())
 
-    sm.update(Reading(values={"engine_state": 0, "alarm_state": 0}), CommsHealth())
-    sm.update(Reading(values={"engine_state": 0, "alarm_state": 0x42}), CommsHealth())
-    emitted = sm.update(Reading(values={"engine_state": 0, "alarm_state": 0}), CommsHealth())
+    base = {"output_status_1": 0x0100, "output_status_2": 0, "output_status_7": 0}  # stopped, no alarm
+    sm.update(Reading(values=dict(base)), CommsHealth())
+    raised = dict(base)
+    raised["output_status_2"] = 0x1000  # Coolant Temp High Alarm
+    sm.update(Reading(values=raised), CommsHealth())
+    emitted = sm.update(Reading(values=dict(base)), CommsHealth())
     cleared = [e for e in emitted if e["type"] == "alarm-cleared"]
     assert len(cleared) == 1
-    assert cleared[0]["code"] == "0x42"
-    assert "Oil" in cleared[0]["desc"]
+    assert cleared[0]["code"] == "COOLANT_TEMP_HIGH_ALARM"
+    assert "Coolant" in cleared[0]["desc"]

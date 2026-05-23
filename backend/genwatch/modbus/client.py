@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass
 from typing import Protocol
 
-from .registers import RegisterMap
+from .registers import ControlDef, RegisterMap
 
 log = logging.getLogger("genwatch.modbus.client")
 
@@ -46,7 +46,29 @@ class ModbusClient(Protocol):
     async def connect(self) -> bool: ...
     async def close(self) -> None: ...
     async def read(self, addr: int, count: int, fc: int = 3) -> ModbusResult: ...
-    async def write(self, addr: int, value: int, fc: int = 6) -> ModbusResult: ...
+    async def write(
+        self,
+        addr: int,
+        value: int | None = None,
+        fc: int = 6,
+        values: list[int] | None = None,
+    ) -> ModbusResult: ...
+
+
+def _coerce_write_args(
+    value: int | None, values: list[int] | None, fc: int
+) -> tuple[list[int], str | None]:
+    """Resolve (value, values) into a definitive list of words, or an error."""
+    if values is not None and value is not None:
+        return [], "both_value_and_values_provided"
+    if values is None and value is None:
+        return [], "no_value_provided"
+    word_list = list(values) if values is not None else [int(value)]  # type: ignore[arg-type]
+    if not word_list:
+        return [], "empty_values"
+    if fc == 6 and len(word_list) != 1:
+        return [], "fc6_requires_single_value"
+    return word_list, None
 
 
 # ─── Real client ─────────────────────────────────────────────────────────
@@ -147,20 +169,29 @@ class SerialModbusClient:
                     await asyncio.sleep(backoff)
             return ModbusResult.failure(last_err, (time.perf_counter() - t0) * 1000)
 
-    async def write(self, addr: int, value: int, fc: int = 6) -> ModbusResult:
+    async def write(
+        self,
+        addr: int,
+        value: int | None = None,
+        fc: int = 6,
+        values: list[int] | None = None,
+    ) -> ModbusResult:
         if self._client is None:
             return ModbusResult.failure("not_connected")
+        words, err = _coerce_write_args(value, values, fc)
+        if err is not None:
+            return ModbusResult.failure(err)
         async with self._lock:
             t0 = time.perf_counter()
             try:
                 if fc == 6:
                     rr = await asyncio.wait_for(
-                        self._client.write_register(address=addr, value=value, slave=self.slave),
+                        self._client.write_register(address=addr, value=words[0], slave=self.slave),
                         timeout=self.timeout_s + 0.2,
                     )
                 elif fc == 16:
                     rr = await asyncio.wait_for(
-                        self._client.write_registers(address=addr, values=[value], slave=self.slave),
+                        self._client.write_registers(address=addr, values=words, slave=self.slave),
                         timeout=self.timeout_s + 0.2,
                     )
                 else:
@@ -170,7 +201,7 @@ class SerialModbusClient:
                         f"write_failed_{getattr(rr, 'exception_code', '?')}",
                         (time.perf_counter() - t0) * 1000,
                     )
-                return ModbusResult.success([value], (time.perf_counter() - t0) * 1000)
+                return ModbusResult.success(words, (time.perf_counter() - t0) * 1000)
             except asyncio.TimeoutError:
                 return ModbusResult.failure("timeout", (time.perf_counter() - t0) * 1000)
             except Exception as e:  # noqa: BLE001
@@ -309,9 +340,18 @@ class TcpRtuModbusClient:
                     await asyncio.sleep(backoff)
             return ModbusResult.failure(last_err, (time.perf_counter() - t0) * 1000)
 
-    async def write(self, addr: int, value: int, fc: int = 6) -> ModbusResult:
+    async def write(
+        self,
+        addr: int,
+        value: int | None = None,
+        fc: int = 6,
+        values: list[int] | None = None,
+    ) -> ModbusResult:
         if self._client is None:
             return ModbusResult.failure("not_connected")
+        words, err = _coerce_write_args(value, values, fc)
+        if err is not None:
+            return ModbusResult.failure(err)
         async with self._lock:
             t0 = time.perf_counter()
             if not await self._ensure_connected():
@@ -319,12 +359,12 @@ class TcpRtuModbusClient:
             try:
                 if fc == 6:
                     rr = await asyncio.wait_for(
-                        self._client.write_register(address=addr, value=value, slave=self.slave),
+                        self._client.write_register(address=addr, value=words[0], slave=self.slave),
                         timeout=self.timeout_s + 0.2,
                     )
                 elif fc == 16:
                     rr = await asyncio.wait_for(
-                        self._client.write_registers(address=addr, values=[value], slave=self.slave),
+                        self._client.write_registers(address=addr, values=words, slave=self.slave),
                         timeout=self.timeout_s + 0.2,
                     )
                 else:
@@ -334,7 +374,7 @@ class TcpRtuModbusClient:
                         f"write_failed_{getattr(rr, 'exception_code', '?')}",
                         (time.perf_counter() - t0) * 1000,
                     )
-                return ModbusResult.success([value], (time.perf_counter() - t0) * 1000)
+                return ModbusResult.success(words, (time.perf_counter() - t0) * 1000)
             except asyncio.TimeoutError:
                 return ModbusResult.failure("timeout", (time.perf_counter() - t0) * 1000)
             except Exception as e:  # noqa: BLE001
@@ -372,12 +412,31 @@ class MockModbusClient:
     async def close(self) -> None:
         self._connected = False
 
-    def _state_to_enum(self) -> int:
-        # invert engine_state_map: pick the lowest raw value that maps to our state.
-        for raw, name in sorted(self.regmap.engine_state_map.items()):
-            if name == self._state:
-                return raw
-        return 0
+    def _output_status_1_bits(self) -> int:
+        """Synthesise the H-100's Output Status 1 bitfield from internal state."""
+        bits = 0
+        if self._state in ("running", "exercising", "cooling"):
+            bits |= 0x2000  # Generator Running
+        if self._state == "running":
+            bits |= 0x0800  # Ready for Load
+        if self._state == "stopped":
+            bits |= 0x0100  # Stopped
+            bits |= 0x0400  # Ready to Run
+        if self._state == "alarm":
+            bits |= 0x8000  # Common Alarm
+            bits |= 0x0200  # Stopped in Alarm
+        return bits
+
+    def _output_status_7_bits(self) -> int:
+        """Synthesise Output Status 7 from internal state."""
+        bits = 0
+        if self._state == "cranking":
+            bits |= 0x1000  # Cranking
+        if self._state == "cooling":
+            bits |= 0x2000  # In Cool Down
+        if self._state == "exercising":
+            bits |= 0x0020  # Internal Exercise Active
+        return bits
 
     def _advance(self) -> None:
         now = time.monotonic()
@@ -410,35 +469,67 @@ class MockModbusClient:
         wob = math.sin(t * 0.6) * 0.4 + math.sin(t * 0.17) * 0.3
         running = self._state in ("running", "exercising", "cooling")
 
-        if name == "engine_state":
-            return self._state_to_enum()
-        if name == "alarm_state":
-            return self._alarm_active
-        if name == "switch_state":
-            return 0b11 if self._state == "running" else 0b01
+        # Bitfield state/alarm registers
+        if name == "output_status_1":
+            return self._output_status_1_bits()
+        if name == "output_status_7":
+            return self._output_status_7_bits()
+        if name == "input_status_1":
+            return 0x8000  # Switch In Auto
+        if name in ("output_status_2", "output_status_3", "output_status_4",
+                    "output_status_5", "output_status_6", "output_status_8"):
+            # Map injected alarm onto output_status_2 bit 0x1000 (Coolant Temp High Alarm)
+            if name == "output_status_2" and self._alarm_active:
+                return 0x1000
+            return 0
+        if name == "active_alarm_count":
+            return 1 if self._alarm_active else 0
+        if name == "engine_status_code":
+            return 0  # H-100 status code (string is the canonical source)
+        if name == "key_switch_state":
+            return 0xFF00  # Auto
+        if name == "quiettest_status":
+            return 1 if self._state == "exercising" else 0
         if name == "rpm":
             base = 1800 if running else 0
             if self._state == "cranking":
                 base = 400
             return max(0, int(base + wob * 8))
+        if name == "oil_temp":
+            return int((215 if running else 100) + wob * 2)
         if name == "oil_pressure":
             return int(max(0, (62 if running else 0) + wob * 1.5))
         if name == "coolant_temp":
             return int((188 if running else 95) + wob * 2)
+        if name == "coolant_level":
+            return 95
+        if name == "throttle_position":
+            return int(max(0, (50 if running else 0) + wob * 3))
+        if name == "o2_sensor":
+            return 21
+        if name == "batt_charge_current":
+            return int(max(0, 2 + wob * 0.5))
         if name == "battery_volts":
-            return int(((139 if running else 126) + wob * 0.5) * 1)  # raw, scale 0.1
+            # Scale 0.01: 1380 → 13.80 V running, 1260 → 12.60 V resting
+            return int((1380 if running else 1260) + wob * 5)
         if name == "frequency":
+            # Scale 0.1: 600 → 60.0 Hz
             return int((60.0 + wob * 0.05) * 10) if running else 0
         if name == "total_kw":
             if self._state == "exercising":
                 return max(0, int(6 + wob * 3))
             return max(0, int((142 if running else 0) + wob * 4))
+        if name == "power_factor":
+            # Scale 0.01: 95 → 0.95
+            return 95 if running else 0
         if name == "gen_voltage_ab":
             return int(480 + wob * 1.2) if running else 0
         if name == "gen_voltage_bc":
             return int(481 + wob * 1.1) if running else 0
         if name == "gen_voltage_ca":
             return int(479 + wob * 1.0) if running else 0
+        if name == "avg_voltage":
+            return int(480 + wob * 1.0) if running else 0
         if name == "gen_current_a":
             base = 8 if self._state == "exercising" else (172 if running else 0)
             return max(0, int(base + wob * 3))
@@ -448,11 +539,12 @@ class MockModbusClient:
         if name == "gen_current_c":
             base = 9 if self._state == "exercising" else (176 if running else 0)
             return max(0, int(base + wob * 3))
+        if name == "avg_current":
+            base = 8 if self._state == "exercising" else (172 if running else 0)
+            return max(0, int(base + wob * 3))
         if name == "run_hours":
             # static-ish counter that ticks while running
             return int(18476 + (time.monotonic() / 36) % 100)
-        if name == "start_count":
-            return 142
         if name == "fuel_level_pct":
             return 78
         return 0
@@ -463,11 +555,46 @@ class MockModbusClient:
             if r.addr <= addr < r.addr + r.words:
                 val = self._synth_value(r.name)
                 if r.words == 2:
-                    # word 0 = high, word 1 = low
+                    # Big-endian: word 0 = high, word 1 = low
                     offset = addr - r.addr
                     return (val >> 16) & 0xFFFF if offset == 0 else val & 0xFFFF
                 return val & 0xFFFF
         return 0
+
+    def _apply_control_write(self, addr: int, words: list[int]) -> None:
+        """Map a write at `addr` with these word values to a state transition."""
+        # Match by (addr, values) against the regmap controls.
+        match: ControlDef | None = None
+        for c in self.regmap.controls.values():
+            if c.addr != addr:
+                continue
+            if list(c.write_values) == words:
+                match = c
+                break
+        if match is None:
+            # Fallback: match by addr only (so unknown bit patterns at the start
+            # register still produce a noticeable mock behaviour for debugging).
+            match = next((c for c in self.regmap.controls.values() if c.addr == addr), None)
+            if match is None:
+                return
+        log.info("mock control: %s (addr=0x%04X, words=%s)", match.name, addr, words)
+        if match.name == "remote_start":
+            self._set_state("cranking")
+        elif match.name == "remote_stop":
+            if self._state in ("running", "exercising", "cranking"):
+                self._cool_until = time.monotonic() + 6.0
+                self._set_state("cooling")
+            else:
+                self._set_state("stopped")
+        elif match.name == "transfer":
+            self._set_state("cranking")
+        elif match.name == "exercise":
+            self._exercise_until = time.monotonic() + 12.0
+            self._set_state("exercising")
+        elif match.name == "ack_alarm":
+            self._alarm_active = 0
+            if self._state == "alarm":
+                self._set_state("stopped")
 
     async def read(self, addr: int, count: int, fc: int = 3) -> ModbusResult:
         if not self._connected:
@@ -479,29 +606,24 @@ class MockModbusClient:
             words = [self._read_addr(addr + i) for i in range(count)]
             return ModbusResult.success(words, 12.0)
 
-    async def write(self, addr: int, value: int, fc: int = 6) -> ModbusResult:
+    async def write(
+        self,
+        addr: int,
+        value: int | None = None,
+        fc: int = 6,
+        values: list[int] | None = None,
+    ) -> ModbusResult:
         if not self._connected:
             return ModbusResult.failure("not_connected")
+        words, err = _coerce_write_args(value, values, fc)
+        if err is not None:
+            return ModbusResult.failure(err)
         async with self._lock:
             await asyncio.sleep(0.01)
-            # Map control address back to its name
-            ctl = next((c for c in self.regmap.controls.values() if c.addr == addr), None)
-            if ctl is None:
-                self._regs[addr] = value
-                return ModbusResult.success([value], 12.0)
-            log.info("mock control: %s=%d", ctl.name, value)
-            if ctl.name == "remote_start":
-                self._set_state("cranking")
-            elif ctl.name == "remote_stop":
-                self._cool_until = time.monotonic() + 6.0
-                self._set_state("cooling")
-            elif ctl.name == "exercise":
-                self._exercise_until = time.monotonic() + 12.0
-                self._set_state("exercising")
-            elif ctl.name == "transfer":
-                self._cool_until = time.monotonic() + 6.0
-                self._set_state("cooling")
-            return ModbusResult.success([value], 12.0)
+            self._apply_control_write(addr, words)
+            for i, w in enumerate(words):
+                self._regs[addr + i] = w
+            return ModbusResult.success(words, 12.0)
 
     # ---- mock helpers (not part of the Protocol) ----
     def inject_alarm(self, code: int) -> None:
