@@ -101,7 +101,9 @@ export const api = {
   // Settings
   config: () => request<any>("/api/config"),
   updateConfig: (body: {
+    transport?: "serial" | "tcp";
     serial?: any;
+    modbus_tcp?: any;
     modbus?: any;
     retention?: any;
     slack?: SlackUpdate;

@@ -28,7 +28,9 @@ async def get_config(request: Request) -> dict:
     return {
         "configPath": s.config_path,
         "mock": s.mock,
+        "transport": s.transport,
         "serial": s.serial.model_dump(),
+        "modbus_tcp": s.modbus_tcp.model_dump(),
         "modbus": s.modbus.model_dump(),
         "retention": s.retention.model_dump(),
         "auth": {
@@ -69,7 +71,9 @@ class SlackUpdate(BaseModel):
 
 
 class ConfigUpdate(BaseModel):
+    transport: str | None = None
     serial: dict | None = None
+    modbus_tcp: dict | None = None
     modbus: dict | None = None
     retention: dict | None = None
     slack: SlackUpdate | None = None
@@ -113,8 +117,14 @@ async def update_config(
         with cfg_path.open() as f:
             on_disk = yaml.safe_load(f) or {}
 
+    if body.transport is not None:
+        if body.transport not in ("serial", "tcp"):
+            raise HTTPException(400, "transport must be 'serial' or 'tcp'")
+        on_disk["transport"] = body.transport
     if body.serial:
         on_disk.setdefault("serial", {}).update(body.serial)
+    if body.modbus_tcp:
+        on_disk.setdefault("modbus_tcp", {}).update(body.modbus_tcp)
     if body.modbus:
         on_disk.setdefault("modbus", {}).update(body.modbus)
     if body.retention:
@@ -161,8 +171,10 @@ async def update_config(
         audit_detail["slack"] = slack_for_audit
     request.app.state.db.write_audit(p.operator, "config.update", str(audit_detail), "", "ok")
 
-    # Slack-only changes don't require a restart; serial/modbus do.
-    restart_required = any(v is not None for v in (body.serial, body.modbus, body.retention, body.ws_push_ms))
+    # Slack-only changes don't require a restart; transport/serial/modbus do.
+    restart_required = any(v is not None for v in (
+        body.transport, body.serial, body.modbus_tcp, body.modbus, body.retention, body.ws_push_ms,
+    ))
     log.info(
         "config updated on disk by %s (slack=%s, restart_required=%s)",
         p.operator, slack_changed, restart_required,

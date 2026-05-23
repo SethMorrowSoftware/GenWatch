@@ -1,12 +1,15 @@
 """Modbus client wrapper.
 
-Two implementations behind one interface:
-  - SerialModbusClient: pymodbus AsyncModbusSerialClient over /dev/ttyUSB0
-  - MockModbusClient:   synthesised registers + state machine for dev/CI
+Three implementations behind one interface:
+  - SerialModbusClient:  pymodbus AsyncModbusSerialClient over /dev/ttyUSB0
+  - TcpRtuModbusClient:  pymodbus AsyncModbusTcpClient with the RTU framer,
+                         used with a Lantronix-style network serial bridge
+                         (raw-TCP tunnel; *not* Modbus/TCP)
+  - MockModbusClient:    synthesised registers + state machine for dev/CI
 
-Both expose the same async methods so the poller doesn't care which is
-attached. All reads return a ModbusResult that carries either values or
-an error reason; the poller updates comms health based on the result.
+All three expose the same async methods so the poller doesn't care which
+is attached. All reads return a ModbusResult that carries either values
+or an error reason; the poller updates comms health based on the result.
 """
 from __future__ import annotations
 
@@ -149,6 +152,170 @@ class SerialModbusClient:
             return ModbusResult.failure("not_connected")
         async with self._lock:
             t0 = time.perf_counter()
+            try:
+                if fc == 6:
+                    rr = await asyncio.wait_for(
+                        self._client.write_register(address=addr, value=value, slave=self.slave),
+                        timeout=self.timeout_s + 0.2,
+                    )
+                elif fc == 16:
+                    rr = await asyncio.wait_for(
+                        self._client.write_registers(address=addr, values=[value], slave=self.slave),
+                        timeout=self.timeout_s + 0.2,
+                    )
+                else:
+                    return ModbusResult.failure(f"unsupported_write_fc_{fc}")
+                if rr is None or rr.isError():
+                    return ModbusResult.failure(
+                        f"write_failed_{getattr(rr, 'exception_code', '?')}",
+                        (time.perf_counter() - t0) * 1000,
+                    )
+                return ModbusResult.success([value], (time.perf_counter() - t0) * 1000)
+            except asyncio.TimeoutError:
+                return ModbusResult.failure("timeout", (time.perf_counter() - t0) * 1000)
+            except Exception as e:  # noqa: BLE001
+                return ModbusResult.failure(type(e).__name__, (time.perf_counter() - t0) * 1000)
+
+
+# ─── TCP-RTU client (Lantronix / ser2net / socat bridges) ──────────────
+
+
+class TcpRtuModbusClient:
+    """Modbus RTU framed over a raw TCP socket.
+
+    The wire format is identical to RS-232 RTU; the only difference is
+    that the bytes travel over TCP to a terminal server (Lantronix UDS,
+    EDS, xDirect; Moxa NPort; Digi PortServer; ser2net; etc.) which
+    drops them onto the physical serial port wired to the H-100. This is
+    NOT Modbus/TCP — Modbus/TCP uses a different frame (MBAP header, no
+    CRC) and a different default port (502). Lantronix raw-TCP mode is
+    port 10001 by default.
+
+    Reconnects opportunistically on the next read after a failure: TCP
+    sockets can drop silently (Lantronix idle timeouts, switch reboots),
+    and unlike a kernel serial port the file handle won't recover on
+    its own.
+    """
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        port: int,
+        framer: str,
+        timeout_s: float,
+        connect_timeout_s: float,
+        slave: int,
+        retries: int,
+        backoff_s: list[float],
+    ):
+        self.host = host
+        self.port = port
+        self.framer = framer
+        self.timeout_s = timeout_s
+        self.connect_timeout_s = connect_timeout_s
+        self.slave = slave
+        self.retries = max(0, retries)
+        self.backoff_s = list(backoff_s) or [0.25]
+        self._client = None
+        self._lock = asyncio.Lock()
+
+    def _build_client(self):
+        from pymodbus.client import AsyncModbusTcpClient  # type: ignore
+        from pymodbus.framer import FramerType  # type: ignore
+
+        framer = FramerType.RTU if self.framer == "rtu" else FramerType.SOCKET
+        return AsyncModbusTcpClient(
+            host=self.host,
+            port=self.port,
+            framer=framer,
+            timeout=self.timeout_s,
+        )
+
+    async def connect(self) -> bool:
+        self._client = self._build_client()
+        try:
+            ok = await asyncio.wait_for(self._client.connect(), timeout=self.connect_timeout_s)
+        except asyncio.TimeoutError:
+            log.error("Modbus TCP connect to %s:%d timed out after %.1fs",
+                      self.host, self.port, self.connect_timeout_s)
+            return False
+        if ok:
+            log.info("Modbus TCP-RTU connected: %s:%d slave=%d framer=%s",
+                     self.host, self.port, self.slave, self.framer)
+        else:
+            log.error("Modbus TCP connect failed to %s:%d", self.host, self.port)
+        return bool(ok)
+
+    async def close(self) -> None:
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._client = None
+
+    async def _ensure_connected(self) -> bool:
+        if self._client is None:
+            return False
+        if getattr(self._client, "connected", False):
+            return True
+        # Best-effort reconnect; the next call will retry if this fails.
+        try:
+            return bool(await asyncio.wait_for(
+                self._client.connect(), timeout=self.connect_timeout_s,
+            ))
+        except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+            return False
+
+    async def _read_once(self, addr: int, count: int, fc: int):
+        assert self._client is not None
+        if fc == 3:
+            rr = await self._client.read_holding_registers(address=addr, count=count, slave=self.slave)
+        elif fc == 4:
+            rr = await self._client.read_input_registers(address=addr, count=count, slave=self.slave)
+        else:
+            raise ValueError(f"unsupported read fc {fc}")
+        return rr
+
+    async def read(self, addr: int, count: int, fc: int = 3) -> ModbusResult:
+        if self._client is None:
+            return ModbusResult.failure("not_connected")
+        attempts = self.retries + 1
+        last_err = "unknown"
+        async with self._lock:
+            t0 = time.perf_counter()
+            for i in range(attempts):
+                if not await self._ensure_connected():
+                    last_err = "tcp_disconnected"
+                else:
+                    try:
+                        rr = await asyncio.wait_for(
+                            self._read_once(addr, count, fc),
+                            timeout=self.timeout_s + 0.2,
+                        )
+                        if rr is None:
+                            last_err = "no_response"
+                        elif rr.isError():
+                            last_err = f"exc_{getattr(rr, 'exception_code', '?')}"
+                        else:
+                            return ModbusResult.success(rr.registers, (time.perf_counter() - t0) * 1000)
+                    except asyncio.TimeoutError:
+                        last_err = "timeout"
+                    except Exception as e:  # noqa: BLE001
+                        last_err = type(e).__name__
+                if i < attempts - 1:
+                    backoff = self.backoff_s[min(i, len(self.backoff_s) - 1)]
+                    await asyncio.sleep(backoff)
+            return ModbusResult.failure(last_err, (time.perf_counter() - t0) * 1000)
+
+    async def write(self, addr: int, value: int, fc: int = 6) -> ModbusResult:
+        if self._client is None:
+            return ModbusResult.failure("not_connected")
+        async with self._lock:
+            t0 = time.perf_counter()
+            if not await self._ensure_connected():
+                return ModbusResult.failure("tcp_disconnected", (time.perf_counter() - t0) * 1000)
             try:
                 if fc == 6:
                     rr = await asyncio.wait_for(

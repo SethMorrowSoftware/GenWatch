@@ -1,19 +1,23 @@
-// Settings view: serial port, modbus, register map, retention, alerts.
-// Saves go through PUT /api/config (admin-only) and require a restart for
-// serial/modbus changes — we surface that warning rather than try to
-// hot-reload the poller. Slack alert settings hot-reload immediately.
+// Settings view: modbus link (TCP bridge or USB serial), modbus protocol,
+// register map, retention, alerts. Saves go through PUT /api/config
+// (admin-only) and require a restart for link/modbus changes — we surface
+// that warning rather than try to hot-reload the poller. Slack alert
+// settings hot-reload immediately.
 
 import { Fragment, useEffect, useState } from "react";
 import { api } from "../api/client";
 import { Card, Icon, Pill, Skeleton, Switch } from "../components/primitives";
 import type { SlackConfigView, SlackUpdate } from "../types";
 
-type Section = "serial" | "modbus" | "registers" | "retention" | "alerts";
+type Section = "link" | "modbus" | "registers" | "retention" | "alerts";
+type Transport = "serial" | "tcp";
 
 interface Config {
   configPath: string;
   mock: boolean;
+  transport: Transport;
   serial: { device: string; baud: number; parity: string; stopbits: number; bytesize: number; timeout_s: number };
+  modbus_tcp: { host: string; port: number; timeout_s: number; connect_timeout_s: number; framer: string };
   modbus: { slave: number; read_fc: number; prime_poll_ms: number; base_poll_ms: number; retries: number; register_file: string };
   retention: { raw_days: number; rollup_1m_days: number; rollup_1h_days: number; audit_days: number };
   auth: { operatorName: string; sessionHours: number; passwordConfigured: boolean; jwtSecretConfigured: boolean };
@@ -21,9 +25,9 @@ interface Config {
 }
 
 export function SettingsView() {
-  const [section, setSection] = useState<Section>("serial");
+  const [section, setSection] = useState<Section>("link");
   const [cfg, setCfg] = useState<Config | null>(null);
-  const [dirty, setDirty] = useState<Partial<{ serial: any; modbus: any; retention: any; slack: SlackUpdate }>>({});
+  const [dirty, setDirty] = useState<Partial<{ transport: Transport; serial: any; modbus_tcp: any; modbus: any; retention: any; slack: SlackUpdate }>>({});
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -35,7 +39,9 @@ export function SettingsView() {
   if (!cfg) return <SettingsLoadingSkeleton />;
 
   const effective = {
+    transport: (dirty.transport ?? cfg.transport) as Transport,
     serial: { ...cfg.serial, ...(dirty.serial || {}) },
+    modbus_tcp: { ...cfg.modbus_tcp, ...(dirty.modbus_tcp || {}) },
     modbus: { ...cfg.modbus, ...(dirty.modbus || {}) },
     retention: { ...cfg.retention, ...(dirty.retention || {}) },
     slack: { ...cfg.slack, ...(dirty.slack || {}) },
@@ -51,7 +57,7 @@ export function SettingsView() {
       let message = "Saved.";
       if (r.restart_required) {
         message = r.slack_updated
-          ? "Saved. Slack updated live · restart genwatch.service for serial/modbus changes."
+          ? "Saved. Slack updated live · restart genwatch.service for link/modbus changes."
           : "Saved. Restart genwatch.service for changes to take effect.";
       } else if (r.slack_updated) {
         message = "Saved · Slack alerts updated live.";
@@ -68,7 +74,7 @@ export function SettingsView() {
   };
 
   const sections: Array<{ id: Section; label: string; icon: any }> = [
-    { id: "serial", label: "Serial Port", icon: "cable" },
+    { id: "link", label: "Modbus Link", icon: "cable" },
     { id: "modbus", label: "Modbus", icon: "cpu" },
     { id: "registers", label: "Register Map", icon: "list" },
     { id: "retention", label: "Retention", icon: "history" },
@@ -81,7 +87,12 @@ export function SettingsView() {
         <div>
           <h1 className="page-title">Settings</h1>
           <div className="page-sub">
-            {cfg.mock ? <span style={{ color: "var(--amber)" }}>MOCK mode (no real serial) · </span> : null}
+            {cfg.mock ? <span style={{ color: "var(--amber)" }}>MOCK mode (no real link) · </span> : null}
+            Transport <span className="mono">{effective.transport.toUpperCase()}</span>
+            {effective.transport === "tcp"
+              ? <> · <span className="mono">{effective.modbus_tcp.host}:{effective.modbus_tcp.port}</span></>
+              : <> · <span className="mono">{effective.serial.device}</span></>}
+            <> · </>
             Config at <span className="mono">{cfg.configPath || "(env-only)"}</span>
           </div>
         </div>
@@ -104,10 +115,14 @@ export function SettingsView() {
           ))}
         </nav>
         <div>
-          {section === "serial" && (
-            <SerialSection
-              v={effective.serial}
-              set={(patch) => setDirty((d) => ({ ...d, serial: { ...(d.serial || {}), ...patch } }))}
+          {section === "link" && (
+            <LinkSection
+              transport={effective.transport}
+              setTransport={(t) => setDirty((d) => ({ ...d, transport: t }))}
+              serial={effective.serial}
+              setSerial={(patch) => setDirty((d) => ({ ...d, serial: { ...(d.serial || {}), ...patch } }))}
+              tcp={effective.modbus_tcp}
+              setTcp={(patch) => setDirty((d) => ({ ...d, modbus_tcp: { ...(d.modbus_tcp || {}), ...patch } }))}
             />
           )}
           {section === "modbus" && (
@@ -136,13 +151,87 @@ export function SettingsView() {
   );
 }
 
-function SerialSection({ v, set }: { v: Config["serial"]; set: (patch: Partial<Config["serial"]>) => void }) {
+function LinkSection({
+  transport, setTransport,
+  serial, setSerial,
+  tcp, setTcp,
+}: {
+  transport: Transport;
+  setTransport: (t: Transport) => void;
+  serial: Config["serial"];
+  setSerial: (patch: Partial<Config["serial"]>) => void;
+  tcp: Config["modbus_tcp"];
+  setTcp: (patch: Partial<Config["modbus_tcp"]>) => void;
+}) {
   return (
     <div className="settings-section">
       <div className="settings-head">
-        <h2>Serial port</h2>
-        <p>USB-to-serial adapter (RS-232 by default; RS-485 if reconfigured). Restart required after changes.</p>
+        <h2>Modbus link</h2>
+        <p>
+          How this Pi reaches the H-100. Choose <b>TCP</b> for a network serial bridge
+          (Lantronix UDS / EDS / xDirect, Moxa NPort, ser2net) or <b>Serial</b> for a direct
+          USB-to-serial cable. Restart required after changes.
+        </p>
       </div>
+      <div className="field-row">
+        <div className="lbl">Transport</div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button
+            type="button"
+            className={`btn ${transport === "tcp" ? "btn-primary" : "btn-ghost"}`}
+            onClick={() => setTransport("tcp")}
+          >
+            <Icon name="cable" size={14} /> TCP bridge
+          </button>
+          <button
+            type="button"
+            className={`btn ${transport === "serial" ? "btn-primary" : "btn-ghost"}`}
+            onClick={() => setTransport("serial")}
+          >
+            <Icon name="cable" size={14} /> USB serial
+          </button>
+        </div>
+      </div>
+      {transport === "tcp" ? <TcpFields v={tcp} set={setTcp} /> : <SerialFields v={serial} set={setSerial} />}
+    </div>
+  );
+}
+
+function TcpFields({ v, set }: { v: Config["modbus_tcp"]; set: (patch: Partial<Config["modbus_tcp"]>) => void }) {
+  return (
+    <>
+      <div className="field-row">
+        <div className="lbl">Host <span className="desc">Lantronix IP or hostname</span></div>
+        <input className="input" value={v.host} onChange={(e) => set({ host: e.target.value })} />
+      </div>
+      <div className="field-row">
+        <div className="lbl">TCP port <span className="desc">Lantronix Channel 1 raw-TCP default is 10001</span></div>
+        <input className="input" type="number" value={v.port} onChange={(e) => set({ port: Number(e.target.value) })} />
+      </div>
+      <div className="field-row">
+        <div className="lbl">Framer <span className="desc">Lantronix raw-TCP tunnels RTU bytes — use 'rtu' for the H-100</span></div>
+        <select className="select" value={v.framer} onChange={(e) => set({ framer: e.target.value })}>
+          <option value="rtu">rtu — Modbus RTU over TCP (Lantronix raw-socket bridge)</option>
+          <option value="socket">socket — Modbus/TCP (MBAP header, no CRC; rare for H-100)</option>
+        </select>
+      </div>
+      <div className="field-row">
+        <div className="lbl">Request timeout <span className="desc">seconds; bump if LAN latency is high</span></div>
+        <input className="input" type="number" step="0.1" value={v.timeout_s}
+               onChange={(e) => set({ timeout_s: Number(e.target.value) })} />
+      </div>
+      <div className="field-row">
+        <div className="lbl">Connect timeout <span className="desc">seconds; affects how fast boot fails when the bridge is unreachable</span></div>
+        <input className="input" type="number" step="0.1" value={v.connect_timeout_s}
+               onChange={(e) => set({ connect_timeout_s: Number(e.target.value) })} />
+      </div>
+    </>
+  );
+}
+
+function SerialFields({ v, set }: { v: Config["serial"]; set: (patch: Partial<Config["serial"]>) => void }) {
+  return (
+    <>
       <div className="field-row">
         <div className="lbl">Device <span className="desc">/dev/genwatch-modbus, /dev/ttyUSB0, or /dev/serial0</span></div>
         <input className="input" value={v.device} onChange={(e) => set({ device: e.target.value })} />
@@ -172,7 +261,7 @@ function SerialSection({ v, set }: { v: Config["serial"]; set: (patch: Partial<C
         <input className="input" type="number" step="0.1" value={v.timeout_s}
                onChange={(e) => set({ timeout_s: Number(e.target.value) })} />
       </div>
-    </div>
+    </>
   );
 }
 
