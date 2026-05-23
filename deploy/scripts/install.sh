@@ -13,10 +13,18 @@
 #   7. Copy built frontend to /usr/share/genwatch/ui
 #   8. Install udev rule for /dev/genwatch-modbus symlink
 #   9. Provision /etc/genwatch/config.yaml (with auto-generated jwt_secret)
-#  10. Install + enable systemd unit
+#  10. Interactively prompt for admin password + Lantronix host
+#  11. Install + enable systemd unit, run doctor, start the service
 #
 # Run from the repository root:
 #   sudo deploy/scripts/install.sh
+#
+# Non-interactive / unattended installs: set these env vars and use sudo -E:
+#   GENWATCH_ADMIN_PASSWORD=...    skips the password prompt
+#   GENWATCH_LANTRONIX_HOST=...    skips the Lantronix host prompt (default 192.168.1.249)
+#   GENWATCH_LANTRONIX_PORT=...    default 10001
+#   GENWATCH_TRANSPORT=tcp|serial  default tcp
+#   GENWATCH_NONINTERACTIVE=1      explicitly disables all prompts
 #
 set -euo pipefail
 
@@ -90,6 +98,109 @@ retry() {
     sleep "$delay"
     delay=$(( delay * 2 ))
   done
+}
+
+interactive() {
+  # Prompts are enabled when stdin is a TTY and GENWATCH_NONINTERACTIVE isn't set.
+  [[ -t 0 ]] && [[ -z "${GENWATCH_NONINTERACTIVE:-}" ]]
+}
+
+# Read a value with a default. Usage: ask_default VAR "Prompt" "default-value"
+ask_default() {
+  local __var=$1 prompt=$2 default=$3 reply
+  read -r -p "$prompt [$default]: " reply </dev/tty || reply=""
+  printf -v "$__var" '%s' "${reply:-$default}"
+}
+
+# Read a yes/no answer. Usage: ask_yes_no "Prompt?" default_yn  → returns 0 for yes, 1 for no
+ask_yes_no() {
+  local prompt=$1 default=${2:-n} reply hint
+  case "$default" in
+    y|Y) hint="[Y/n]" ;;
+    *)   hint="[y/N]" ;;
+  esac
+  read -r -p "$prompt $hint: " reply </dev/tty || reply=""
+  reply=${reply:-$default}
+  case "$reply" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Read a password silently, twice, and confirm they match. Prints the password
+# on stdout (and only stdout) — caller is responsible for keeping it secret.
+read_password_twice() {
+  local pw1 pw2
+  while true; do
+    read -r -s -p "Choose an admin password (min 8 chars): " pw1 </dev/tty
+    echo >/dev/tty
+    if (( ${#pw1} < 8 )); then
+      printf '  password too short — try again.\n' >/dev/tty
+      continue
+    fi
+    read -r -s -p "Confirm password: " pw2 </dev/tty
+    echo >/dev/tty
+    if [[ "$pw1" != "$pw2" ]]; then
+      printf '  passwords did not match — try again.\n' >/dev/tty
+      continue
+    fi
+    printf '%s' "$pw1"
+    return 0
+  done
+}
+
+# Write a value into a top-level YAML key (one-level depth). Idempotent.
+# Usage: yaml_set <file> <parent_key> <child_key> <new_value>
+yaml_set_child() {
+  local file=$1 parent=$2 child=$3 value=$4
+  # Use Python to do this safely — sed gets tangled on quoting.
+  "$APP_DIR/venv/bin/python" - "$file" "$parent" "$child" "$value" <<'PY'
+import sys, yaml, pathlib
+path, parent, child, value = sys.argv[1:]
+p = pathlib.Path(path)
+data = yaml.safe_load(p.read_text()) or {}
+# Best-effort type coercion: bare ints stay ints
+try:
+    if value.isdigit():
+        value = int(value)
+except AttributeError:
+    pass
+data.setdefault(parent, {})[child] = value
+with p.open("w") as f:
+    yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
+PY
+}
+
+# Write a top-level scalar key (transport, mock, etc.). Idempotent.
+yaml_set_root() {
+  local file=$1 key=$2 value=$3
+  "$APP_DIR/venv/bin/python" - "$file" "$key" "$value" <<'PY'
+import sys, yaml, pathlib
+path, key, value = sys.argv[1:]
+p = pathlib.Path(path)
+data = yaml.safe_load(p.read_text()) or {}
+data[key] = value
+with p.open("w") as f:
+    yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
+PY
+}
+
+# TCP reachability probe. Returns 0 if connect succeeds within $3 seconds.
+probe_tcp() {
+  local host=$1 port=$2 timeout=${3:-3}
+  "$APP_DIR/venv/bin/python" - "$host" "$port" "$timeout" <<'PY' 2>/dev/null
+import socket, sys
+host, port, timeout = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(timeout)
+try:
+    s.connect((host, port))
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+finally:
+    s.close()
+PY
 }
 
 # ─── pre-flight ───────────────────────────────────────────────────────────
@@ -190,7 +301,8 @@ rsync -a --delete \
 ln -sf "$APP_DIR/venv/bin/python" "$APP_DIR/python"
 cat >"$APP_DIR/genwatch.sh" <<'SH'
 #!/usr/bin/env bash
-exec /opt/genwatch/venv/bin/python -m genwatch "$@"
+# Pin PYTHONPATH so `python -m genwatch` works from any cwd.
+exec env PYTHONPATH=/opt/genwatch /opt/genwatch/venv/bin/python -m genwatch "$@"
 SH
 chmod +x "$APP_DIR/genwatch.sh"
 ln -sf "$APP_DIR/genwatch.sh" /usr/local/bin/genwatch
@@ -208,16 +320,17 @@ udevadm control --reload-rules
 udevadm trigger --subsystem-match=tty || true
 
 # ─── 7. config.yaml ───────────────────────────────────────────────────────
+FIRST_INSTALL=0
 NEEDS_PASSWORD=0
 if [[ ! -f "$ETC_DIR/config.yaml" ]]; then
   log "Provisioning $ETC_DIR/config.yaml with a random jwt_secret"
   install -m 0640 -o "$USER" -g "$USER" "$REPO_ROOT/deploy/config.yaml.example" "$ETC_DIR/config.yaml"
   SECRET=$("$APP_DIR/venv/bin/python" -c 'import secrets;print(secrets.token_hex(32))')
   sed -i "s|^  jwt_secret:.*$|  jwt_secret: \"$SECRET\"|" "$ETC_DIR/config.yaml"
+  FIRST_INSTALL=1
   NEEDS_PASSWORD=1
 else
-  log "Config already exists at $ETC_DIR/config.yaml — not touching"
-  # Verify it has a usable jwt_secret; warn if not
+  log "Config already exists at $ETC_DIR/config.yaml — preserving operator edits"
   if grep -q '^  jwt_secret: "REPLACE_ME"' "$ETC_DIR/config.yaml"; then
     warn "jwt_secret is still REPLACE_ME in $ETC_DIR/config.yaml"
   fi
@@ -226,22 +339,100 @@ else
   fi
 fi
 
-# ─── 8. systemd unit ──────────────────────────────────────────────────────
+# ─── 8. interactive config: link + admin password ────────────────────────
+# Only prompt on a first install (or if values are still placeholders), and
+# only when we have a TTY. Env vars override prompts for unattended installs.
+
+if (( FIRST_INSTALL )); then
+  echo
+  log "─── Link configuration ──────────────────────────────────"
+
+  # Transport selection. Default tcp.
+  TRANSPORT_DEFAULT=${GENWATCH_TRANSPORT:-tcp}
+  if interactive && [[ -z "${GENWATCH_TRANSPORT:-}" ]]; then
+    if ask_yes_no "Use TCP bridge (Lantronix / Moxa / ser2net) for the H-100 link?" y; then
+      TRANSPORT=tcp
+    else
+      TRANSPORT=serial
+    fi
+  else
+    TRANSPORT="$TRANSPORT_DEFAULT"
+  fi
+  yaml_set_root "$ETC_DIR/config.yaml" transport "$TRANSPORT"
+  log "Transport: $TRANSPORT"
+
+  if [[ "$TRANSPORT" == "tcp" ]]; then
+    LAN_HOST=${GENWATCH_LANTRONIX_HOST:-192.168.1.249}
+    LAN_PORT=${GENWATCH_LANTRONIX_PORT:-10001}
+    if interactive; then
+      ask_default LAN_HOST "Lantronix host (IP or hostname)" "$LAN_HOST"
+      ask_default LAN_PORT "Lantronix TCP port" "$LAN_PORT"
+    fi
+    yaml_set_child "$ETC_DIR/config.yaml" modbus_tcp host "$LAN_HOST"
+    yaml_set_child "$ETC_DIR/config.yaml" modbus_tcp port "$LAN_PORT"
+
+    log "Probing $LAN_HOST:$LAN_PORT ..."
+    if probe_tcp "$LAN_HOST" "$LAN_PORT" 3; then
+      log "TCP reachable — bridge is listening."
+    else
+      warn "TCP NOT reachable at $LAN_HOST:$LAN_PORT (timeout/refused)."
+      warn "  • Confirm the bridge is powered and on this LAN: ping $LAN_HOST"
+      warn "  • Confirm Channel 1 → Connection → passive raw-TCP on port $LAN_PORT"
+      warn "  • If a Windows machine is using this Lantronix via CPR, stop the CPR session first."
+      warn "Install continues — fix the network, then run: sudo systemctl restart genwatch"
+    fi
+  else
+    SERIAL_DEV=${GENWATCH_SERIAL_DEVICE:-/dev/genwatch-modbus}
+    if interactive; then
+      ask_default SERIAL_DEV "Serial device path" "$SERIAL_DEV"
+    fi
+    yaml_set_child "$ETC_DIR/config.yaml" serial device "$SERIAL_DEV"
+  fi
+fi
+
+# ─── Admin password ───────────────────────────────────────────────────────
+if (( NEEDS_PASSWORD )); then
+  echo
+  log "─── Admin password ──────────────────────────────────────"
+  ADMIN_PASSWORD="${GENWATCH_ADMIN_PASSWORD:-}"
+  if [[ -z "$ADMIN_PASSWORD" ]]; then
+    if interactive; then
+      ADMIN_PASSWORD=$(read_password_twice)
+    else
+      warn "No GENWATCH_ADMIN_PASSWORD set and no TTY — leaving admin_password_hash unset."
+    fi
+  fi
+  if [[ -n "$ADMIN_PASSWORD" ]]; then
+    log "Generating bcrypt hash and writing to config.yaml"
+    HASH=$(PYTHONPATH="$APP_DIR" "$APP_DIR/venv/bin/python" -m genwatch hash "$ADMIN_PASSWORD")
+    yaml_set_child "$ETC_DIR/config.yaml" auth admin_password_hash "$HASH"
+    unset ADMIN_PASSWORD
+    NEEDS_PASSWORD=0
+  fi
+fi
+
+# Make sure config ownership is right after our edits.
+chown "$USER:$USER" "$ETC_DIR/config.yaml"
+chmod 0640 "$ETC_DIR/config.yaml"
+
+# ─── 9. systemd unit ──────────────────────────────────────────────────────
 log "Installing systemd unit"
 install -m 0644 "$REPO_ROOT/deploy/systemd/genwatch.service" "$UNIT_FILE"
 systemctl daemon-reload
 systemctl enable genwatch.service
 
-# ─── 9. pre-flight check ──────────────────────────────────────────────────
+# ─── 10. pre-flight check ─────────────────────────────────────────────────
 log "Running pre-flight diagnostics"
 set +e
 sudo -u "$USER" \
   GENWATCH_CONFIG_PATH="$ETC_DIR/config.yaml" \
   GENWATCH_DATA_DIR="$DATA_DIR" \
-  "$APP_DIR/venv/bin/python" -m genwatch doctor || true
+  PYTHONPATH="$APP_DIR" \
+  "$APP_DIR/venv/bin/python" -m genwatch doctor
+DOCTOR_RC=$?
 set -e
 
-# ─── 10. start service ────────────────────────────────────────────────────
+# ─── 11. start service ────────────────────────────────────────────────────
 if (( NEEDS_PASSWORD )); then
   echo
   echo "============================================================"
@@ -252,8 +443,6 @@ if (( NEEDS_PASSWORD )); then
   echo "    sudo genwatch hash 'your-strong-password'"
   echo "    sudo nano $ETC_DIR/config.yaml      # paste into admin_password_hash"
   echo "    sudo systemctl restart genwatch"
-  echo
-  echo "  The service will not start until a password is configured."
   echo "============================================================"
   echo
   log "Skipping systemctl start — set admin_password_hash first."
@@ -274,9 +463,23 @@ fi
 # Detect primary IPv4 for the friendly URL hint
 HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 echo
+echo "============================================================"
 log "Install complete."
-if [[ -n "$HOST_IP" ]]; then
-  log "Browse to: http://${HOST_IP}:8000"
+if (( DOCTOR_RC == 0 )) && (( ! NEEDS_PASSWORD )); then
+  log "Link is live. Telemetry is flowing."
+elif (( DOCTOR_RC != 0 )); then
+  warn "doctor reported a problem — see output above. The service is enabled"
+  warn "and will retry once the link is fixed."
 fi
-log "Service log: journalctl -u genwatch -e"
-log "Diagnostics: sudo genwatch doctor"
+if [[ -n "$HOST_IP" ]]; then
+  echo
+  log "Open the operator console:"
+  log "    http://${HOST_IP}:8000"
+fi
+echo
+log "Useful commands:"
+log "    sudo systemctl status genwatch     # service state"
+log "    sudo journalctl -u genwatch -ef    # live log"
+log "    sudo genwatch doctor               # re-run diagnostics"
+log "    sudo nano $ETC_DIR/config.yaml     # edit config (restart service after)"
+echo "============================================================"

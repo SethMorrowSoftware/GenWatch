@@ -76,7 +76,7 @@ If `nc` says "succeeded" you're ready. If not, log into the Lantronix's web UI (
 
 **2. Flash Raspberry Pi OS Bookworm (64-bit) onto the SD card** and bring up the Pi with SSH enabled. Full instructions in [§3](#3-prepare-the-raspberry-pi-5) — but if you've set up a Pi before, just use the Imager's "Edit Settings" panel to preconfigure user/SSH/Wi-Fi, then boot.
 
-**3. Install Castle Generator Monitor** on the Pi:
+**3. Clone and run the installer** on the Pi:
 
 ```bash
 ssh pi@<your-pi-ip>
@@ -85,35 +85,42 @@ cd GenWatch
 sudo ./deploy/scripts/install.sh
 ```
 
-The installer creates the `genwatch` system user, builds the UI, sets up the Python venv, drops a default config at `/etc/genwatch/config.yaml`, and installs the systemd unit. Full detail in [§4](#4-install-castle-generator-monitor).
+The installer does the heavy lifting — apt deps, system user, frontend build, Python venv, udev rules, systemd unit — and then **interactively prompts you for three things** at the end:
 
-**4. Set the admin password and the Lantronix host** in `/etc/genwatch/config.yaml`:
+```
+─── Link configuration ──────────────────────────────────
+Use TCP bridge (Lantronix / Moxa / ser2net) for the H-100 link? [Y/n]: y
+Lantronix host (IP or hostname) [192.168.1.249]: ↵
+Lantronix TCP port [10001]: ↵
+Probing 192.168.1.249:10001 ...
+TCP reachable — bridge is listening.
+
+─── Admin password ──────────────────────────────────────
+Choose an admin password (min 8 chars): ********
+Confirm password: ********
+Generating bcrypt hash and writing to config.yaml
+```
+
+Press Enter to accept the defaults, type your own values to override. The installer probes TCP reachability before continuing, runs `genwatch doctor`, and starts the service. **No manual `config.yaml` editing required for the standard case.**
+
+If you'd rather drive it non-interactively (CI, image bake, etc.):
 
 ```bash
-sudo genwatch hash 'pick-a-strong-password'        # prints a bcrypt hash
-sudo nano /etc/genwatch/config.yaml
+sudo GENWATCH_ADMIN_PASSWORD='your-pw' \
+     GENWATCH_LANTRONIX_HOST=192.168.1.249 \
+     GENWATCH_LANTRONIX_PORT=10001 \
+     -E ./deploy/scripts/install.sh
 ```
 
-Replace `admin_password_hash: "REPLACE_ME"` with the hash you just generated, then confirm the link block points at your Lantronix:
+**4. Verify it's live.** When the installer finishes, you'll see:
 
-```yaml
-transport: tcp
-modbus_tcp:
-  host: 192.168.1.249    # ← your Lantronix's IP
-  port: 10001            # ← Lantronix Channel 1 Local Port (default 10001)
-  framer: rtu
+```
+[genwatch] Link is live. Telemetry is flowing.
+[genwatch] Open the operator console:
+[genwatch]     http://192.168.1.X:8000
 ```
 
-Defaults already match `192.168.1.249:10001`; only edit if yours differs. Everything else in the file is fine as-is for an H-100 at factory address 100.
-
-**5. Start it and verify:**
-
-```bash
-sudo systemctl restart genwatch
-sudo genwatch doctor                                # full pre-flight
-```
-
-`doctor` should print `Modbus: slave 100 responded with [<value>]`. Open `http://<your-pi-ip>:8000` in a browser, log in, and the Live view should populate within ~2 seconds.
+Open that URL in a browser, log in with the password you set, and the Live view should populate within ~2 seconds. That's it.
 
 **If `doctor` reports `NO RESPONSE` on a socket that opens fine,** the most common cause is the Lantronix's "Pack Control" splitting Modbus frames. Log into the Lantronix web UI → Channel 1 → Connection → Pack Control → drop **Idle Gap Time** to ~10 ms (RTU's end-of-frame is a 3.5-character silence and the bridge needs to preserve it). Other causes covered in [§10 Troubleshooting](#10-troubleshooting).
 
@@ -445,7 +452,11 @@ If you see `Modbus: NO RESPONSE`, jump to [§10 Troubleshooting](#10-troubleshoo
 
 ## 5. Initial configuration
 
-### 5.1 Set the admin password and confirm the link target
+> **The standard install path doesn't need this section.** `install.sh` prompts for the admin password and the link target interactively and writes them to `/etc/genwatch/config.yaml` for you. This section is for: re-installs, changing settings after the fact, or driving the configuration via env vars from a deployment tool.
+
+### 5.1 Set / reset the admin password
+
+If you skipped the prompt during install (or want to rotate the password later):
 
 ```bash
 sudo genwatch hash 'pick-a-strong-password'
@@ -453,15 +464,13 @@ sudo genwatch hash 'pick-a-strong-password'
 sudo nano /etc/genwatch/config.yaml
 ```
 
-Do three things in the editor:
+Find `admin_password_hash:` and replace `"REPLACE_ME"` (or the existing hash) with the hash you just generated. Save and exit, then `sudo systemctl restart genwatch`.
 
-1. Replace `admin_password_hash: "REPLACE_ME"` with the hash you just generated.
-2. Confirm the **transport block** matches your setup:
-   - **Path A (Lantronix / network bridge):** `transport: tcp` with `modbus_tcp.host` pointing at your bridge's IP (default is `192.168.1.249:10001` — change if yours differs).
-   - **Paths B/C (direct USB serial):** `transport: serial` and confirm `serial.device` matches what got assigned (the installer prints what it saw; usually `/dev/genwatch-modbus`).
-3. Save and exit.
+### 5.2 Change the link target after install
 
-### 5.2 Start the service
+Edit the same file and adjust either the `transport`, `modbus_tcp` block (TCP path), or `serial` block (direct cable path). The Settings UI (`http://<pi>:8000/settings` → Modbus Link) lets you change these from the browser too — a service restart is required after either path.
+
+### 5.3 Start the service
 
 ```bash
 sudo systemctl restart genwatch
@@ -474,7 +483,7 @@ You should see `active (running)`. If not, check the log:
 journalctl -u genwatch -e --no-pager
 ```
 
-### 5.3 Open the operator console
+### 5.4 Open the operator console
 
 From any device on the same network:
 
@@ -486,7 +495,7 @@ http://genwatch.local:8000
 
 Log in with the password you set in §5.1.
 
-### 5.4 (Optional) Verify telemetry is live
+### 5.5 (Optional) Verify telemetry is live
 
 The Live view should populate within ~2 seconds with engine state, frequency, voltages, and currents from your H-100. The "Comms" badge in the top-right should be green and showing 100 % success.
 
