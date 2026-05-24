@@ -559,6 +559,10 @@ def _panel(args: list[str]) -> int:
     p.add_argument("--config", default=None, help="config.yaml path")
     p.add_argument("--json", action="store_true",
                    help="emit machine-readable JSON instead of the text report")
+    p.add_argument("--html", action="store_true",
+                   help="emit a printable HTML cross-check sheet "
+                        "(pre-filled with current readings; save and open in a "
+                        "browser to print)")
     p.add_argument("--slave", type=int, default=None,
                    help="override modbus.slave (default: from register map)")
     opts = p.parse_args(args)
@@ -682,11 +686,29 @@ def _panel(args: list[str]) -> int:
         print(json.dumps(out, indent=2))
         return 0 if not errs else 1
 
-    # ─── Text report ──────────────────────────────────────────────────
+    # Shared between HTML and text branches
     if settings.transport == "tcp":
         link = f"tcp {settings.modbus_tcp.host}:{settings.modbus_tcp.port}"
     else:
         link = f"serial {settings.serial.device} {settings.serial.baud}"
+
+    # ─── HTML printable cross-check sheet ─────────────────────────────
+    if opts.html:
+        html = _render_panel_html(
+            decoded=decoded,
+            value_map=value_map,
+            rm=rm,
+            link=link,
+            fired_state=fired_state,
+            fired_rule=fired_rule,
+            bit_meanings=bit_meanings,
+            elapsed_ms=elapsed_ms,
+            errs=errs,
+        )
+        print(html)
+        return 0 if not errs else 1
+
+    # ─── Text report ──────────────────────────────────────────────────
     print(f"== Castle Generator Monitor — panel ({len(decoded)} registers in {elapsed_ms:.0f} ms) ==")
     print(f"  Link:    {link}  slave={rm.slave}")
     print(f"  Map:     {rm.path}")
@@ -801,6 +823,288 @@ def _value_note(d: dict) -> str:
         if name == "rpm" and v > 3600:
             return f"  ← {v} rpm above redline for a genset"
     return ""
+
+
+def _render_panel_html(
+    *,
+    decoded: list[dict],
+    value_map: dict[str, float | int],
+    rm,
+    link: str,
+    fired_state: str,
+    fired_rule,
+    bit_meanings: dict[str, dict[int, str]],
+    elapsed_ms: float,
+    errs: list[str],
+) -> str:
+    """Generate a single-page printable cross-check sheet (HTML).
+
+    Pre-fills every reading from the live Modbus poll so the operator
+    walks to the H-100 panel with a checklist of "GenWatch reads X — does
+    your panel show X?" and a blank column to write the panel value into
+    when it doesn't match. The sheet is laid out for US Letter / A4 and
+    has print-only CSS so saving as PDF from a browser produces a clean
+    page.
+    """
+    import html as _html
+    from datetime import datetime, timezone
+
+    from . import __version__
+
+    by_name = {d["name"]: d for d in decoded}
+
+    def get_val(name: str) -> str:
+        d = by_name.get(name)
+        if d is None or d["value"] is None:
+            return "—"
+        return _fmt_value(d["value"], d.get("scale", 1.0), d.get("unit"))
+
+    def get_unit(name: str) -> str:
+        d = by_name.get(name)
+        return (d.get("unit") or "") if d else ""
+
+    def get_raw(name: str) -> str:
+        d = by_name.get(name)
+        if d is None:
+            return ""
+        return _fmt_raw(d["raw_words"])
+
+    active_alarms = rm.derive_active_alarms(value_map)
+    site_id = _html.escape(getattr(rm.site, "id", "SITE-1"))
+    site_name = _html.escape(getattr(rm.site, "name", "Generac H-100"))
+    timestamp = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M %Z")
+    fired_rule_text = (
+        f"{fired_rule.register} bit 0x{fired_rule.mask:04X} set" if fired_rule else "no rule matched"
+    )
+
+    # Section 1: warnings to confirm/deny on the panel
+    warning_rows = "".join(
+        f"""
+        <tr class="warn">
+          <td><strong>{_html.escape(ab.code)}</strong><br><span class="desc">{_html.escape(ab.desc)}</span></td>
+          <td class="mono">{_html.escape(ab.register)} 0x{ab.mask:04X}</td>
+          <td class="chk">☐ Yes &nbsp;&nbsp; ☐ No</td>
+          <td class="write"></td>
+        </tr>"""
+        for ab in active_alarms
+    ) or """
+        <tr><td colspan="4" style="text-align:center; color:#666;">
+          GenWatch reports no active warnings. Confirm the panel agrees:
+          ☐ Panel also shows no warnings &nbsp;&nbsp;&nbsp;
+          ☐ Panel shows warnings (write here): _______________________
+        </td></tr>"""
+
+    # Section 2: high-confidence numeric cross-checks
+    numeric_targets = [
+        ("battery_volts",       "Battery voltage",      "0.1 V"),
+        ("run_hours",           "Run hours (lifetime)", "1 h"),
+        ("coolant_temp",        "Coolant temperature",  "1 °"),
+        ("oil_temp",            "Oil temperature",      "1 °"),
+        ("fuel_level_pct",      "Fuel level",           "1 %"),
+    ]
+    numeric_rows = "".join(
+        f"""
+        <tr>
+          <td>{_html.escape(label)}</td>
+          <td class="mono num">{_html.escape(get_val(name))} {_html.escape(get_unit(name))}</td>
+          <td class="write"></td>
+          <td class="chk">☐ Match &nbsp; ☐ Off</td>
+        </tr>"""
+        for name, label, _ in numeric_targets
+    )
+
+    # Section 3: suspicious / diagnostic values
+    diag_rows = []
+    cl = by_name.get("coolant_level")
+    if cl and cl["value"] is not None:
+        diag_rows.append(f"""
+        <tr>
+          <td>Coolant level<br><span class="desc">GenWatch reads {cl['value']} (impossible if % — likely scale issue)</span></td>
+          <td class="write"></td>
+          <td class="note">If panel shows ~{cl['value']/10:.1f} → set <span class="mono">scale: 0.1</span><br>If different → register may not mean coolant level</td>
+        </tr>""")
+    qts = by_name.get("quiettest_status")
+    if qts and qts["value"] is not None:
+        diag_rows.append(f"""
+        <tr>
+          <td>Quiet-test status<br><span class="desc">GenWatch reads {qts['value']} (0xFFFF = "unconfigured" sentinel)</span></td>
+          <td class="write">Has a quiet-test ever been run? ☐ Yes ☐ No / unknown</td>
+          <td class="note">If "no", the 0xFFFF is expected; will populate on first quiet-test</td>
+        </tr>""")
+    esc = by_name.get("engine_status_code")
+    if esc and esc["value"] is not None:
+        diag_rows.append(f"""
+        <tr>
+          <td>Engine status code<br><span class="desc">GenWatch reads {esc['value']}</span></td>
+          <td class="write">Panel home screen status text / code:</td>
+          <td class="note">Tells us whether 0x0132 is the actual status enum on your panel</td>
+        </tr>""")
+    kss = by_name.get("key_switch_state")
+    if kss and kss["value"] is not None:
+        diag_rows.append(f"""
+        <tr>
+          <td>Key switch position<br><span class="desc">GenWatch raw 0x{int(kss['value']) & 0xFFFF:04X}</span></td>
+          <td class="write">Physical key position:&nbsp;&nbsp;☐ OFF &nbsp;☐ AUTO &nbsp;☐ MANUAL</td>
+          <td class="note">Lets us label the bits set in key_switch_state</td>
+        </tr>""")
+    diag_table = "".join(diag_rows) or "<tr><td colspan='3'>No diagnostic values flagged.</td></tr>"
+
+    # Section 4: unknown bits — just a freeform notes box.
+    # We list how many "?" bits there are per register so the operator knows
+    # how much there is to look for, but don't ask them to enumerate.
+    unknown_summary = []
+    for d in decoded:
+        if d["type"] != "bitfld" or d["value"] is None:
+            continue
+        v = int(d["value"]) & 0xFFFF
+        meanings = bit_meanings.get(d["name"], {})
+        unknown = [b for b in range(16) if (v >> b) & 1 and (1 << b) not in meanings]
+        if unknown:
+            bit_list = ", ".join(f"0x{1 << b:04X}" for b in sorted(unknown, reverse=True))
+            unknown_summary.append(
+                f"<li><span class='mono'>{_html.escape(d['name'])}</span>: {bit_list}</li>"
+            )
+    unknown_html = "".join(unknown_summary) or "<li>None — every set bit has a known meaning. Nice.</li>"
+
+    # Engine readings summary at the top
+    state_class = "state-alarm" if fired_state == "alarm" else (
+        "state-running" if fired_state in ("running", "cranking", "exercising", "cooling") else "state-stopped"
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>H-100 Panel Cross-Check — {site_name}</title>
+<style>
+  @page {{ size: Letter; margin: 0.5in; }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    font: 10.5pt/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: #111; max-width: 7.5in; margin: 0 auto; padding: 0.25in;
+  }}
+  h1 {{ font-size: 18pt; margin: 0 0 4pt 0; }}
+  h2 {{
+    font-size: 12pt; margin: 14pt 0 6pt 0; padding: 3pt 6pt;
+    background: #222; color: #fff; border-radius: 2pt;
+  }}
+  .meta {{ font-size: 9pt; color: #444; line-height: 1.5; margin-bottom: 8pt; }}
+  .state {{
+    display: inline-block; padding: 4pt 10pt; border-radius: 3pt;
+    font-weight: 600; letter-spacing: 0.05em;
+  }}
+  .state-stopped {{ background: #e8eef5; color: #1a3a5c; }}
+  .state-running {{ background: #e6f4e0; color: #2a5a1a; }}
+  .state-alarm {{ background: #ffe0e0; color: #8a1a1a; }}
+  table {{ width: 100%; border-collapse: collapse; margin: 4pt 0 8pt 0; font-size: 10pt; }}
+  th, td {{ border: 1px solid #999; padding: 5pt 7pt; text-align: left; vertical-align: top; }}
+  th {{ background: #efefef; font-weight: 600; font-size: 9.5pt; }}
+  td.chk {{ width: 1.4in; text-align: center; white-space: nowrap; }}
+  td.write {{ background: #fffdf2; min-width: 1.6in; min-height: 0.4in; }}
+  td.note {{ font-size: 8.5pt; color: #555; font-style: italic; max-width: 2in; }}
+  td.mono, .mono {{ font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 9.5pt; }}
+  td.num {{ font-variant-numeric: tabular-nums; font-weight: 600; }}
+  .warn td:first-child {{ border-left: 3pt solid #d97706; }}
+  .desc {{ font-size: 9pt; color: #555; font-weight: normal; }}
+  .signoff {{ margin-top: 18pt; }}
+  .signoff td {{ border: none; padding: 8pt 6pt; }}
+  .signoff td:first-child {{ width: 1.2in; font-weight: 600; }}
+  .line {{ border-bottom: 1px solid #444; min-height: 18pt; width: 100%; display: block; }}
+  .notes {{ background: #fffdf2; border: 1px solid #999; min-height: 0.8in; padding: 6pt 8pt; margin-top: 4pt; }}
+  ul.bits {{ font-size: 9pt; margin: 4pt 0 8pt 0; padding-left: 18pt; color: #444; }}
+  .footer {{ font-size: 8.5pt; color: #666; margin-top: 16pt; border-top: 1px solid #ccc; padding-top: 6pt; }}
+  @media print {{ body {{ padding: 0; }} h2 {{ break-after: avoid; }} table {{ break-inside: avoid; }} }}
+</style>
+</head>
+<body>
+
+<h1>H-100 Panel Cross-Check</h1>
+<div class="meta">
+  Site: <strong>{site_name}</strong> ({site_id}) &nbsp;·&nbsp;
+  Link: <span class="mono">{_html.escape(link)}</span> &nbsp;·&nbsp;
+  Slave {rm.slave} &nbsp;·&nbsp;
+  Captured: {timestamp}<br>
+  Castle Generator Monitor v{__version__} &nbsp;·&nbsp;
+  {len(decoded)} registers polled in {elapsed_ms:.0f} ms
+  {('<br><strong style="color:#a00;">⚠ ' + str(len(errs)) + ' read warnings</strong>') if errs else ''}
+</div>
+
+<p>Engine state at capture: <span class="state {state_class}">{_html.escape(fired_state.upper())}</span>
+&nbsp;<span class="desc">(matched: {_html.escape(fired_rule_text)})</span></p>
+
+<h2>1. Active warnings — does the panel agree?</h2>
+<p class="desc">If GenWatch flags a warning that the panel doesn't show, our bit-to-meaning
+map for your H-100 revision is wrong and we'll fix it. If both agree the warning is set
+but the panel hasn't cleared it, it's a latched warning from a previous run.</p>
+<table>
+  <colgroup>
+    <col><col><col style="width:1.4in"><col style="width:1.8in">
+  </colgroup>
+  <thead>
+    <tr><th>GenWatch reports</th><th>Source bit</th><th>Panel shows it?</th><th>If different, what does panel actually show?</th></tr>
+  </thead>
+  <tbody>
+    {warning_rows}
+  </tbody>
+</table>
+
+<h2>2. Numeric cross-check — high-confidence values</h2>
+<p class="desc">Walk these in order. If any are far off, the corresponding register address
+in <span class="mono">registers/h100.yaml</span> is wrong for your panel revision.</p>
+<table>
+  <colgroup>
+    <col style="width:2.2in"><col style="width:1.4in"><col><col style="width:1.4in">
+  </colgroup>
+  <thead>
+    <tr><th>Reading</th><th>GenWatch shows</th><th>Panel shows</th><th>Match?</th></tr>
+  </thead>
+  <tbody>
+    {numeric_rows}
+  </tbody>
+</table>
+
+<h2>3. Diagnostic values — write down what the panel says</h2>
+<p class="desc">These are values GenWatch can't fully interpret without seeing what the
+panel reports for them. Your answers here let us patch the register map.</p>
+<table>
+  <colgroup>
+    <col style="width:2.4in"><col><col style="width:2in">
+  </colgroup>
+  <thead>
+    <tr><th>Reading</th><th>What the panel shows</th><th>Why we ask</th></tr>
+  </thead>
+  <tbody>
+    {diag_table}
+  </tbody>
+</table>
+
+<h2>4. Unknown bits — only fill if anything on the panel looks unexpected</h2>
+<p class="desc">These status bits are set right now but our map has no name for them on
+your panel. They're almost always informational (battery-charger active, AC sensing OK,
+etc.). Note here if any panel indicator changes that you can't explain from sections 1–3.</p>
+<ul class="bits">
+  {unknown_html}
+</ul>
+<div class="notes">Notes:</div>
+
+<h2>5. Sign-off</h2>
+<table class="signoff">
+  <tr><td>Technician:</td><td><span class="line"></span></td></tr>
+  <tr><td>Date / time:</td><td><span class="line"></span></td></tr>
+  <tr><td>Generator s/n:</td><td><span class="line"></span></td></tr>
+  <tr><td>Signature:</td><td><span class="line"></span></td></tr>
+</table>
+
+<div class="footer">
+  Generated by <span class="mono">genwatch panel --html</span> ·
+  Save this page (or print to PDF) and tick through it next to the H-100 LCD.
+  Paste the filled-in answers back to your software contact and we'll patch
+  <span class="mono">registers/h100.yaml</span> to match your panel exactly.
+</div>
+
+</body>
+</html>
+"""
 
 
 def _compact_ranges(addrs: list[int]) -> str:
