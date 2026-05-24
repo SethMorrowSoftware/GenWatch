@@ -30,6 +30,7 @@ USER=genwatch
 UDEV_RULE=/etc/udev/rules.d/99-genwatch-modbus.rules
 OLD_UDEV_RULE=/etc/udev/rules.d/99-genwatch-rs485.rules
 UNIT_FILE=/etc/systemd/system/genwatch.service
+HWWD_FILE=/etc/systemd/system.conf.d/10-genwatch-hwwatchdog.conf
 
 # ─── helpers ──────────────────────────────────────────────────────────────
 log()  { printf "\033[1;36m[genwatch]\033[0m %s\n" "$*"; }
@@ -236,8 +237,30 @@ fi
 # ─── 8. systemd unit ──────────────────────────────────────────────────────
 log "Installing systemd unit"
 install -m 0644 "$REPO_ROOT/deploy/systemd/genwatch.service" "$UNIT_FILE"
+
+# Hardware watchdog drop-in for pid 1. systemd will pet /dev/watchdog so
+# the SoC resets the Pi if userspace deadlocks beneath the GenWatch
+# service's own software watchdog. The drop-in lives in system.conf.d,
+# which only takes effect after daemon-reexec — defer that until after
+# the unit is in place so we reexec exactly once.
+install -d -m 0755 "$(dirname "$HWWD_FILE")"
+install -m 0644 \
+  "$REPO_ROOT/deploy/systemd/system.conf.d/10-genwatch-hwwatchdog.conf" \
+  "$HWWD_FILE"
+
 systemctl daemon-reload
+# Re-exec pid 1 so the new RuntimeWatchdogSec setting is picked up. This
+# is the documented way to apply system.conf changes without a reboot
+# and is safe to call repeatedly.
+systemctl daemon-reexec || warn "systemctl daemon-reexec failed — HW watchdog will activate on next reboot"
 systemctl enable genwatch.service
+
+# Sanity-check the hardware watchdog is actually present. Absent on
+# x86/QEMU dev rigs; warn only — the service is still useful there.
+if [[ ! -c /dev/watchdog ]]; then
+  warn "/dev/watchdog not present — hardware watchdog will be inactive."
+  warn "On a real Pi this means the bcm2835_wdt kernel module didn't load."
+fi
 
 # ─── 9. pre-flight check ──────────────────────────────────────────────────
 log "Running pre-flight diagnostics"

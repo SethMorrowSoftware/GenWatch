@@ -17,6 +17,7 @@ import asyncio
 import logging
 import math
 import random
+import socket as _socket
 import time
 from dataclasses import dataclass
 from typing import Protocol
@@ -24,6 +25,51 @@ from typing import Protocol
 from .registers import ControlDef, RegisterMap
 
 log = logging.getLogger("genwatch.modbus.client")
+
+
+# TCP keepalive parameters (Linux). The Lantronix bridge (and any NAT or
+# stateful firewall between it and the Pi) can silently drop a TCP
+# connection without sending FIN/RST — switch reboots, idle timeouts,
+# the bridge itself rebooting. Without keepalive we only notice when a
+# read times out, then burn the entire retry budget before failing.
+# With these settings the kernel drops a wedged socket after roughly
+# KEEPIDLE + KEEPCNT * KEEPINTVL ≈ 60 s of silence; the next poll then
+# fails fast on a dead socket and _ensure_connected triggers a clean
+# reconnect instead of pymodbus sitting on a zombie peer.
+_TCP_KEEPIDLE_S = 30
+_TCP_KEEPINTVL_S = 10
+_TCP_KEEPCNT = 3
+
+
+def _apply_tcp_keepalive(transport, host: str, port: int) -> None:
+    """Enable SO_KEEPALIVE + tune timings on the underlying asyncio socket.
+
+    No-op if the platform doesn't expose the Linux TCP_KEEP* options, or
+    if the transport hasn't exposed a socket (rare; future pymodbus
+    versions may swap the underlying transport). Failure here must not
+    prevent the connection from being used — keepalive is a defence in
+    depth, not a correctness requirement.
+    """
+    if transport is None:
+        return
+    try:
+        sock = transport.get_extra_info("socket")
+    except Exception:  # noqa: BLE001
+        sock = None
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1)
+        if hasattr(_socket, "TCP_KEEPIDLE"):  # Linux
+            sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE, _TCP_KEEPIDLE_S)
+            sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL, _TCP_KEEPINTVL_S)
+            sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT, _TCP_KEEPCNT)
+        log.debug(
+            "TCP keepalive enabled for %s:%d (idle=%ds intvl=%ds cnt=%d)",
+            host, port, _TCP_KEEPIDLE_S, _TCP_KEEPINTVL_S, _TCP_KEEPCNT,
+        )
+    except OSError as e:
+        log.warning("could not apply TCP keepalive to %s:%d: %s", host, port, e)
 
 
 @dataclass
@@ -272,11 +318,24 @@ class TcpRtuModbusClient:
                       self.host, self.port, self.connect_timeout_s)
             return False
         if ok:
+            self._enable_keepalive()
             log.info("Modbus TCP-RTU connected: %s:%d slave=%d framer=%s",
                      self.host, self.port, self.slave, self.framer)
         else:
             log.error("Modbus TCP connect failed to %s:%d", self.host, self.port)
         return bool(ok)
+
+    def _enable_keepalive(self) -> None:
+        # pymodbus 3.x exposes the asyncio transport at client.ctx.transport.
+        # Walk defensively so a future internal rename doesn't crash the
+        # connection — keepalive is a hardening measure, not load-bearing.
+        client = self._client
+        if client is None:
+            return
+        transport = getattr(getattr(client, "ctx", None), "transport", None)
+        if transport is None:
+            transport = getattr(client, "transport", None)
+        _apply_tcp_keepalive(transport, self.host, self.port)
 
     async def close(self) -> None:
         if self._client is not None:
@@ -293,11 +352,15 @@ class TcpRtuModbusClient:
             return True
         # Best-effort reconnect; the next call will retry if this fails.
         try:
-            return bool(await asyncio.wait_for(
+            ok = bool(await asyncio.wait_for(
                 self._client.connect(), timeout=self.connect_timeout_s,
             ))
         except (asyncio.TimeoutError, Exception):  # noqa: BLE001
             return False
+        if ok:
+            # Re-apply keepalive on the freshly created socket.
+            self._enable_keepalive()
+        return ok
 
     async def _read_once(self, addr: int, count: int, fc: int):
         assert self._client is not None

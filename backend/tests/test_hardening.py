@@ -247,6 +247,51 @@ async def test_poller_falls_back_to_singles_when_batch_fails(tmp_path):
 # ─── Modbus client ────────────────────────────────────────────────────────
 
 
+def test_tcp_keepalive_applied_to_real_socket():
+    """The keepalive helper must enable SO_KEEPALIVE and tune the Linux
+    TCP_KEEP* timings on the underlying socket. Without this, a wedged
+    Lantronix TCP connection (NAT timeout, switch reboot, bridge crash
+    with no FIN/RST) is invisible until the application-level read
+    timeout expires — and then often after a full retry budget."""
+    import socket
+    from genwatch.modbus.client import _apply_tcp_keepalive
+
+    class FakeTransport:
+        def __init__(self, sock):
+            self._sock = sock
+            self.queries: list[str] = []
+
+        def get_extra_info(self, key):
+            self.queries.append(key)
+            return self._sock if key == "socket" else None
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        _apply_tcp_keepalive(FakeTransport(sock), "192.0.2.1", 10001)
+        assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE) == 1
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE) == 30
+            assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL) == 10
+            assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT) == 3
+    finally:
+        sock.close()
+
+
+def test_tcp_keepalive_tolerates_missing_socket():
+    """Keepalive is a hardening measure, not load-bearing. If the
+    transport doesn't expose a socket — future pymodbus refactor, mocked
+    transport, etc. — the helper must not raise."""
+    from genwatch.modbus.client import _apply_tcp_keepalive
+
+    class NoSocketTransport:
+        def get_extra_info(self, key):
+            return None
+
+    # Must not raise.
+    _apply_tcp_keepalive(NoSocketTransport(), "192.0.2.1", 10001)
+    _apply_tcp_keepalive(None, "192.0.2.1", 10001)
+
+
 async def test_tcp_client_reports_failure_when_bridge_unreachable():
     """Reads must not raise — they return a ModbusResult with ok=False
     so the poller can surface a 'comms lost' state instead of crashing."""
