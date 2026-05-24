@@ -6,6 +6,7 @@ Usage:
   python -m genwatch gensecret     # generate a jwt_secret
   python -m genwatch modbusdump    # single-block read for diagnostics
   python -m genwatch scan          # walk a range of addresses, classify each
+  python -m genwatch panel         # decoded snapshot for cross-check vs H-100 LCD
   python -m genwatch doctor        # pre-flight diagnostics (hardware, config, DB)
   python -m genwatch version       # print version
 """
@@ -58,6 +59,9 @@ def main() -> int:
 
     if cmd == "scan":
         return _scan(args[1:])
+
+    if cmd == "panel":
+        return _panel(args[1:])
 
     if cmd == "doctor":
         return _doctor(args[1:])
@@ -245,10 +249,14 @@ def _doctor(args: list[str]) -> int:
 def _build_client_from_settings(settings, rm, retries: int = 2):
     """Construct the right Modbus client for the configured transport.
 
-    Used by doctor and modbusdump so the diagnostics follow whatever
-    transport is in config.yaml.
+    Used by doctor / modbusdump / scan / panel so the diagnostics follow
+    whatever transport is in config.yaml. Honors mock so the diagnostic
+    tools can be smoke-tested without hardware.
     """
-    from .modbus.client import SerialModbusClient, TcpRtuModbusClient
+    from .modbus.client import MockModbusClient, SerialModbusClient, TcpRtuModbusClient
+
+    if settings.mock:
+        return MockModbusClient(rm)
 
     if settings.transport == "tcp":
         return TcpRtuModbusClient(
@@ -512,6 +520,287 @@ def _scan(args: list[str]) -> int:
         print(f"\n[saved to {opts.out}]")
 
     return 0
+
+
+def _panel(args: list[str]) -> int:
+    """Decoded snapshot of every named register, for cross-checking against
+    the H-100 LCD.
+
+    The use case: the UI shows you a number that doesn't match the panel,
+    or a warning bit you don't expect, and you want to know which
+    bit-to-meaning mapping in `registers/h100.yaml` is responsible — or
+    whether the panel itself disagrees. This command:
+
+      - reads every register in the loaded map (using single-register
+        reads so one bad address can't take out the report)
+      - decodes each value with its scale + unit
+      - for every bitfield register, lists every bit that's SET and
+        labels it with the name from `alarm_bits` / `engine_state_bits`
+        (or "?" if we have no name for that bit on this panel)
+      - calls out telemetry that looks structurally suspicious
+        (0xFFFF sentinels, percentages > 100, etc.)
+
+    Output is plain text designed to sit next to the panel display so
+    you can tick through it. Use `--json` if you want it machine-readable.
+    """
+    import argparse
+    import asyncio
+    import time
+
+    from .config import load
+    from .modbus.client import ModbusResult
+    from .modbus.registers import (
+        batch_reads,
+        decode_value,
+        load_register_map,
+    )
+
+    p = argparse.ArgumentParser(prog="genwatch panel")
+    p.add_argument("--config", default=None, help="config.yaml path")
+    p.add_argument("--json", action="store_true",
+                   help="emit machine-readable JSON instead of the text report")
+    p.add_argument("--slave", type=int, default=None,
+                   help="override modbus.slave (default: from register map)")
+    opts = p.parse_args(args)
+
+    settings = load(opts.config)
+    rm = load_register_map(settings.register_file_path)
+    if opts.slave is not None:
+        rm.slave = opts.slave  # type: ignore[misc]
+
+    async def run() -> tuple[dict[int, int], list[str], float]:
+        """Read every register in the map. Returns (addr→word, errors, elapsed_ms)."""
+        client = _build_client_from_settings(settings, rm, retries=1)
+        ok = await client.connect()
+        if not ok:
+            return {}, ["connect failed"], 0.0
+        t0 = time.perf_counter()
+        words: dict[int, int] = {}
+        errs: list[str] = []
+        # Use the same batching the poller uses so we issue ~5 reads not
+        # ~35. Fall back to single-register reads if a batch fails so one
+        # bad address can't blow out the whole report.
+        for start, count in batch_reads(rm.registers):
+            r: ModbusResult = await client.read(start, count, fc=rm.read_fc)
+            if r.ok and r.words:
+                for i, w in enumerate(r.words):
+                    words[start + i] = int(w)
+                continue
+            errs.append(f"batch 0x{start:04X}+{count} failed ({r.error}); falling back to singles")
+            for i in range(count):
+                rr = await client.read(start + i, 1, fc=rm.read_fc)
+                if rr.ok and rr.words:
+                    words[start + i] = int(rr.words[0])
+                else:
+                    errs.append(f"  0x{start + i:04X} {rr.error}")
+        await client.close()
+        return words, errs, (time.perf_counter() - t0) * 1000.0
+
+    words, errs, elapsed_ms = asyncio.run(run())
+    if "connect failed" in errs:
+        print("connect failed — check transport in config.yaml", file=sys.stderr)
+        return 2
+
+    # Build the decoded view: per-register name → {value, raw_words, def}
+    decoded: list[dict] = []
+    for reg in rm.registers:
+        raw_words = [words.get(reg.addr + i) for i in range(reg.words)]
+        if any(w is None for w in raw_words):
+            value = None
+        else:
+            value = decode_value(reg, [w for w in raw_words if w is not None])  # type: ignore[arg-type]
+        decoded.append({
+            "name": reg.name,
+            "addr": reg.addr,
+            "type": reg.type,
+            "scale": reg.scale,
+            "unit": reg.unit,
+            "group": reg.group,
+            "tier": reg.tier,
+            "value": value,
+            "raw_words": raw_words,
+        })
+
+    # Engine state — both the semantic result and the *evidence* (which
+    # rule fired). We re-evaluate rules in priority order so the user can
+    # see what the poller saw.
+    value_map: dict[str, float | int] = {
+        d["name"]: int(d["value"]) if isinstance(d["value"], (int, float)) else 0
+        for d in decoded if d["value"] is not None
+    }
+    fired_state = "unknown"
+    fired_rule = None
+    for rule in rm.engine_state_bits:
+        raw = value_map.get(rule.register)
+        if raw is None:
+            continue
+        if (int(raw) & rule.mask) == rule.mask:
+            fired_state = rule.state
+            fired_rule = rule
+            break
+
+    # Per-bit dictionaries: register name → {bit_mask: AlarmBit or StateBitRule}
+    bit_meanings: dict[str, dict[int, str]] = {}
+    for ab in rm.alarm_bits:
+        bit_meanings.setdefault(ab.register, {})[ab.mask] = f"{ab.code} ({ab.severity})"
+    for rule in rm.engine_state_bits:
+        existing = bit_meanings.setdefault(rule.register, {}).get(rule.mask)
+        label = f"state:{rule.state}"
+        bit_meanings[rule.register][rule.mask] = (
+            f"{existing}, {label}" if existing else label
+        )
+
+    # ─── JSON output path ─────────────────────────────────────────────
+    if opts.json:
+        import json
+        out = {
+            "transport": settings.transport,
+            "slave": rm.slave,
+            "engine_state": fired_state,
+            "engine_state_via": (
+                {"register": fired_rule.register, "mask": f"0x{fired_rule.mask:04X}"}
+                if fired_rule else None
+            ),
+            "registers": [
+                {
+                    "name": d["name"],
+                    "addr": f"0x{d['addr']:04X}",
+                    "type": d["type"],
+                    "value": d["value"],
+                    "unit": d["unit"],
+                    "raw_hex": [None if w is None else f"0x{w:04X}" for w in d["raw_words"]],
+                }
+                for d in decoded
+            ],
+            "active_alarms": [
+                {"code": ab.code, "desc": ab.desc, "severity": ab.severity}
+                for ab in rm.derive_active_alarms(value_map)
+            ],
+            "errors": errs,
+            "elapsed_ms": round(elapsed_ms, 1),
+        }
+        print(json.dumps(out, indent=2))
+        return 0 if not errs else 1
+
+    # ─── Text report ──────────────────────────────────────────────────
+    if settings.transport == "tcp":
+        link = f"tcp {settings.modbus_tcp.host}:{settings.modbus_tcp.port}"
+    else:
+        link = f"serial {settings.serial.device} {settings.serial.baud}"
+    print(f"== Castle Generator Monitor — panel ({len(decoded)} registers in {elapsed_ms:.0f} ms) ==")
+    print(f"  Link:    {link}  slave={rm.slave}")
+    print(f"  Map:     {rm.path}")
+    if errs:
+        print(f"  WARN:    {len(errs)} read issue(s); some values may be missing")
+    print()
+
+    # Engine state with provenance
+    if fired_rule is not None:
+        print(f"Engine state: {fired_state.upper()}")
+        print(f"  (matched: {fired_rule.register} bit 0x{fired_rule.mask:04X} set)")
+    else:
+        print(f"Engine state: {fired_state.upper()}  (no rule matched)")
+    print()
+
+    # Group registers by their YAML `group:` tag, render each register
+    # according to its own type so a u16 count sitting in a status group
+    # isn't dumped as a bitfield.
+    groups: dict[str, list[dict]] = {}
+    for d in decoded:
+        groups.setdefault(d["group"] or "Other", []).append(d)
+
+    for g, rows in groups.items():
+        print(f"{g}")
+        for d in rows:
+            raw = _fmt_raw(d["raw_words"])
+            if d["type"] == "bitfld":
+                v = int(d["value"]) & 0xFFFF if d["value"] is not None else 0
+                print(f"  {d['name']:<22} 0x{v:04X}                raw={raw}")
+                if v == 0:
+                    print("                           (no bits set)")
+                    continue
+                meanings = bit_meanings.get(d["name"], {})
+                # Walk bits high → low so the report reads like the panel
+                for bit in range(15, -1, -1):
+                    mask = 1 << bit
+                    if not (v & mask):
+                        continue
+                    label = meanings.get(mask, "?")
+                    marker = "  " if label != "?" else " ?"
+                    print(f"     {marker}  0x{mask:04X}  {label}")
+            else:
+                val = _fmt_value(d["value"], d["scale"], d["unit"])
+                note = _value_note(d)
+                unit = d["unit"] or ""
+                print(f"  {d['name']:<22} {val:>14}  {unit:<6} raw={raw}{note}")
+        print()
+
+    # Active alarms summary
+    active = rm.derive_active_alarms(value_map)
+    print("Active alarms (from alarm_bits map)")
+    if not active:
+        print("  none")
+    else:
+        for ab in active:
+            print(f"  - {ab.severity.upper():<5}  {ab.code:<28}  {ab.desc}")
+    print()
+
+    # Cross-check checklist
+    print("Cross-check against the H-100 LCD:")
+    print("  1. Does the panel show the same engine state as above?")
+    print("  2. Does the panel show the same active warnings/alarms?")
+    print("     If a warning is listed here but absent on the panel, the bit")
+    print("     mapping in registers/h100.yaml is wrong for your revision.")
+    print("  3. Spot-check rpm, oil pressure, coolant temp, battery V, fuel %.")
+    print("     Values flagged with ← are structurally suspicious (sentinel,")
+    print("     out-of-range, etc.) and worth confirming.")
+    print()
+    return 0 if not errs else 1
+
+
+def _fmt_value(value, scale: float, unit: str | None) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, float):
+        # Scaled values; print 2 decimals unless they're effectively integers
+        if abs(value - round(value)) < 1e-6:
+            return f"{value:.0f}"
+        return f"{value:.2f}"
+    return f"{value}"
+
+
+def _fmt_raw(words: list[int | None]) -> str:
+    parts = []
+    for w in words:
+        parts.append("----" if w is None else f"{w:04X}")
+    return " ".join(parts)
+
+
+def _value_note(d: dict) -> str:
+    """Heuristic flag for values that look structurally wrong.
+
+    These are tells that the register's bit-to-meaning or scale doesn't
+    match the panel revision. False positives are fine — better to point
+    at three things than miss the broken one.
+    """
+    v = d["value"]
+    unit = (d["unit"] or "").lower()
+    name = d["name"].lower()
+    if v is None:
+        return "  ← read failed"
+    if isinstance(v, (int, float)):
+        # Common 16-bit sentinel for "no data" / unconfigured channel
+        if d["type"] in ("u16", "s16") and int(v) == 0xFFFF:
+            return "  ← 0xFFFF sentinel (likely unconfigured on this panel)"
+        if d["type"] in ("u32", "s32") and int(v) == 0xFFFFFFFF:
+            return "  ← 0xFFFFFFFF sentinel (likely unconfigured)"
+        if "pct" in unit and v > 100:
+            return f"  ← {v} > 100% (scale or register-meaning mismatch?)"
+        if "psi" in unit and v > 200:
+            return f"  ← {v} psi unusually high"
+        if name == "rpm" and v > 3600:
+            return f"  ← {v} rpm above redline for a genset"
+    return ""
 
 
 def _compact_ranges(addrs: list[int]) -> str:

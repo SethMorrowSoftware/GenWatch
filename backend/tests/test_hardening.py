@@ -292,6 +292,54 @@ def test_tcp_keepalive_tolerates_missing_socket():
     _apply_tcp_keepalive(None, "192.0.2.1", 10001)
 
 
+# ─── CLI: panel command ──────────────────────────────────────────────────
+
+
+def test_panel_command_runs_against_mock(monkeypatch, tmp_path, capsys):
+    """The `genwatch panel` CLI reads every register in the map and
+    prints a decoded report. Smoke-test that it (a) actually runs end
+    to end against the mock client, (b) decodes the engine state, and
+    (c) renders the bitfield meaning inline so an operator can
+    cross-check the panel LCD."""
+    monkeypatch.setenv("GENWATCH_MOCK", "true")
+    monkeypatch.setenv("GENWATCH_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("GENWATCH_AUTH__JWT_SECRET", "x" * 64)
+    monkeypatch.setenv("GENWATCH_AUTH__ADMIN_PASSWORD_HASH", hash_password("t"))
+
+    from genwatch.__main__ import _panel
+
+    rc = _panel([])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "Engine state:" in out
+    assert "STOPPED" in out          # mock starts in stopped
+    assert "matched: output_status_1 bit 0x0100" in out
+    assert "Active alarms" in out
+    assert "Cross-check against the H-100 LCD" in out
+    # Bitfield rendering must show the engine_state hint inline.
+    assert "state:stopped" in out
+
+
+def test_panel_command_json_output_is_parseable(monkeypatch, tmp_path, capsys):
+    """--json must produce valid JSON suitable for piping to jq."""
+    import json
+    monkeypatch.setenv("GENWATCH_MOCK", "true")
+    monkeypatch.setenv("GENWATCH_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("GENWATCH_AUTH__JWT_SECRET", "x" * 64)
+    monkeypatch.setenv("GENWATCH_AUTH__ADMIN_PASSWORD_HASH", hash_password("t"))
+
+    from genwatch.__main__ import _panel
+
+    rc = _panel(["--json"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    doc = json.loads(out)
+    assert doc["engine_state"] == "stopped"
+    assert doc["slave"] == 100
+    assert any(r["name"] == "output_status_1" for r in doc["registers"])
+    assert isinstance(doc["active_alarms"], list)
+
+
 async def test_tcp_client_reports_failure_when_bridge_unreachable():
     """Reads must not raise — they return a ModbusResult with ok=False
     so the poller can surface a 'comms lost' state instead of crashing."""

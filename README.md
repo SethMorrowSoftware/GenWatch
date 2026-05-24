@@ -329,8 +329,35 @@ genwatch gensecret              # generate a JWT signing secret
 genwatch doctor                 # pre-flight diagnostics
 genwatch modbusdump [--addr]    # read raw registers from the controller
 genwatch scan [--start --end]   # walk a range and classify each register
+genwatch panel [--json]         # decoded snapshot of every named register —
+                                #   side-by-side cross-check vs the H-100 LCD
 genwatch version                # print version
 ```
+
+### Cross-checking against the H-100 LCD
+
+When a value in the UI looks off — a warning that isn't on the panel, a
+percentage above 100, a sensor reading you don't trust — `genwatch panel`
+reads every register in the loaded map, decodes every bit by its name
+(from `engine_state_bits` and `alarm_bits` in `registers/h100.yaml`), and
+prints a report you can hold next to the H-100's own display:
+
+```bash
+sudo -u genwatch genwatch panel
+```
+
+The report shows the derived engine state (with the exact bit that
+triggered it), every telemetry value with units and raw hex, every set
+bit in each status register labelled with its `code`/severity (or `?`
+if the bit isn't in our map for your panel revision), and the list of
+currently active alarms. Values flagged with `←` are structurally
+suspicious — `0xFFFF` sentinels, percentages above 100, RPM above
+redline, etc. — and worth confirming on the panel.
+
+If the panel disagrees with the report on any bit, edit
+`/opt/genwatch/genwatch/registers/h100.yaml` to match your panel's
+actual bit-to-meaning mapping, then `curl -X POST .../api/registers/reload`
+or `sudo systemctl restart genwatch`.
 
 ### Useful systemd commands
 
