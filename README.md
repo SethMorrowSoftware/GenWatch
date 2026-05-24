@@ -329,8 +329,8 @@ genwatch gensecret              # generate a JWT signing secret
 genwatch doctor                 # pre-flight diagnostics
 genwatch modbusdump [--addr]    # read raw registers from the controller
 genwatch scan [--start --end]   # walk a range and classify each register
-genwatch panel [--json]         # decoded snapshot of every named register —
-                                #   side-by-side cross-check vs the H-100 LCD
+genwatch panel [--json|--html]  # decoded snapshot of every named register —
+                                #   --html emits a printable cross-check sheet
 genwatch version                # print version
 ```
 
@@ -358,6 +358,19 @@ If the panel disagrees with the report on any bit, edit
 `/opt/genwatch/genwatch/registers/h100.yaml` to match your panel's
 actual bit-to-meaning mapping, then `curl -X POST .../api/registers/reload`
 or `sudo systemctl restart genwatch`.
+
+For a paper-friendly version you can take to the panel, add `--html`:
+
+```bash
+sudo -u genwatch genwatch panel --html > /tmp/cross-check.html
+# Open /tmp/cross-check.html in any browser → File → Print (or Save as PDF)
+```
+
+The HTML sheet is pre-filled with the current live readings and has
+write-in space next to each value for you to record what the panel
+displays. Sections cover active warnings, high-confidence numeric
+cross-checks (battery, run hours, temperatures, fuel %), suspicious
+values, unknown bits, and a sign-off block.
 
 ### Useful systemd commands
 
