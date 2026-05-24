@@ -14,10 +14,12 @@
 #
 # Anything not set here falls back to package defaults.
 
-# Set to true to disable real serial I/O and use the synthesized H-100
-# state machine. Useful for setting up the UI before cabling is done.
-# Production deploys MUST leave this false — the service will refuse to
-# start if the live link is unavailable instead of silently faking it.
+# Set to true to disable real Modbus I/O and use the synthesized H-100
+# state machine. Useful for previewing the UI before the bridge is
+# wired or for offline UI development. Leave false in production: with
+# a real transport configured, the service stays up even when the link
+# is down (surfacing "Comms LOST" in the UI) and reconnects in the
+# background — it never silently invents telemetry.
 mock: false
 
 # Which Modbus link to use:
