@@ -322,6 +322,66 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    # ─── derived stats (status panel surfaces these) ───────────────────
+    # These are cheap (events table is indexed on ts and pruned by
+    # retention) but we still cache them implicitly via the prime-poll
+    # cadence: status.py builds them once per /api/status call.
+
+    def count_engine_starts(self) -> int:
+        """Total times the engine entered 'cranking' from any prior state.
+
+        The H-100's Modbus map doesn't expose a start counter (see
+        registers/h100.yaml note), so we derive it from the TRANSITION
+        event stream. The state-machine writes a "→ cranking" event on
+        every transition into cranking, so this is the canonical count.
+        """
+        with self._writer() as c:
+            row = c.execute(
+                "SELECT COUNT(*) AS n FROM events "
+                "WHERE type = 'TRANSITION' AND message LIKE '%→ cranking%'"
+            ).fetchone()
+        return int(row["n"] if row else 0)
+
+    def last_transfer_to_gen(self) -> dict | None:
+        """Most recent transition into 'running' state (load on gen).
+
+        Returns {ts, message} or None. The H-100 doesn't expose an ATS
+        contact register on this map, so this is our best proxy for
+        when the load was last on the generator.
+        """
+        with self._writer() as c:
+            row = c.execute(
+                "SELECT ts, message FROM events "
+                "WHERE type = 'TRANSITION' AND message LIKE '%→ running%' "
+                "ORDER BY ts DESC LIMIT 1"
+            ).fetchone()
+        return dict(row) if row else None
+
+    def count_transfers_since(self, since_ts: float) -> int:
+        """Count transitions into 'running' since `since_ts` (unix seconds)."""
+        with self._writer() as c:
+            row = c.execute(
+                "SELECT COUNT(*) AS n FROM events "
+                "WHERE type = 'TRANSITION' AND message LIKE '%→ running%' "
+                "AND ts >= ?",
+                (since_ts,),
+            ).fetchone()
+        return int(row["n"] if row else 0)
+
+    def last_alarm_event(self) -> dict | None:
+        """Most recent type='ALARM' event of severity warn/alarm (raise or clear).
+
+        Used by the Live view's "Last alarm" line so it remains useful
+        when no alarms are currently active.
+        """
+        with self._writer() as c:
+            row = c.execute(
+                "SELECT ts, severity, message, meta FROM events "
+                "WHERE type = 'ALARM' AND severity IN ('warn', 'alarm') "
+                "ORDER BY ts DESC LIMIT 1"
+            ).fetchone()
+        return dict(row) if row else None
+
     # ─── audit ─────────────────────────────────────────────────────────
     def write_audit(self, operator: str, action: str, detail: str, token: str, result: str) -> int:
         with self._writer() as c:

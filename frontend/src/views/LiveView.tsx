@@ -293,11 +293,13 @@ function AtsCard({ status }: { status: StatusBody }) {
           </div>
           <div className="ats-stat">
             <div className="l">Last transfer</div>
-            <div className="v dim">—</div>
+            <div className="v dim">
+              {status.hts.lastTransferTs != null ? relTime(status.hts.lastTransferTs) : "—"}
+            </div>
           </div>
           <div className="ats-stat">
             <div className="l">Transfers (30d)</div>
-            <div className="v dim">—</div>
+            <div className="v">{status.hts.transfers30d}</div>
           </div>
         </div>
       </div>
@@ -535,8 +537,12 @@ function FuelMaintCard({ reading: r, status }: { reading: Reading; status: Statu
         <div className="kv-row"><span className="l">Next exercise</span>
           <span className="v">{capitalize(status.exercise.day)} · {status.exercise.time}</span></div>
         <div className="kv-row"><span className="l">Last alarm</span>
-          <span className="v">
-            {status.activeAlarms[0] ? status.activeAlarms[0].desc : "—"}
+          <span className="v" title={status.lastAlarm?.message}>
+            {status.activeAlarms[0]
+              ? status.activeAlarms[0].desc
+              : status.lastAlarm
+                ? `${relTime(status.lastAlarm.ts)} — ${status.lastAlarm.message.replace(/^(Alarm raised — |Alarm cleared — |Alarm acknowledged — )/, "")}`
+                : "—"}
           </span></div>
       </div>
     </Card>

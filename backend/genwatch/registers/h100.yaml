@@ -167,7 +167,7 @@ registers:
   - { name: oil_temp,          addr: 0x008A, fc: 3, type: u32, tier: base, group: "Engine", unit: F }
   - { name: coolant_temp,      addr: 0x008C, fc: 3, type: u32, tier: base, group: "Engine", unit: F,    warn_range: [170, 210], alarm_range: [120, 235] }
   - { name: oil_pressure,      addr: 0x008E, fc: 3, type: u32, tier: base, group: "Engine", unit: psi,  warn_range: [35, 80] }
-  - { name: coolant_level,     addr: 0x0090, fc: 3, type: u32, tier: base, group: "Engine", unit: pct }
+  - { name: coolant_level,     addr: 0x0090, fc: 3, type: u32, tier: base, group: "Engine", unit: pct, scale: 0.1 }
   - { name: fuel_level_pct,    addr: 0x0092, fc: 3, type: u32, tier: base, group: "Engine", unit: pct }
   - { name: throttle_position, addr: 0x0096, fc: 3, type: u32, tier: base, group: "Engine", unit: pct }
   - { name: o2_sensor,         addr: 0x0098, fc: 3, type: u32, tier: base, group: "Engine", unit: pct }

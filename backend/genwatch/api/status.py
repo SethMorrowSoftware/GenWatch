@@ -17,10 +17,27 @@ async def status(request: Request) -> dict:
     snap = sm.snap
     reading = snap.last_reading
     regmap = st.regmap
+    db = st.db
 
     # Build a flat reading suitable for the UI. We expose canonical
     # camelCase keys matching the prototype's design.
     r = reading.values
+
+    # Engine starts: prefer the H-100 register if the map ever exposes
+    # it; otherwise derive from the TRANSITION event stream so the UI
+    # still has a real number to show.
+    start_count = r.get("start_count")
+    if start_count is None:
+        start_count = db.count_engine_starts()
+
+    # ATS history (no contact register on H-100 map → derive from state
+    # transitions into 'running').
+    last_xfer = db.last_transfer_to_gen()
+    thirty_days_ago = time.time() - 30 * 86400
+    xfer_30d = db.count_transfers_since(thirty_days_ago)
+
+    last_alarm = db.last_alarm_event()
+
     out = {
         "state": snap.engine_state,
         "alarmRaw": snap.alarm_raw,
@@ -48,7 +65,7 @@ async def status(request: Request) -> dict:
             "iC": r.get("gen_current_c"),
             "fuelPct": r.get("fuel_level_pct"),
             "runHours": r.get("run_hours"),
-            "startCount": r.get("start_count"),
+            "startCount": start_count,
         },
         "site": {
             "id": regmap.site.id,
@@ -63,10 +80,19 @@ async def status(request: Request) -> dict:
             "time": regmap.site.exercise_time,
             "durationMin": regmap.site.exercise_duration_min,
         },
-        "activeAlarms": st.db.active_alarms(),
+        "activeAlarms": db.active_alarms(),
         "hts": {
             "transferredToGen": snap.engine_state in ("running", "exercising"),
+            "lastTransferTs": last_xfer["ts"] if last_xfer else None,
+            "transfers30d": xfer_30d,
         },
+        "lastAlarm": (
+            {
+                "ts": last_alarm["ts"],
+                "severity": last_alarm["severity"],
+                "message": last_alarm["message"],
+            } if last_alarm else None
+        ),
         "serverTs": time.time(),
     }
     return out

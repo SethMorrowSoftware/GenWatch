@@ -70,7 +70,16 @@ export interface StatusBody {
     durationMin: number;
   };
   activeAlarms: ActiveAlarm[];
-  hts: { transferredToGen: boolean };
+  hts: {
+    transferredToGen: boolean;
+    lastTransferTs: number | null;
+    transfers30d: number;
+  };
+  lastAlarm: {
+    ts: number;
+    severity: Severity;
+    message: string;
+  } | null;
   serverTs: number;
 }
 
