@@ -59,6 +59,7 @@ export function HistoryView() {
     <>
       <div className="page-head">
         <div>
+          <div className="page-eyebrow">Time-series · {range}</div>
           <h1 className="page-title">Telemetry History</h1>
           <div className="page-sub">SQLite time-series · raw 7 d, 1-min rollup 90 d · {Object.keys(METRICS).length} indexed metrics</div>
         </div>
