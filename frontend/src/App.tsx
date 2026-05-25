@@ -152,6 +152,25 @@ function Shell({ auth, view, setView, theme, onToggleTheme, onLogout }: {
   // Reference `clock` so the memoizer recomputes once per second.
   void clock;
 
+  const navTabs = (
+    <nav className="nav" role="tablist" aria-label="Primary">
+      {navItems.map((n) => (
+        <button key={n.id}
+                aria-current={view === n.id ? "page" : undefined}
+                onClick={() => setView(n.id)}
+                role="tab">
+          <Icon name={n.icon} size={13} stroke={1.8} />
+          <span className="lbl-text">{n.label}</span>
+          {n.id === "events" && activeAlarmCount > 0 && (
+            <span className="nav-badge" aria-label={`${activeAlarmCount} active alarms`}>
+              {activeAlarmCount}
+            </span>
+          )}
+        </button>
+      ))}
+    </nav>
+  );
+
   return (
     <div className="app">
       <header className="topbar" data-scrolled={scrolled ? "1" : "0"}>
@@ -162,22 +181,7 @@ function Shell({ auth, view, setView, theme, onToggleTheme, onLogout }: {
             <span className="brand-sub">Generator Monitor</span>
           </div>
         </div>
-        <nav className="nav" role="tablist" aria-label="Primary">
-          {navItems.map((n) => (
-            <button key={n.id}
-                    aria-current={view === n.id ? "page" : undefined}
-                    onClick={() => setView(n.id)}
-                    role="tab">
-              <Icon name={n.icon} size={13} stroke={1.8} />
-              <span className="lbl-text">{n.label}</span>
-              {n.id === "events" && activeAlarmCount > 0 && (
-                <span className="nav-badge" aria-label={`${activeAlarmCount} active alarms`}>
-                  {activeAlarmCount}
-                </span>
-              )}
-            </button>
-          ))}
-        </nav>
+        <div className="nav-desktop-slot">{navTabs}</div>
         <div className="topbar-right">
           {stale && (
             <div
@@ -215,6 +219,8 @@ function Shell({ auth, view, setView, theme, onToggleTheme, onLogout }: {
           </button>
         </div>
       </header>
+
+      <div className="nav-mobile-slot">{navTabs}</div>
 
       <main className="main">
         {live.loading && !tickedStatus && (
