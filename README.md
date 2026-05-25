@@ -2,11 +2,11 @@
 
 Professional monitoring and control software for the **Generac H-100** industrial generator, running on a **Raspberry Pi 5** and talking to the controller over a **Modbus-RTU-over-TCP** network bridge (Lantronix UDS / EDS / xDirect, Moxa NPort, Digi PortServer, ser2net, etc.).
 
-A single-pane operator console: live engine state, electrical output, two-step-confirm controls (start / stop / quiet-test / transfer), time-series history, alarms, and on-device configuration of the link, register map, and retention policy.
+A single-pane operator console: live engine state, electrical output, two-step-confirm controls (start / stop / quiet-test / transfer) gated on the H-100 front-panel key switch, time-series history, alarms, and on-device configuration of the link, register map, and retention policy.
 
 > **Note on naming.** The product was previously called *GenWatch*. The internal Python package, systemd unit, CLI, and on-disk paths (`/etc/genwatch/`, `genwatch.service`, the `genwatch` CLI) keep those identifiers so existing deployments don't break. Only the operator-facing copy was rebranded.
 
-> **Reliability summary.** Hardware watchdog on pid 1 (Pi reboots on kernel hang); software watchdog on the polling loop driven by a monotonic prime-poll heartbeat (service restarts on a deadlocked read); TCP keepalive on the Modbus socket (dead Lantronix detected in ~60 s); SQLite WAL with `synchronous=FULL` (audit/alarm rows survive a power cut); graceful degradation when the link is down (UI stays reachable, comms shown as LOST, reconnect in the background); login rate-limited; audit log on every control command. Test coverage under `backend/tests/`.
+> **Reliability summary.** Hardware watchdog on pid 1 (Pi reboots on kernel hang); software watchdog on the polling loop driven by a monotonic prime-poll heartbeat (service restarts on a deadlocked read); TCP keepalive on the Modbus socket (dead Lantronix detected in ~60 s); SQLite WAL with `synchronous=FULL` (audit/alarm rows survive a power cut); graceful degradation when the link is down (UI stays reachable, comms shown as LOST, reconnect in the background); panel-mode gate on every remote command (server rejects with 409 unless the H-100 key switch is in AUTO); batch-read fan-out preserves last-good values when a single register fails (no sentinel zeros that could trip an alarm comparator); register-map hot-reload propagates to the live poller without a service restart; login rate-limited; audit log on every control command. Test coverage under `backend/tests/` (71 tests).
 
 ---
 
@@ -229,7 +229,7 @@ Two things in the editor:
      connect_timeout_s: 3.0
    ```
 
-   Defaults already match `192.168.1.249:10001`; only edit if yours differs. The Settings page in the UI can also edit this; a service restart is still required.
+   Defaults already match `192.168.1.249:10001`; only edit if yours differs. The Settings page in the UI can also edit this; transport / endpoint / retention / Slack changes write straight to `config.yaml` and require a service restart. Register-map edits hot-reload — see [§12](#12-adapting-the-register-map).
 
 ### 5.2 Start the service
 
@@ -298,18 +298,32 @@ If `modbusdump` returns values but they don't match what you see on the H-100 pa
 
 The Live view is the operator console: engine state, electrical output, control buttons, recent events.
 
-- **Remote Start** — only enabled when state is `stopped`. Two-step confirm with an 8-char hex token that expires in 30 s.
-- **Remote Stop** — enabled while running/exercising. Initiates the controller's normal cool-down cycle.
+- **Remote Start** — only enabled when state is `stopped` *and* the H-100 front-panel key switch is in AUTO. Two-step confirm with an 8-char hex token that expires in 30 s.
+- **Remote Stop** — enabled while running / exercising / cranking. Initiates the controller's normal cool-down cycle.
 - **Quiet-Test** — 30-minute unloaded exercise. Idle exercise schedule shown at the top right.
 - **Transfer back** — while running, hand the load back to utility and cool down.
 
-All commands are Modbus writes:
+### Panel key-switch gating
+
+The H-100 has a physical key switch on the front panel with three positions: **AUTO / MANUAL / OFF**. The controller only honors remote start/stop/exercise/transfer writes when the switch is in **AUTO**. MANUAL means a local operator at the unit has taken control; OFF means the engine is locked out. Sending a remote command on a panel that isn't in AUTO would succeed at the Modbus wire layer but be silently dropped by the controller — leaving the UI claiming success while nothing happens at the generator.
+
+The monitor handles this on both ends:
+
+- **Topbar chip** (`PANEL · AUTO / MANUAL / OFF / ?`) shows the live key-switch position, decoded from `input_status_1` bits per `panel_mode_bits` in `registers/h100.yaml`. Updates live over the WebSocket, so toggling the switch at the unit refreshes the chip without a page reload.
+- **Control buttons** are disabled (with a tooltip hint) whenever the chip is not AUTO.
+- **Server-side gate** rejects with `HTTP 409 panel_mode_locked` even if a buggy client bypasses the UI disabled state. Every attempt is audit-logged.
+
+If the chip stays on `?` (unknown) even when the panel is in AUTO, your firmware's bit assignment for the key switch differs from genmon's defaults — see [§12 Adapting the register map](#12-adapting-the-register-map).
+
+### Modbus writes
+
+All commands are Modbus writes against the H-100:
 
 - **Start / Stop / Transfer** — FC16 multi-register write to `0x019C` (`START_BITS`). Start = `[0x0080, 0x0000, 0x0000]`, stop = `[0x0000, 0x0000, 0x0000]`, transfer = `[0x0080, 0x0000, 0x0080]`.
 - **Quiet-Test** — writes `0x0001` to `0x022B` (`QUIETTEST_STATUS`); the same register reads back the test's running status.
 - **Acknowledge Alarm** — writes `0x0001` to `0x012E` (`ALARM_ACK`).
 
-Every command is audit-logged with the operator, timestamp, register, the actual word values written, and the result.
+Every command is audit-logged with the operator, timestamp, action, the actual register + word values written, and the result (`ok` / `denied` / `failed`). Login attempts additionally record the source IP. See [§8.4](#84-built-in-defenses).
 
 ### Views
 
@@ -320,19 +334,27 @@ Every command is audit-logged with the operator, timestamp, register, the actual
 
 ### CLI commands
 
-All exposed via the `genwatch` wrapper installed by the installer:
+All exposed via the `genwatch` wrapper installed by the installer. Run any with no args to see the per-command flags.
 
 ```bash
-genwatch serve                  # run the service (used by systemd)
-genwatch hash <password>        # bcrypt-hash a password for config
-genwatch gensecret              # generate a JWT signing secret
-genwatch doctor                 # pre-flight diagnostics
-genwatch modbusdump [--addr]    # read raw registers from the controller
-genwatch scan [--start --end]   # walk a range and classify each register
-genwatch panel [--json|--html]  # decoded snapshot of every named register —
-                                #   --html emits a printable cross-check sheet
-genwatch version                # print version
+genwatch serve                       # run the service (used by systemd)
+genwatch hash <password>             # bcrypt-hash a password for config
+genwatch gensecret                   # generate a JWT signing secret (hex)
+genwatch doctor [--config PATH]      # pre-flight diagnostics: config, DB, register map,
+                                     #   bridge reachability, live Modbus probe
+genwatch modbusdump [--addr 0xNN]    # read raw registers from the controller.
+        [--count N] [--fc 3|4]       #   --host/--port override config for ad-hoc probes
+        [--host IP] [--port N]
+genwatch scan [--start 0xNN]         # walk a range and classify each register
+        [--end 0xNN] [--fc 3,4]      #   (printable ASCII / integer / bitfield / counter)
+        [--batch N] [--out FILE]
+genwatch panel [--json] [--html]     # decoded snapshot of every named register vs
+                                     #   the H-100 LCD. --html emits a printable
+                                     #   cross-check sheet with write-in space.
+genwatch version                     # print version
 ```
+
+All commands except `serve`, `hash`, `gensecret`, and `version` read `/etc/genwatch/config.yaml`. When running by hand, use `sudo -u genwatch …` so the service's config is found and the SQLite path is writable.
 
 ### Cross-checking against the H-100 LCD
 
@@ -357,7 +379,9 @@ redline, etc. — and worth confirming on the panel.
 If the panel disagrees with the report on any bit, edit
 `/opt/genwatch/genwatch/registers/h100.yaml` to match your panel's
 actual bit-to-meaning mapping, then `curl -X POST .../api/registers/reload`
-or `sudo systemctl restart genwatch`.
+(see [§12](#12-adapting-the-register-map) for the full hot-reload flow).
+The reload propagates to the live poller, state machine, and control
+service — no service restart needed for register-map edits.
 
 For a paper-friendly version you can take to the panel, add `--html`:
 
@@ -428,11 +452,13 @@ Restricts the monitor's port to your LAN ranges.
 
 ### 8.4 Built-in defenses
 
-- **Login rate-limiter** — 5 attempts then 1 attempt per 3 minutes per source IP. State resets on service restart.
-- **JWT secret rotation** — invalidate all sessions by regenerating: `sudo genwatch gensecret` → paste into `config.yaml` `jwt_secret:` → `sudo systemctl restart genwatch`.
-- **Audit log** — `/var/lib/genwatch/db.sqlite` table `audit` records every login attempt, confirm-token issue/use, and control command with source IP, operator, and result. SQLite `synchronous=FULL` means a power cut after a command can't lose the audit row.
-- **Server-side state validity** — even if the UI bug-allows clicking "Start" while the engine is running, the server rejects with HTTP 409 and audit-logs the denial.
-- **Hardened systemd unit** — `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectKernelTunables`, narrow `DeviceAllow` list, `MemoryMax=512M`, `TasksMax=128`.
+- **Login rate-limiter** — 5 attempts then 1 attempt per 3 minutes per source IP. State resets on service restart. *(Note: behind a reverse proxy the limiter sees the proxy's IP — restricts the limiter to a single global bucket. Use Tailscale or `ufw` for proxied deploys.)*
+- **JWT secret rotation** — invalidate all sessions by regenerating: `sudo genwatch gensecret` → paste into `config.yaml` `jwt_secret:` → `sudo systemctl restart genwatch`. An empty `jwt_secret` makes the service generate an ephemeral one at startup (warning logged); set it explicitly so sessions survive restarts.
+- **Audit log** — `/var/lib/genwatch/db.sqlite` table `audit` records every login attempt (with source IP), every confirm-token issue/consume/evict, and every control command (with operator, action, register, word values, and result `ok`/`denied`/`failed`). SQLite `synchronous=FULL` means a power cut after a command can't lose the audit row.
+- **Server-side state validity** — every control command re-checks `engine_state` server-side; clicking "Start" while running returns HTTP 409 `invalid_state` and audit-logs the denial.
+- **Panel-mode gate** — every remote command re-checks the H-100 front-panel key-switch position; rejects with HTTP 409 `panel_mode_locked` unless the panel is in AUTO. Stops a stolen session (or a misclicked button) from quietly no-op'ing at the unit. See [§7 Panel key-switch gating](#panel-key-switch-gating).
+- **Confirm-token discipline** — 8-char hex tokens (`secrets.token_hex(4)`), 30 s TTL, single-use (`pop`-on-consume), operator-bound (issuer must match consumer). Replay returns 400 `token_invalid`.
+- **Hardened systemd unit** — `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectKernelTunables`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, narrow `DeviceAllow` list (covers FTDI/CH340/CP210x USB-serial chips + the Pi 5 on-board UART for the legacy serial fallback), `MemoryMax=512M`, `TasksMax=128`.
 
 ---
 
@@ -454,15 +480,30 @@ It will:
 - Reinstall apt deps (no-op if current).
 - Reinstall the venv deps (only changes if `requirements.txt` moved).
 - Rebuild the frontend (only if sources are newer than the dist).
-- Sync the backend package.
+- Sync the backend package to `/opt/genwatch/genwatch/`.
 - Keep your `/etc/genwatch/config.yaml` and `/var/lib/genwatch/db.sqlite` untouched.
 
-If you changed the register map (locally edited `registers/h100.yaml`), hot-reload after login:
+The journal will show `Poller register-map reloaded: prime N→N batches, base N→N batches` if the upgrade includes a YAML edit — the first restart picks it up at boot.
+
+### Register-map edits without a restart
+
+If you've locally edited `registers/h100.yaml` (e.g. fixed a bit position for your firmware revision after running `genwatch panel`), hot-reload while the service keeps running. The reload propagates to the live poller, state machine, and control service:
 
 ```bash
-curl -b cookies.txt -X POST http://localhost:8000/api/registers/reload
+# Log in once to get a session cookie
+curl -c cookies.txt -X POST http://localhost:8000/api/auth/login \
+     -H 'Content-Type: application/json' -d '{"password":"<your-admin-pw>"}'
+
+# Validate the new map (static rule check + per-register live read probe)
 curl -b cookies.txt http://localhost:8000/api/registers/verify
+
+# Apply the new map to the running poller — no restart needed
+curl -b cookies.txt -X POST http://localhost:8000/api/registers/reload
 ```
+
+`/api/registers/verify` is read-only and reports both **static** issues (overlaps, invalid FC, missing tier) and **live** failures (per-register Modbus reads against the configured H-100). Use it to commission a YAML edit before flipping the live poller over to it.
+
+### Backups + schema
 
 Keep a dated backup of `/etc/genwatch/config.yaml` before major upgrades. The SQLite schema is forward-compatible (`CREATE TABLE IF NOT EXISTS` everywhere) — an upgrade never destroys data.
 
@@ -504,6 +545,14 @@ The browser is connected but no live update has arrived recently (WebSocket drop
 ### Symptom: Comms badge is "LOST" but the service is running
 
 The poller can't get a response from the H-100. Run `sudo genwatch doctor` to isolate whether the bridge is reachable (TCP layer) and whether the H-100 is replying (Modbus layer). The service stays up so you can investigate from the UI — it no longer crashes on a missing link.
+
+### Symptom: Control buttons greyed out · "Panel key switch is MANUAL"
+
+The H-100 front-panel key switch is not in AUTO. Set the panel to AUTO at the unit; the UI chip refreshes within ~1.5 s over the WebSocket and the buttons re-enable. If the chip stays on `?` (unknown) while the panel is in AUTO, the bit positions in your YAML don't match your firmware — run `sudo -u genwatch genwatch panel` to see the raw `input_status_1` value and edit `panel_mode_bits` in `/opt/genwatch/genwatch/registers/h100.yaml` to match (see [§12](#12-adapting-the-register-map)). The AUTO bit (`0x8000`) is firmly known; MANUAL (`0x4000`) and OFF (`0x2000`) ship as best-guess defaults and may need adjustment.
+
+### Symptom: A telemetry value freezes briefly on a flaky link
+
+If a single Modbus read fails inside a coalesced batch, the poller falls back to single-register reads. Registers whose single-read fallback ALSO fails are *skipped* — the previous value is kept rather than overwritten with `0`. So a coolant temp displayed as 188 °F will simply stay at 188 °F until the next successful read, rather than briefly flicker to 0 °F and trip an alarm comparator. The journal shows `skipping decode of <name> @0x<addr> — fan-out read failed` at debug level. If the freeze persists, run `sudo genwatch doctor` and look at the bridge.
 
 ### Symptom: Service restart-looping
 
@@ -569,8 +618,10 @@ Pi 5 needs a true 5 V / 5 A supply. Cheap USB-C chargers brown out under USB per
 │                                                                  │
 │  State machine + control service:                                │
 │   • semantic engine state (stopped/cranking/running/…)           │
+│   • panel-mode tracking (AUTO/MANUAL/OFF) — gates remote writes  │
 │   • two-step confirm tokens (8-char hex, 30 s TTL, single-use)   │
-│   • server-side state-validity guards                            │
+│   • server-side state-validity guards (409 invalid_state)        │
+│   • server-side panel-mode guard      (409 panel_mode_locked)    │
 │   • audit log on every command                                   │
 │                                                                  │
 │  Storage (SQLite WAL, synchronous=FULL):                         │
@@ -599,15 +650,16 @@ Pi 5 needs a true 5 V / 5 A supply. Cheap USB-C chargers brown out under USB per
 - **Software watchdog driven by a poll heartbeat** — `Type=notify` unit with `WatchdogSec=60s`. The app only pings `sd_notify(WATCHDOG=1)` while a *prime* Modbus poll has completed within the last ~6 × prime cadence. A deadlocked poll task (pymodbus stuck on a bad socket) lets systemd SIGKILL and restart. Uses a monotonic clock so NTP/DST jumps can't fool the timing.
 - **TCP keepalive on the Modbus socket** — `SO_KEEPALIVE` + Linux `TCP_KEEPIDLE=30` / `KEEPINTVL=10` / `KEEPCNT=3`. The kernel drops a wedged socket (Lantronix reboot, NAT idle timeout, switch flap with no FIN/RST) within ~60 s instead of waiting for application read timeouts to exhaust.
 - **Graceful degradation when the link is down** — a Modbus connect failure at startup no longer hard-exits. The service stays up with comms shown as `LOST` in the UI; the poller reconnects in the background. Stops systemd restart-thrash from burning the SD card during outages.
-- **Batch-read fan-out** — a failing Modbus block read falls back to single-register reads so one bad address can't blank out an entire telemetry tier.
+- **Batch-read fan-out, no sentinel zeros** — a failing block read falls back to single-register reads so one bad address can't blank out an entire telemetry tier. Registers whose fan-out *also* fails are skipped (the previous value is kept) rather than overwritten with `0` — a 0 °F on a coolant-temp register could otherwise trip an out-of-range alarm comparator on a transient bus error.
+- **Register-map hot-reload** — `POST /api/registers/reload` re-derives the prime/base batch tables under a lock and swaps them into the live poller, state machine, and control service. Operators can fix a bit position or scale and apply it without dropping a poll. Verified by `POST /api/registers/verify` (static + live read probe).
 - **SQLite WAL with `synchronous=FULL`** — fsyncs the WAL on every commit, so a power cut on the Pi can't lose freshly committed alarm / audit / event rows.
-- **Frontend stale-data indicator** — a red **STALE DATA** badge appears when the WebSocket is down or no live push has arrived in ~3 poll intervals, so operators don't act on frozen numbers.
-- **Per-poll timeouts and retries** on every Modbus read; configurable in `config.yaml`.
-- **Comms watchdog** — declares LOST after no successful prime poll for 3× the prime cadence.
-- **Token replay protection** — confirm tokens are single-use, 30 s TTL, operator-bound, audit-logged on every state transition.
-- **Server-side state validity** — every control command re-checks the engine state and rejects with 409 Conflict if invalid (e.g. Start while running).
-- **Login rate-limiter** — token-bucket per source IP, 5 burst then 1 per 3 min.
-- **Retention** — raw telemetry pruned at 7 d, 1-min rollup at 90 d, info events at 30 d. Alarms / warns and the audit log are never auto-pruned.
+- **Frontend stale-data indicator** — a red **STALE DATA** badge appears when the WebSocket is down or no live push has arrived in ~3 poll intervals, so operators don't act on frozen numbers. WebSocket reconnects with exponential backoff (cap 30 s).
+- **Per-poll timeouts and retries** on every Modbus read; configurable in `config.yaml` (`modbus_tcp.timeout_s`, `modbus.retries`, `modbus.backoff_s`).
+- **Comms watchdog** — declares LOST after no successful prime poll for 3× the prime cadence; emits a `comms` event over the WebSocket so the badge transitions live.
+- **Two-step confirm tokens** — 8-char hex, 30 s TTL, single-use (`pop`-on-consume), operator-bound. Every issue / consume / expiry / mismatch is audit-logged.
+- **Server-side state validity + panel-mode gate** — every remote command re-checks `engine_state` (rejects 409 `invalid_state` for impossible transitions) and the H-100 panel key-switch position (rejects 409 `panel_mode_locked` unless AUTO).
+- **Login rate-limiter** — token-bucket per source IP, 5 burst then 1 per 3 min. Returns `429` with `Retry-After`.
+- **Retention** — raw telemetry pruned at 7 d, 1-min rollup at 90 d, info / ok events at 30 d. Alarms, warns, and the audit log are never auto-pruned.
 
 ---
 
@@ -644,34 +696,35 @@ Cross-reference the values you see with what the H-100 panel shows on its own sc
 sudo nano /opt/genwatch/genwatch/registers/h100.yaml
 ```
 
-Then hot-reload (admin auth required):
+Then verify the new map, then hot-reload (admin auth required):
 
 ```bash
-curl -b cookies.txt -X POST http://localhost:8000/api/registers/reload
+# Log in once to get a session cookie
+curl -c cookies.txt -X POST http://localhost:8000/api/auth/login \
+     -H 'Content-Type: application/json' -d '{"password":"<admin-pw>"}'
 
-# Run automated verification (static safety + live read probe)
+# Static + live verification — read-only, doesn't affect the poller
 curl -b cookies.txt http://localhost:8000/api/registers/verify
+
+# Apply to the running poller (re-derives batch tables under a lock,
+# swaps into state machine + control service atomically)
+curl -b cookies.txt -X POST http://localhost:8000/api/registers/reload
 ```
 
-`/api/registers/verify` is read-only. It reports:
+`/api/registers/verify` reports:
 
-- **static** — map structure / safety issues (overlaps, invalid FC, invalid tier, etc.)
-- **live** — per-register Modbus read failures against the currently configured H-100 link
+- **static** — map structure / safety issues (overlaps, invalid FC, invalid tier, control-on-read-address warnings, etc.)
+- **live** — per-register Modbus read failures against the currently configured H-100 link (skipped in mock mode)
 
-This makes commissioning easier: edit YAML → reload → verify → only then enable operator controls.
-
-Or restart the service to fully rebind the poller batching:
-
-```bash
-sudo systemctl restart genwatch
-```
+This makes commissioning safer: edit YAML → verify → reload. The reload propagates to the live poller's prime/base batch tables, the state machine's rule references, and the control service's address resolution — no service restart needed.
 
 The YAML schema is documented in comments at the top of `h100.yaml`. Key sections:
 
 - **`registers`** — per register: `addr`, `fc` (3/4), `type` (`u16`/`s16`/`u32`/`s32`/`bitfld`/`enum`), `scale`, `tier` (`prime`/`base`), `group`, `unit`, `warn_range`, `alarm_range`. Most H-100 telemetry slots are 2-register `u32` blocks; the meaningful value lives in the low word and the decoder reads them as big-endian.
-- **`engine_state_bits`** — priority-ordered rules mapping bitfield bits to engine states (`stopped` / `cranking` / `running` / `cooling` / `exercising` / `alarm`). First matching rule wins.
-- **`alarm_bits`** — flat table of alarm bits across `output_status_2..8`. Each entry has `register`, `mask`, `code`, `desc`, `severity` (`alarm`/`warn`). Multiple alarms can be active simultaneously.
-- **`controls`** — write-gated commands. Single-register writes use `value: N` with `fc: 6`; multi-register writes (H-100 start/stop/transfer at `0x019C`) use `values: [w1, w2, w3]` with `fc: 16`.
+- **`engine_state_bits`** — priority-ordered rules mapping bitfield bits to engine states (`stopped` / `cranking` / `running` / `cooling` / `exercising` / `alarm`). First matching rule wins. List `alarm` rules ahead of `running` so a faulted-while-running engine reports `alarm`, not `running`.
+- **`alarm_bits`** — flat table of alarm bits across `output_status_1..8`. Each entry has `register`, `mask`, `code`, `desc`, `severity` (`alarm`/`warn`). Multiple alarms can be active simultaneously; the state machine tracks them as a set and emits `alarm` / `alarm-cleared` events.
+- **`panel_mode_bits`** — rules mapping `input_status_1` bits to the H-100 front-panel key-switch position (`auto` / `manual` / `off`). First match wins; non-match → `unknown`. **AUTO (`0x8000`) is firmly known. MANUAL (`0x4000`) and OFF (`0x2000`) ship as best-guess defaults — verify on your unit during commissioning** by toggling the physical switch while watching `genwatch panel` or the topbar chip. The control service rejects every remote write unless this resolves to `auto`, so getting these bits right is required before remote control is usable.
+- **`controls`** — write-gated commands. Single-register writes use `value: N` with `fc: 6`; multi-register writes (H-100 start/stop/transfer at `0x019C`) use `values: [w1, w2, w3]` with `fc: 16`. The validator emits a warning when a control's address overlaps a read register (H-100's `0x022B` quiet-test status / control and `0x012E` alarm-ack are intentional duals).
 
 ---
 
@@ -711,10 +764,14 @@ The mock client simulates a plausible H-100 — engine state machine, electrical
 cd backend
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/python -m pytest tests/ -v
-# Test categories: register decode + batching, e2e mock control flow,
-# rate-limit, events retention, sd_notify, poll heartbeat + batch fallback,
-# TCP keepalive, refuse-silent-mock safety, Slack notifier
 ```
+
+71 tests across four files:
+
+- `test_registers.py` — YAML loader, decoder for every `RegType`, batch coalescing, address-overlap + bad-FC validation.
+- `test_endtoend.py` — boots the app with the mock client, drives the full operator flow (login → confirm → start → state-validity rejection → panel-mode-locked rejection), and verifies `/api/registers/reload` propagates to the live poller / state machine / control service.
+- `test_hardening.py` — rate-limiter math, events retention, `sd_notify` parsing, transport selection, TCP keepalive socket options, poller heartbeat stamping, batch-fallback behavior, fan-out-failure preserves last-good value, `panel` CLI command output (text + JSON).
+- `test_slack.py` — block builder, gating flags, dispatch worker, retry-on-transport-error vs no-retry-on-Slack-error, token sanitization (never echoed to audit), hot-reload from `PUT /api/config`.
 
 ### Layout
 
@@ -747,28 +804,47 @@ design_handoff_genwatch/                  Original design spec (reference)
 
 ### API contract
 
-| Method | Path                                          | Notes                                       |
-|--------|-----------------------------------------------|---------------------------------------------|
-| GET    | `/api/health`                                 | Liveness; no auth                           |
-| POST   | `/api/auth/login`                             | `{ password }` → session cookie             |
-| POST   | `/api/auth/logout`                            | Clear cookie                                |
-| GET    | `/api/auth/me`                                | Identity (200 even when anonymous)          |
-| GET    | `/api/status`                                 | Full live snapshot                          |
-| GET    | `/api/telemetry`                              | `?metric=kw&from=&to=&max_points=`          |
-| GET    | `/api/events`                                 | `?limit=&severity=alarm,warn`               |
-| GET    | `/api/alarms?active=true`                     | Active alarms                               |
-| POST   | `/api/alarms/{code}/ack`                      | Operator clears an alarm                    |
-| GET    | `/api/alarm-codes`                            | Static reference table                      |
-| GET    | `/api/control/confirm`                        | Issue confirm token (op+)                   |
-| POST   | `/api/control/{start,stop,exercise,transfer}` | Body `{ confirm_token }`                    |
-| GET    | `/api/config`                                 | Effective config (sanitized)                |
-| PUT    | `/api/config`                                 | Update on-disk config (admin)               |
-| GET    | `/api/registers`                              | Current register map + last read            |
-| POST   | `/api/registers/reload`                       | Re-read YAML from disk (admin)              |
-| GET    | `/api/registers/verify`                       | Static + live register verification (admin) |
-| WS     | `/ws/live`                                    | `snapshot` / `transition` / `alarm`         |
+The auth column reflects the *current* implementation. Read endpoints are **public** under the trusted-LAN deployment model — anyone with network access to port 8000 can read telemetry, events, and the sanitized config without logging in. Write endpoints (control, config edits, alarm-ack, register reload) require a session cookie. Deploying outside a trusted LAN means putting the monitor behind Tailscale, Caddy, or a firewall ACL per [§8](#8-security-recommendations).
 
-All errors return JSON `{ detail: { code, message } }` with appropriate HTTP status.
+| Method | Path                                          | Auth   | Notes                                                       |
+|--------|-----------------------------------------------|--------|-------------------------------------------------------------|
+| GET    | `/api/health`                                 | public | Liveness; returns comms state, uptime, mock flag, version   |
+| POST   | `/api/auth/login`                             | public | `{ password }` → session cookie (rate-limited per IP)       |
+| POST   | `/api/auth/logout`                            | public | Clear cookie                                                |
+| GET    | `/api/auth/me`                                | public | Identity (200 with `{authenticated: false}` when anonymous) |
+| GET    | `/api/status`                                 | public | Full live snapshot (engine, comms, reading, panel, alarms)  |
+| GET    | `/api/telemetry`                              | public | `?metric=&from=&to=&max_points=` (server-side decimation)   |
+| GET    | `/api/telemetry/columns`                      | public | Available telemetry metric names                            |
+| GET    | `/api/columns`                                | public | Register-name → DB column mapping                           |
+| GET    | `/api/events`                                 | public | `?limit=&severity=alarm,warn&type=&from=&to=`               |
+| GET    | `/api/alarms?active=true`                     | public | Currently-active alarms                                     |
+| POST   | `/api/alarms/{code}/ack`                      | op+    | Operator clears an alarm (writes `0x0001` → `0x012E`)       |
+| GET    | `/api/alarm-codes`                            | public | Static alarm-code reference table from the YAML             |
+| GET    | `/api/control/confirm`                        | op+    | Issue 8-char hex confirm token (30 s TTL, single-use)       |
+| POST   | `/api/control/{start,stop,exercise,transfer}` | op+    | Body `{ confirm_token }`; 409 on invalid state or panel ≠ AUTO |
+| GET    | `/api/config`                                 | public | Effective config (bot_token + jwt_secret never returned)    |
+| PUT    | `/api/config`                                 | admin  | Update on-disk config; Slack hot-reloads, others need restart |
+| POST   | `/api/slack/test`                             | admin  | Send a synchronous test message; returns `{ok, detail}`     |
+| GET    | `/api/registers`                              | public | Current register map + last-read values for each            |
+| POST   | `/api/registers/reload`                       | admin  | Re-parse YAML, propagate to live poller + state + control   |
+| GET    | `/api/registers/verify`                       | admin  | Static + live read verification (skipped in mock mode)      |
+| WS     | `/ws/live`                                    | cookie | Pushes `hello` / `snapshot` / `transition` / `alarm` / `alarm-cleared` / `comms` / `ping` |
+
+Roles: **viewer** (read), **operator** (read + control), **admin** (everything including config edits). The default `operator_name` (`auth.operator_name` in config) is the only configured account; the role attached at login is `admin` for the operator account by default — viewer/operator are reserved for future multi-user expansion.
+
+All errors return JSON `{ detail: { code, message } }` with appropriate HTTP status. Common error codes:
+
+| Status | Code                  | Cause                                                            |
+|--------|-----------------------|------------------------------------------------------------------|
+| 400    | `token_invalid`       | Confirm token missing, expired, or already consumed              |
+| 400    | `token_expired`       | Confirm token's 30 s TTL elapsed                                 |
+| 401    | `unauthorized`        | No / invalid session cookie                                      |
+| 403    | `forbidden`           | Role insufficient for the action                                 |
+| 403    | `token_mismatch`      | Confirm token was issued to a different operator                 |
+| 409    | `invalid_state`       | Control verb not valid for current engine state (e.g. start while running) |
+| 409    | `panel_mode_locked`   | Panel key switch is MANUAL / OFF / unknown — remote writes blocked |
+| 429    | `rate_limited`        | Too many login attempts; `Retry-After` header gives the wait    |
+| 502    | `modbus_failed`       | Underlying Modbus write returned an error                        |
 
 ---
 
