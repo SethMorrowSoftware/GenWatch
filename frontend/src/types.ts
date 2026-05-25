@@ -55,6 +55,14 @@ export interface ActiveAlarm {
   raw: number;
 }
 
+export interface PanelBlock {
+  mode: "auto" | "manual" | "off" | "unknown";
+  keySwitchRaw: number | null;
+  engineStatusCode: number | null;
+  activeAlarmCountHw: number | null;
+  quietTestStatusRaw: number | null;
+}
+
 export interface StatusBody {
   state: EngineState;
   alarmRaw: number;
@@ -86,13 +94,7 @@ export interface StatusBody {
     severity: Severity;
     message: string;
   } | null;
-  panel: {
-    mode: "auto" | "manual" | "off" | "unknown";
-    keySwitchRaw: number | null;
-    engineStatusCode: number | null;
-    activeAlarmCountHw: number | null;
-    quietTestStatusRaw: number | null;
-  };
+  panel: PanelBlock;
   serverTs: number;
 }
 
@@ -122,6 +124,10 @@ export type LiveMessage =
       alarmRaw: number;
       comms: CommsHealth;
       reading: Reading;
+      // Optional for forward-compat with older backends — present from
+      // v0.1.1 onwards. Used to gate the control buttons on the
+      // H-100 front-panel key switch being in AUTO.
+      panel?: PanelBlock;
     }
   | { type: "transition"; from: EngineState; to: EngineState; ts: number }
   | { type: "alarm"; code: string; desc: string; severity: Severity; ts: number }

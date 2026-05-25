@@ -129,6 +129,14 @@ export function useLiveData(): LiveState {
               timeInState: msg.timeInState,
               comms: msg.comms,
               reading: mergeReading(s.reading, msg.reading),
+              // Carry the panel block forward when the backend sends it
+              // (v0.1.1+). Without this, an on-site operator toggling
+              // AUTO ↔ MANUAL would leave the remote UI's panel chip
+              // and control-button enable state stuck on the seed value
+              // from /api/status. Fall back to the previous block if
+              // the message predates the field so older backends still
+              // work.
+              panel: msg.panel ?? s.panel,
               serverTs: msg.ts,
             };
             history = [s.reading, ...history].slice(0, HISTORY_SIZE);

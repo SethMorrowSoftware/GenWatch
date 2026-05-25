@@ -264,10 +264,22 @@ async def reload_registers(
         request.app.state.db.write_audit(p.operator, "registers.reload", str(e), "", "failed")
         raise HTTPException(400, f"register map invalid: {e}")
 
-    # Hot-swap into app state and notify dependents that point at the same
-    # object. Poller doesn't hot-swap mid-run — it captures the reference
-    # at start. For a clean rebind, the caller should also POST /api/restart.
+    # Hot-swap into every live consumer so the next poll, the next state
+    # derivation, and the next control write all see the new map. Order
+    # is deliberate: poller first (it's what's actually reading the bus
+    # — start there to bound the inconsistency window), then state +
+    # control (which only read derived values keyed by name).
+    poller = getattr(request.app.state, "poller", None)
+    state_machine = getattr(request.app.state, "state_machine", None)
+    control = getattr(request.app.state, "control", None)
+    if poller is not None:
+        await poller.apply_regmap(rm_new)
+    if state_machine is not None:
+        state_machine.apply_regmap(rm_new)
+    if control is not None:
+        await control.apply_regmap(rm_new)
     request.app.state.regmap = rm_new
+
     request.app.state.db.write_audit(p.operator, "registers.reload", str(rm_new.path), "", "ok")
     request.app.state.db.write_event(
         severity="info",

@@ -172,6 +172,18 @@ async def lifespan(app: FastAPI):
         # a ws_push_ms floor). Events below still push immediately.
         if tier == "prime" and (reading.ts - last_push_ts[0]) >= push_throttle_s:
             last_push_ts[0] = reading.ts
+            # Panel block mirrors GET /api/status — the UI gates the
+            # control buttons on panel.mode == 'auto' and shows a chip
+            # for MANUAL/OFF. Without this in the push, a key-switch
+            # toggle at the unit would not refresh until a manual
+            # page reload.
+            panel = {
+                "mode": state_machine.snap.panel_mode,
+                "keySwitchRaw": reading.values.get("key_switch_state"),
+                "engineStatusCode": reading.values.get("engine_status_code"),
+                "activeAlarmCountHw": reading.values.get("active_alarm_count"),
+                "quietTestStatusRaw": reading.values.get("quiettest_status"),
+            }
             payload = {
                 "type": "snapshot",
                 "ts": reading.ts,
@@ -185,6 +197,7 @@ async def lifespan(app: FastAPI):
                     "p95LatencyMs": comms.p95_latency_ms,
                 },
                 "reading": status_routes.reading_to_ui(reading.values),
+                "panel": panel,
             }
             await bus.publish(payload)
 

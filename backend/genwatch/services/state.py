@@ -32,6 +32,12 @@ class StateSnapshot:
     active_alarms: set[str] = field(default_factory=set)  # alarm codes
     last_reading: Reading = field(default_factory=Reading)
     comms: CommsHealth = field(default_factory=CommsHealth)
+    # H-100 front-panel key-switch position: 'auto' | 'manual' | 'off' |
+    # 'unknown'. The controller only honors remote start/stop/transfer
+    # writes when this is 'auto'; the control service rejects with 409
+    # otherwise so an operator clicking the UI button on a panel that's
+    # been locally locked out doesn't get a silent no-op at the unit.
+    panel_mode: str = "unknown"
 
     @property
     def time_in_state_s(self) -> int:
@@ -51,6 +57,18 @@ class StateMachine:
         self.db = db
         self.bus = bus
         self.snap = StateSnapshot()
+
+    def apply_regmap(self, new_regmap: RegisterMap) -> None:
+        """Swap in a freshly-loaded register map (POST /api/registers/reload).
+
+        The state machine just looks up register values by name and reads
+        the YAML's engine_state_bits / alarm_bits / panel_mode_bits rules.
+        Swapping the reference is enough — Python attribute assignment is
+        atomic under the GIL, and the next update() call will use the
+        new rules. Cleared alarms whose codes no longer exist in the new
+        map will be reaped naturally on the next diff.
+        """
+        self.regmap = new_regmap
 
     def update(self, reading: Reading, comms: CommsHealth) -> list[dict[str, Any]]:
         """Apply a new poll result. Returns the list of events emitted."""
@@ -145,6 +163,10 @@ class StateMachine:
                 "successPct": comms.success_pct,
                 "ts": time.time(),
             })
+        # Panel key-switch — derive from the YAML's panel_mode_bits rules.
+        # Falls back to 'unknown' until the prime tier polls input_status_1.
+        self.snap.panel_mode = self.regmap.derive_panel_mode(reading.values)
+
         self.snap.comms = comms
         self.snap.last_reading = reading
         return emitted

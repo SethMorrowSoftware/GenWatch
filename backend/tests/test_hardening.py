@@ -235,13 +235,141 @@ async def test_poller_falls_back_to_singles_when_batch_fails(tmp_path):
         pass
 
     p = Poller(fc, regmap, cb)
-    await p._poll_tier("prime", p._prime_batches)
+    await p._poll_tier("prime")
     # The fan-out must have happened — every register in the prime tier
     # has its single-read fallback exercised.
     assert fc.single_calls > 0
     # And the prime heartbeat is still stamped, since the fan-outs
     # recovered some data.
     assert p.health.last_prime_good_monotonic is not None
+
+
+async def test_poller_skips_registers_whose_fanout_fails(tmp_path):
+    """A register whose single-read fallback ALSO fails must be skipped,
+    not decoded as a sentinel zero. Stamping 0 on coolant_temp or RPM
+    can trip an out-of-range alarm comparator and corrupt the audit
+    record. Preserves the last good value instead."""
+    from dataclasses import dataclass, field
+    from genwatch.modbus.client import ModbusResult
+    from genwatch.modbus.poller import Poller
+    from genwatch.modbus.registers import load_register_map
+
+    regmap = load_register_map("genwatch/registers/h100.yaml")
+
+    # Pick a known register on the prime tier so the test doesn't depend
+    # on YAML reordering. output_status_1 is bitfield, single-word — easy
+    # to target by exact address.
+    target = regmap.by_name("output_status_1")
+    assert target is not None
+
+    @dataclass
+    class FakeClient:
+        # Batches always fail; singles fail ONLY for `target` and succeed
+        # for every other address.
+        single_calls: int = 0
+        addrs_failed: list[int] = field(default_factory=list)
+
+        async def connect(self):
+            return True
+
+        async def close(self):
+            pass
+
+        async def read(self, addr, count, fc=3):
+            if count == 1:
+                self.single_calls += 1
+                if addr == target.addr:
+                    self.addrs_failed.append(addr)
+                    return ModbusResult.failure("simulated_addr_failure", 1.0)
+                return ModbusResult.success([0x4321], 1.0)
+            return ModbusResult.failure("simulated_batch_failure", 1.0)
+
+        async def write(self, *a, **kw):
+            return ModbusResult.failure("not_used")
+
+    fc = FakeClient()
+
+    async def cb(tier, reading, health):
+        pass
+
+    p = Poller(fc, regmap, cb)
+    # Pre-seed a known-good value so we can verify it survives the bad
+    # fan-out read.
+    p.reading.values[target.name] = 0xABCD
+    await p._poll_tier("prime")
+    # The target's fan-out failed — we must NOT have overwritten its
+    # value with 0 (or anything else from this cycle).
+    assert p.reading.values[target.name] == 0xABCD, (
+        "fan-out failure on a single register must preserve the last good "
+        "value, not substitute a sentinel zero"
+    )
+    # Sanity: the target was actually attempted, and some other prime
+    # register did get the success value, proving the cycle ran.
+    assert fc.addrs_failed == [target.addr]
+    other_prime_names = [r.name for r in regmap.tier("prime") if r.name != target.name]
+    assert any(p.reading.values.get(n) == 0x4321 for n in other_prime_names), (
+        "neighbouring registers in the same batch must still decode their "
+        "successful fan-out reads"
+    )
+
+
+async def test_poller_apply_regmap_swaps_batches_and_cadence(tmp_path):
+    """POST /api/registers/reload must update the live poller, not just
+    app.state.regmap. Otherwise the operator edits the YAML, reloads,
+    and the poller silently keeps reading the old addresses."""
+    from copy import deepcopy
+    from dataclasses import dataclass, field
+    from genwatch.modbus.client import ModbusResult
+    from genwatch.modbus.poller import Poller
+    from genwatch.modbus.registers import RegisterDef, load_register_map
+
+    regmap = load_register_map("genwatch/registers/h100.yaml")
+
+    @dataclass
+    class FakeClient:
+        async def connect(self): return True
+        async def close(self): pass
+        async def read(self, addr, count, fc=3):
+            return ModbusResult.success([0] * count, 1.0)
+        async def write(self, *a, **kw):
+            return ModbusResult.failure("not_used")
+
+    async def cb(tier, reading, health):
+        pass
+
+    p = Poller(FakeClient(), regmap, cb)
+    prime_before = len(p._prime_batches)
+    base_before = len(p._base_batches)
+    rate_before = p.health.rate_ms
+
+    # Build a new map with the prime cadence changed and one extra prime
+    # register to force a different batch count. deepcopy keeps the test
+    # independent of YAML mutations elsewhere.
+    new_regmap = deepcopy(regmap)
+    new_regmap.prime_poll_ms = 750
+    new_regmap.registers = list(new_regmap.registers) + [
+        RegisterDef(
+            name="_test_extra_prime",
+            addr=0x0F00,
+            fc=3,
+            type="u16",
+            tier="prime",
+            group="State",
+        )
+    ]
+
+    await p.apply_regmap(new_regmap)
+
+    # Poller must now hold the new map and have re-derived batches.
+    assert p.regmap is new_regmap
+    assert p.health.rate_ms == 750
+    assert any(start == 0x0F00 for start, _ in p._prime_batches), (
+        "new prime register should have produced a new batch entry"
+    )
+    # Old batch count is allowed to change either way — we only assert
+    # that the poller actually re-derived rather than keeping the old
+    # tuples. (We can detect that via the new entry presence above.)
+    _ = prime_before, base_before, rate_before  # silence unused
 
 
 # ─── Modbus client ────────────────────────────────────────────────────────
