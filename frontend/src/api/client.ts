@@ -153,7 +153,9 @@ export const api = {
 };
 
 export const EMPTY_READING: Reading = {
-  rpm: null, hz: null, kw: null, oilP: null, coolT: null, batt: null,
+  rpm: null, hz: null, kw: null, pf: null,
+  oilP: null, oilT: null, coolT: null, coolLevel: null,
+  throttle: null, o2: null, batt: null, battA: null,
   vAB: null, vBC: null, vCA: null, iA: null, iB: null, iC: null,
   fuelPct: null, runHours: null, startCount: null,
 };

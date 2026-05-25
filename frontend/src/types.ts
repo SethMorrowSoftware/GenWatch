@@ -19,9 +19,15 @@ export interface Reading {
   rpm: number | null;
   hz: number | null;
   kw: number | null;
+  pf: number | null;
   oilP: number | null;
+  oilT: number | null;
   coolT: number | null;
+  coolLevel: number | null;
+  throttle: number | null;
+  o2: number | null;
   batt: number | null;
+  battA: number | null;
   vAB: number | null;
   vBC: number | null;
   vCA: number | null;

@@ -7,6 +7,38 @@ from fastapi import APIRouter, Request
 
 from ..db import COLUMN_MAP
 
+
+def reading_to_ui(values: dict) -> dict:
+    """Translate internal Modbus register names to the UI's camelCase keys.
+
+    Single source of truth for the `reading` block — called by both
+    /api/status (REST, on mount) and the WS snapshot push (every prime
+    poll). Keeps the two payload shapes in lockstep.
+    """
+    return {
+        "rpm": values.get("rpm"),
+        "hz": values.get("frequency"),
+        "kw": values.get("total_kw"),
+        "pf": values.get("power_factor"),
+        "oilP": values.get("oil_pressure"),
+        "oilT": values.get("oil_temp"),
+        "coolT": values.get("coolant_temp"),
+        "coolLevel": values.get("coolant_level"),
+        "throttle": values.get("throttle_position"),
+        "o2": values.get("o2_sensor"),
+        "batt": values.get("battery_volts"),
+        "battA": values.get("batt_charge_current"),
+        "vAB": values.get("gen_voltage_ab"),
+        "vBC": values.get("gen_voltage_bc"),
+        "vCA": values.get("gen_voltage_ca"),
+        "iA": values.get("gen_current_a"),
+        "iB": values.get("gen_current_b"),
+        "iC": values.get("gen_current_c"),
+        "fuelPct": values.get("fuel_level_pct"),
+        "runHours": values.get("run_hours"),
+        "startCount": values.get("start_count"),
+    }
+
 router = APIRouter(prefix="/api", tags=["status"])
 
 
@@ -29,6 +61,9 @@ async def status(request: Request) -> dict:
     start_count = r.get("start_count")
     if start_count is None:
         start_count = db.count_engine_starts()
+
+    reading_ui = reading_to_ui(r)
+    reading_ui["startCount"] = start_count
 
     # ATS history (no contact register on H-100 map → derive from state
     # transitions into 'running').
@@ -62,23 +97,7 @@ async def status(request: Request) -> dict:
             "rateMs": snap.comms.rate_ms,
             "p95LatencyMs": snap.comms.p95_latency_ms,
         },
-        "reading": {
-            "rpm": r.get("rpm"),
-            "hz": r.get("frequency"),
-            "kw": r.get("total_kw"),
-            "oilP": r.get("oil_pressure"),
-            "coolT": r.get("coolant_temp"),
-            "batt": r.get("battery_volts"),
-            "vAB": r.get("gen_voltage_ab"),
-            "vBC": r.get("gen_voltage_bc"),
-            "vCA": r.get("gen_voltage_ca"),
-            "iA": r.get("gen_current_a"),
-            "iB": r.get("gen_current_b"),
-            "iC": r.get("gen_current_c"),
-            "fuelPct": r.get("fuel_level_pct"),
-            "runHours": r.get("run_hours"),
-            "startCount": start_count,
-        },
+        "reading": reading_ui,
         "site": {
             "id": regmap.site.id,
             "name": regmap.site.name,
