@@ -109,3 +109,75 @@ async def test_state_validity_enforced(client):
         r = await client.post("/api/control/start", json={"confirm_token": token})
         assert r.status_code == 409
         assert r.json()["detail"]["code"] == "invalid_state"
+
+
+async def test_control_rejected_when_panel_not_auto(client, app_env):
+    """The H-100 only honors remote writes when the front-panel key
+    switch is in AUTO. The server must reject with 409
+    panel_mode_locked if the operator clicks a button while the panel
+    has been locally locked out — otherwise the UI claims success
+    while nothing happens at the unit."""
+    from genwatch.main import create_app
+
+    app = create_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        async with app.router.lifespan_context(app):
+            await asyncio.sleep(0.3)
+            # Force the state-machine snapshot's panel_mode to a non-AUTO
+            # value, mimicking an operator who turned the key switch.
+            app.state.state_machine.snap.panel_mode = "manual"
+
+            await _login(c)
+            r = await c.get("/api/control/confirm")
+            token = r.json()["token"]
+            r = await c.post("/api/control/start", json={"confirm_token": token})
+            assert r.status_code == 409, r.text
+            detail = r.json()["detail"]
+            assert detail["code"] == "panel_mode_locked"
+            assert "MANUAL" in detail["message"]
+
+
+async def test_registers_reload_propagates_to_poller(client, app_env):
+    """POST /api/registers/reload must update the live poller's batches
+    and cadence, not just app.state.regmap. Verifies the hot-reload path
+    actually closes the loop."""
+    from copy import deepcopy
+    from genwatch.main import create_app
+    from genwatch.modbus.registers import load_register_map
+
+    app = create_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        async with app.router.lifespan_context(app):
+            await asyncio.sleep(0.3)
+            await _login(c)
+
+            # Mutate the on-disk-equivalent map in place via a deepcopy
+            # so the file isn't touched. The reload endpoint imports
+            # load_register_map lazily inside the handler, so we patch
+            # the function on the source module — that's where the
+            # endpoint resolves it from on each call.
+            import genwatch.modbus.registers as regs_mod
+            original_load = regs_mod.load_register_map
+            mutated = deepcopy(app.state.regmap)
+            mutated.prime_poll_ms = 700  # halved cadence
+
+            def fake_load(path):
+                return mutated
+
+            regs_mod.load_register_map = fake_load
+            try:
+                r = await c.post("/api/registers/reload")
+                assert r.status_code == 200, r.text
+                # Poller picked up the new cadence — health.rate_ms is
+                # the canonical "what cadence are we polling at" value
+                # surfaced to the WS clients and stale-data badge.
+                assert app.state.poller.health.rate_ms == 700
+                assert app.state.poller.regmap is mutated
+                # State machine + control service also see the new map.
+                assert app.state.state_machine.regmap is mutated
+                assert app.state.control.regmap is mutated
+                assert app.state.regmap is mutated
+            finally:
+                regs_mod.load_register_map = original_load

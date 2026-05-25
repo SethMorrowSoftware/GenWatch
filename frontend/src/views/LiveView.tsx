@@ -72,7 +72,11 @@ export function LiveView({ status, history, operator }: Props) {
 
       <div className="row-ats" style={{ marginTop: "var(--gap)" }}>
         <AtsCard status={status} />
-        <ControlsPanel state={status.state} onCommand={setConfirmCmd} />
+        <ControlsPanel
+          state={status.state}
+          panelMode={status.panel.mode}
+          onCommand={setConfirmCmd}
+        />
       </div>
 
       <div style={{ marginTop: "var(--gap)" }}>
@@ -474,37 +478,68 @@ function EngineMetric({ label, value, unit, sparkPoints, color, warnRange, numer
 }
 
 // ─── Controls panel ──────────────────────────────────────────────────────
-function ControlsPanel({ state, onCommand }: {
-  state: EngineState; onCommand: (cmd: "start" | "stop" | "exercise" | "transfer") => void;
+function ControlsPanel({ state, panelMode, onCommand }: {
+  state: EngineState;
+  panelMode: "auto" | "manual" | "off" | "unknown";
+  onCommand: (cmd: "start" | "stop" | "exercise" | "transfer") => void;
 }) {
-  const canStart = state === "stopped";
-  const canStop = state === "running" || state === "exercising" || state === "cranking";
-  const canExercise = state === "stopped";
-  const canTransfer = state === "running";
+  // The H-100 only honors remote start/stop/exercise/transfer writes
+  // when the front-panel key switch is in AUTO. MANUAL/OFF locally
+  // locks out the controller's remote-command path, so an enabled UI
+  // button on a non-AUTO panel would just produce a silent no-op at
+  // the unit. The backend rejects with 409 either way; this just keeps
+  // the UI honest. "unknown" means the prime poll hasn't decoded
+  // input_status_1 yet (cold start) or the operator's panel_mode_bits
+  // YAML rules don't match their firmware — safer to gate.
+  const panelOk = panelMode === "auto";
+  const canStart = panelOk && state === "stopped";
+  const canStop = panelOk && (state === "running" || state === "exercising" || state === "cranking");
+  const canExercise = panelOk && state === "stopped";
+  const canTransfer = panelOk && state === "running";
+
+  const panelHint =
+    panelMode === "auto"           ? null :
+    panelMode === "manual"         ? "Panel key switch is MANUAL — set to AUTO at the unit to enable remote commands." :
+    panelMode === "off"            ? "Panel key switch is OFF — engine is locked out. Set to AUTO at the unit." :
+    /* unknown */                    "Panel key-switch position is unknown — waiting for prime poll or verify panel_mode_bits in h100.yaml.";
+
   return (
     <Card title="Controls" sub="Operator · two-step confirm">
       <div className="ctl-stack">
-        <button className="ctl-btn" data-tone="start" disabled={!canStart} onClick={() => onCommand("start")}>
+        <button className="ctl-btn" data-tone="start" disabled={!canStart} onClick={() => onCommand("start")}
+                title={panelHint ?? undefined}>
           <span className="icon"><Icon name="play" size={18} /></span>
           <span><div className="lbl">Remote Start</div><div className="desc">Crank engine, transfer to gen</div></span>
           <span className="kbd">⌘S</span>
         </button>
-        <button className="ctl-btn" data-tone="stop" disabled={!canStop} onClick={() => onCommand("stop")}>
+        <button className="ctl-btn" data-tone="stop" disabled={!canStop} onClick={() => onCommand("stop")}
+                title={panelHint ?? undefined}>
           <span className="icon"><Icon name="stop" size={16} /></span>
           <span><div className="lbl">Remote Stop</div><div className="desc">Cool-down then engine-off</div></span>
           <span className="kbd">⌘.</span>
         </button>
-        <button className="ctl-btn" data-tone="exer" disabled={!canExercise} onClick={() => onCommand("exercise")}>
+        <button className="ctl-btn" data-tone="exer" disabled={!canExercise} onClick={() => onCommand("exercise")}
+                title={panelHint ?? undefined}>
           <span className="icon"><Icon name="activity" size={18} /></span>
           <span><div className="lbl">Quiet-Test</div><div className="desc">Run unloaded · 30 min default</div></span>
           <span className="kbd">⌘E</span>
         </button>
-        <button className="ctl-btn" data-tone="xfer" disabled={!canTransfer} onClick={() => onCommand("transfer")}>
+        <button className="ctl-btn" data-tone="xfer" disabled={!canTransfer} onClick={() => onCommand("transfer")}
+                title={panelHint ?? undefined}>
           <span className="icon"><Icon name="switch_" size={20} /></span>
           <span><div className="lbl">Transfer back</div><div className="desc">HTS-1 → Utility, cool engine</div></span>
           <span className="kbd">⌘T</span>
         </button>
       </div>
+      {panelHint && (
+        <div style={{ marginTop: 14, padding: "10px 14px", background: "color-mix(in oklch, var(--amber) 12%, var(--panel-2))",
+                      borderRadius: 10, border: "1px solid color-mix(in oklch, var(--amber) 30%, var(--border))",
+                      fontSize: 12, color: "var(--text-2)", display: "flex", gap: 10, alignItems: "flex-start",
+                      fontWeight: 500 }}>
+          <Icon name="lock" size={14} />
+          <div>{panelHint}</div>
+        </div>
+      )}
       <div style={{ marginTop: 16, padding: "12px 14px", background: "var(--panel-2)", borderRadius: 10,
                     border: "1px solid var(--border)", fontSize: 12, color: "var(--text-3)",
                     display: "flex", gap: 12, alignItems: "flex-start", fontWeight: 500 }}>

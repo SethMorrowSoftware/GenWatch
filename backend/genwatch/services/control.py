@@ -59,6 +59,14 @@ ALLOWED = {
     "transfer": {"running"},
 }
 
+# Verbs whose Modbus write the H-100 only honors when the front-panel
+# key switch is in AUTO. MANUAL / OFF locally locks out the controller's
+# remote-command path, so a write that "succeeds" at the wire level
+# would be silently dropped by the panel — leaving the operator looking
+# at a UI that says "started" while the engine never cranks. Reject
+# server-side instead.
+PANEL_AUTO_REQUIRED = {"start", "stop", "exercise", "transfer"}
+
 
 class ControlError(Exception):
     def __init__(self, code: str, message: str, http_status: int = 400):
@@ -83,6 +91,17 @@ class ControlService:
         self.slack = slack
         self._tokens: dict[str, ConfirmToken] = {}
         self._lock = asyncio.Lock()
+
+    async def apply_regmap(self, new_regmap: RegisterMap) -> None:
+        """Swap in a freshly-loaded register map (POST /api/registers/reload).
+
+        Acquires _lock so a control write in flight finishes against the
+        old map's address before the swap takes effect. Without this, an
+        operator-initiated start that races a hot-reload could write to
+        an address that no longer exists in the new YAML.
+        """
+        async with self._lock:
+            self.regmap = new_regmap
 
     async def issue_token(self, operator: str) -> ConfirmToken:
         async with self._lock:
@@ -142,6 +161,24 @@ class ControlService:
                 f"Edit registers/h100.yaml or settings.",
                 500,
             )
+
+        # Panel key-switch gate. The H-100 ignores remote writes unless
+        # the front-panel key is in AUTO; surfacing this server-side
+        # turns the failure mode from "silent no-op at the unit" into a
+        # visible 409 the UI can render. Skip the check only if the verb
+        # doesn't require AUTO (none today, but the table leaves room).
+        if verb in PANEL_AUTO_REQUIRED:
+            panel_mode = self.state.snap.panel_mode
+            if panel_mode != "auto":
+                self.db.write_audit(
+                    operator, f"control.{verb}", f"panel_mode={panel_mode}", token, "denied"
+                )
+                raise ControlError(
+                    "panel_mode_locked",
+                    f"cannot {verb}: H-100 front-panel key switch is {panel_mode.upper()}. "
+                    f"Set the panel to AUTO at the unit before issuing remote commands.",
+                    409,
+                )
 
         # Server-side state-validity guard (defense in depth).
         cur = self.state.snap.engine_state

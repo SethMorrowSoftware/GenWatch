@@ -83,12 +83,45 @@ class Poller:
         self._running = False
         self._tasks: list[asyncio.Task] = []
 
-        # Pre-compute batched reads per tier
+        # Pre-compute batched reads per tier. apply_regmap() rebuilds
+        # these under _regmap_lock when the operator reloads h100.yaml.
         self._prime_batches = batch_reads(regmap.tier("prime"))
         self._base_batches = batch_reads(regmap.tier("base"))
+        # Serializes the (regmap, _prime_batches, _base_batches) triple so
+        # a mid-cycle hot-reload can't leave the poller decoding new
+        # registers against words read for the old map. _poll_tier
+        # takes a brief snapshot under this lock at the top of each
+        # poll; apply_regmap holds it across the swap.
+        self._regmap_lock = asyncio.Lock()
         log.info(
             "Poller batches: prime=%d reads, base=%d reads",
             len(self._prime_batches), len(self._base_batches),
+        )
+
+    async def apply_regmap(self, new_regmap: RegisterMap) -> None:
+        """Swap the register map mid-run.
+
+        Re-computes the prime/base batch tables from the new tier
+        membership so subsequent polls hit the operator's edited
+        addresses. Holds _regmap_lock so any in-flight _poll_tier sees
+        a consistent (regmap, batches) snapshot — never new batches
+        with old register definitions or vice versa.
+
+        Called by POST /api/registers/reload after the YAML edit + parse
+        succeeds. The Modbus client is not torn down; the existing TCP /
+        serial connection keeps serving.
+        """
+        new_prime = batch_reads(new_regmap.tier("prime"))
+        new_base = batch_reads(new_regmap.tier("base"))
+        async with self._regmap_lock:
+            old_prime, old_base = len(self._prime_batches), len(self._base_batches)
+            self.regmap = new_regmap
+            self._prime_batches = new_prime
+            self._base_batches = new_base
+            self.health.rate_ms = new_regmap.prime_poll_ms
+        log.info(
+            "Poller register-map reloaded: prime %d→%d batches, base %d→%d batches",
+            old_prime, len(new_prime), old_base, len(new_base),
         )
 
     @property
@@ -102,7 +135,7 @@ class Poller:
         self._running = True
         # Kick off a base poll immediately so the UI has data even
         # before the first base interval elapses.
-        await self._poll_tier("base", self._base_batches)
+        await self._poll_tier("base")
         self._tasks = [
             asyncio.create_task(self._loop_prime(), name="poll-prime"),
             asyncio.create_task(self._loop_base(), name="poll-base"),
@@ -123,11 +156,13 @@ class Poller:
 
     # ---- loops ----
     async def _loop_prime(self) -> None:
-        period = self.regmap.prime_poll_ms / 1000.0
+        # Read cadence each iteration so apply_regmap() picks up the new
+        # prime_poll_ms without a restart.
         while self._running:
+            period = self.regmap.prime_poll_ms / 1000.0
             t0 = time.monotonic()
             try:
-                await self._poll_tier("prime", self._prime_batches)
+                await self._poll_tier("prime")
             except Exception as e:  # noqa: BLE001
                 log.exception("prime poll crashed: %s", e)
             elapsed = time.monotonic() - t0
@@ -138,11 +173,11 @@ class Poller:
                 break
 
     async def _loop_base(self) -> None:
-        period = self.regmap.base_poll_ms / 1000.0
         while self._running:
+            period = self.regmap.base_poll_ms / 1000.0
             t0 = time.monotonic()
             try:
-                await self._poll_tier("base", self._base_batches)
+                await self._poll_tier("base")
             except Exception as e:  # noqa: BLE001
                 log.exception("base poll crashed: %s", e)
             elapsed = time.monotonic() - t0
@@ -153,8 +188,8 @@ class Poller:
                 break
 
     async def _watchdog(self) -> None:
-        threshold = (self.regmap.prime_poll_ms * 3) / 1000.0
         while self._running:
+            threshold = (self.regmap.prime_poll_ms * 3) / 1000.0
             try:
                 await asyncio.sleep(1.0)
             except asyncio.CancelledError:
@@ -168,19 +203,28 @@ class Poller:
                 log.warning("Comms LOST — %.1fs since last good prime poll", silence)
 
     # ---- batch execution ----
-    async def _poll_tier(self, tier: str, batches: list[tuple[int, int]]) -> None:
+    async def _poll_tier(self, tier: str, batches: list[tuple[int, int]] | None = None) -> None:
+        # Snapshot regmap + batches atomically so a mid-cycle hot-reload
+        # via /api/registers/reload doesn't leave us decoding registers
+        # from one map against words read for another. apply_regmap()
+        # acquires the same lock when swapping.
+        async with self._regmap_lock:
+            regmap = self.regmap
+            if batches is None:
+                batches = self._prime_batches if tier == "prime" else self._base_batches
         if not batches:
             return
-        # Maps start-of-batch addr → words successfully read covering that range.
-        # A batch may be served by either the original block read or by a
-        # fan-out fallback that re-reads each register individually.
-        results: list[tuple[int, ModbusResult]] = []
+        # Maps start-of-batch addr → (words, failed_offsets) successfully
+        # read covering that range. failed_offsets carries the per-word
+        # indices that the single-register fan-out couldn't read so the
+        # decoder can skip those registers rather than substitute zeros.
+        results: list[tuple[int, list[int], set[int]]] = []
         any_batch_ok = False
         for start, count in batches:
-            r = await self.client.read(start, count, fc=self.regmap.read_fc)
+            r = await self.client.read(start, count, fc=regmap.read_fc)
             self._record(r)
-            if r.ok:
-                results.append((start, r))
+            if r.ok and r.words is not None:
+                results.append((start, list(r.words), set()))
                 any_batch_ok = True
                 continue
             # Batch read failed. Rather than blanking every register in the
@@ -191,24 +235,38 @@ class Poller:
                 "batch %#06x+%d failed (%s) — falling back to single-register reads",
                 start, count, r.error or "?",
             )
-            fb_words = await self._fallback_singles(start, count)
-            if fb_words is not None:
-                results.append((start, ModbusResult.success(fb_words, r.elapsed_ms)))
+            fb = await self._fallback_singles(start, count, regmap.read_fc)
+            if fb is not None:
+                fb_words, fb_failed = fb
+                results.append((start, fb_words, fb_failed))
                 any_batch_ok = True
 
-        # Decode every register whose address falls within a successful batch.
+        # Decode every register whose address falls within a successful
+        # batch. Registers whose words include a fan-out failure are
+        # skipped entirely (rather than decoded against a sentinel zero),
+        # preserving the previous good value in self.reading.values.
         new_values: dict[str, float | int] = dict(self.reading.values)
-        for reg in self.regmap.tier(tier):
-            for start, r in results:
-                if not r.ok or r.words is None:
+        for reg in regmap.tier(tier):
+            for start, words, failed_offsets in results:
+                if not (start <= reg.addr and (start + len(words)) >= reg.addr + reg.words):
                     continue
-                if start <= reg.addr and (start + len(r.words)) >= reg.addr + reg.words:
-                    offset = reg.addr - start
-                    words = r.words[offset : offset + reg.words]
-                    decoded = decode_value(reg, words)
-                    if decoded is not None:
-                        new_values[reg.name] = decoded
+                offset = reg.addr - start
+                reg_offsets = range(offset, offset + reg.words)
+                if any(o in failed_offsets for o in reg_offsets):
+                    # One or more words for this register failed even
+                    # after fan-out. Leave the prior value in place
+                    # rather than overwriting with a sentinel that could
+                    # trip an out-of-range alarm comparator.
+                    log.debug(
+                        "skipping decode of %s @0x%04X — fan-out read failed",
+                        reg.name, reg.addr,
+                    )
                     break
+                reg_words = words[offset : offset + reg.words]
+                decoded = decode_value(reg, reg_words)
+                if decoded is not None:
+                    new_values[reg.name] = decoded
+                break
 
         self.reading = Reading(values=new_values, ts=time.time())
 
@@ -224,25 +282,36 @@ class Poller:
         except Exception as e:  # noqa: BLE001
             log.exception("poll callback failed: %s", e)
 
-    async def _fallback_singles(self, start: int, count: int) -> list[int] | None:
+    async def _fallback_singles(
+        self, start: int, count: int, read_fc: int,
+    ) -> tuple[list[int], set[int]] | None:
         """Re-read a failed batch one register at a time.
 
-        Returns a list of `count` words covering [start, start+count), with
-        sentinel 0 substituted for any individual address that still fails.
-        Returns None if *every* single-register read failed (link is truly
-        down — let the caller skip this batch entirely).
+        Returns (words, failed_offsets):
+          - words is a list of `count` ints covering [start, start+count).
+            Failed positions hold 0 as a placeholder so the list stays
+            the right length; callers MUST check failed_offsets before
+            decoding any register touching those positions.
+          - failed_offsets is the set of per-word indices that still
+            failed after fan-out, so the poller can skip decoding those
+            registers rather than emit a sentinel zero.
+
+        Returns None if *every* single-register read failed (link is
+        truly down — let the caller skip this batch entirely).
         """
         words: list[int] = []
+        failed: set[int] = set()
         any_ok = False
         for offset in range(count):
-            r = await self.client.read(start + offset, 1, fc=self.regmap.read_fc)
+            r = await self.client.read(start + offset, 1, fc=read_fc)
             self._record(r)
             if r.ok and r.words:
                 words.append(int(r.words[0]))
                 any_ok = True
             else:
                 words.append(0)
-        return words if any_ok else None
+                failed.add(offset)
+        return (words, failed) if any_ok else None
 
     # ---- comms health ----
     def _record(self, r: ModbusResult) -> None:
