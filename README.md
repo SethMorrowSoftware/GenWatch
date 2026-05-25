@@ -665,7 +665,7 @@ Pi 5 needs a true 5 V / 5 A supply. Cheap USB-C chargers brown out under USB per
 
 ## 12. Adapting the register map
 
-The shipped `backend/genwatch/registers/h100.yaml` is derived from the [`jgyates/genmon`](https://github.com/jgyates/genmon/blob/master/genmonlib/generac_HPanel.py) project's `generac_HPanel.py` — a field-tested open-source H-100 integration cross-checked against the [Monico H100 Combined Data Map](https://www.monicoinc.com/downloads/H100_Combined_Data_Map-WEB.xls). If you're seeing wrong values on a real panel, the most likely causes (in order) are:
+The shipped `backend/genwatch/registers/h100.yaml` is derived from the [`jgyates/genmon`](https://github.com/jgyates/genmon/blob/master/genmonlib/generac_HPanel.py) project's `generac_HPanel.py` — a field-tested open-source H-100 integration. Addresses and bit meanings were cross-referenced against Generac's own [H-100 Control Panel Technical Manual (0F3750)](https://soa.generac.com/manuals/5309519/0F3750). If you're seeing wrong values on a real panel, the most likely causes (in order) are:
 
 1. **It's actually a G-Panel, not an H-100.** Generac's industrial line includes a G-Panel sibling controller. Addresses shift by 6–0x20 — see `GPanelReg` in genmon's source. Symptom: the telemetry block reads as garbage but the link is healthy.
 2. **Dealer-customized firmware** with different addresses for a few sensors.
