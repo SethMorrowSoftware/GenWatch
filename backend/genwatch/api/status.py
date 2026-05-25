@@ -38,6 +38,18 @@ async def status(request: Request) -> dict:
 
     last_alarm = db.last_alarm_event()
 
+    # Panel block: surfaces previously-dead polled registers and decodes
+    # the key-switch position. Operator commands from this UI only
+    # engage the controller when panel.mode == 'auto'.
+    panel_mode = regmap.derive_panel_mode(r)
+    panel = {
+        "mode": panel_mode,
+        "keySwitchRaw": r.get("key_switch_state"),
+        "engineStatusCode": r.get("engine_status_code"),
+        "activeAlarmCountHw": r.get("active_alarm_count"),
+        "quietTestStatusRaw": r.get("quiettest_status"),
+    }
+
     out = {
         "state": snap.engine_state,
         "alarmRaw": snap.alarm_raw,
@@ -93,6 +105,7 @@ async def status(request: Request) -> dict:
                 "message": last_alarm["message"],
             } if last_alarm else None
         ),
+        "panel": panel,
         "serverTs": time.time(),
     }
     return out

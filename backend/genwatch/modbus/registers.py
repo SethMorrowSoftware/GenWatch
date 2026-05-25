@@ -77,6 +77,17 @@ class StateBitRule:
 
 
 @dataclass(frozen=True)
+class PanelModeRule:
+    """Panel key-switch derivation rule: if mask is set in `register`,
+    the H-100 front-panel key switch is in `mode` (auto / manual / off).
+    First match wins; operator commands from this UI are accepted by the
+    controller only when mode == 'auto'."""
+    mode: str
+    register: str
+    mask: int
+
+
+@dataclass(frozen=True)
 class SiteConfig:
     id: str = "SITE-1"
     name: str = "Generac H-100"
@@ -103,6 +114,7 @@ class RegisterMap:
     backoff_s: list[float]
     engine_state_bits: list[StateBitRule]
     alarm_bits: list[AlarmBit]
+    panel_mode_bits: list[PanelModeRule]
     registers: list[RegisterDef]
     controls: dict[str, ControlDef]
     raw: dict = field(default_factory=dict)  # for /api/registers GET
@@ -139,6 +151,21 @@ class RegisterMap:
             if int(raw) & ab.mask:
                 active.append(ab)
         return active
+
+    def derive_panel_mode(self, values: dict[str, float | int]) -> str:
+        """Return the first panel mode whose mask is set, or 'unknown'.
+
+        Maps the H-100's key-switch position to a UI label. Returns one
+        of 'auto', 'manual', 'off', 'unknown'. Operator commands from
+        this UI only engage the controller when mode == 'auto'.
+        """
+        for rule in self.panel_mode_bits:
+            raw = values.get(rule.register)
+            if raw is None:
+                continue
+            if (int(raw) & rule.mask) == rule.mask:
+                return rule.mode
+        return "unknown"
 
 
 @dataclass(frozen=True)
@@ -211,6 +238,16 @@ def validate_register_map(rm: RegisterMap) -> MapValidation:
             errors.append(f"alarm_bits rule references unknown register: {ab.register}")
         if ab.mask <= 0 or ab.mask > 0xFFFF:
             errors.append(f"alarm_bits rule '{ab.code}' has invalid mask 0x{ab.mask:X}")
+    for pm in rm.panel_mode_bits:
+        if pm.register not in by_name:
+            errors.append(f"panel_mode_bits rule references unknown register: {pm.register}")
+        if pm.mask <= 0 or pm.mask > 0xFFFF:
+            errors.append(f"panel_mode_bits rule '{pm.mode}' has invalid mask 0x{pm.mask:X}")
+        if pm.mode not in ("auto", "manual", "off"):
+            warnings.append(
+                f"panel_mode_bits rule has non-standard mode '{pm.mode}' "
+                f"(UI expects auto/manual/off; will display as 'unknown')"
+            )
 
     control_names: set[str] = set()
     for c in rm.controls.values():
@@ -291,6 +328,15 @@ def load_register_map(path: Path | str) -> RegisterMap:
         for a in (data.get("alarm_bits") or [])
     ]
 
+    panel_mode_bits = [
+        PanelModeRule(
+            mode=str(r["mode"]).lower(),
+            register=str(r["register"]),
+            mask=_coerce_mask(r["mask"]),
+        )
+        for r in (data.get("panel_mode_bits") or [])
+    ]
+
     registers: list[RegisterDef] = []
     for r in data.get("registers") or []:
         registers.append(
@@ -337,6 +383,7 @@ def load_register_map(path: Path | str) -> RegisterMap:
         backoff_s=backoff,
         engine_state_bits=engine_state_bits,
         alarm_bits=alarm_bits,
+        panel_mode_bits=panel_mode_bits,
         registers=registers,
         controls=controls,
         raw=data,

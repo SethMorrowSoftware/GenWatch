@@ -138,6 +138,15 @@ async def lifespan(app: FastAPI):
     slack = SlackNotifier(settings.slack, db, site_name=regmap.site.name)
     control_service = ControlService(regmap, client, db, state_machine, slack=slack)
 
+    # WebSocket snapshot push cadence. Defaults to the prime-poll interval
+    # but operators can dial back the UI refresh rate via ws_push_ms
+    # (e.g. lower CPU on the Pi, or fewer updates over a slow VPN). We
+    # throttle by recording the last-push timestamp; transitions / alarms
+    # / comms events always push regardless, so state changes still feel
+    # live even with a longer ws_push_ms.
+    push_throttle_s = max(0.0, settings.ws_push_ms / 1000.0)
+    last_push_ts = [0.0]  # boxed so the nested fn can mutate
+
     # Poller callback: persist telemetry, update state machine, push to WS bus.
     async def on_poll(tier, reading, comms):
         try:
@@ -159,8 +168,10 @@ async def lifespan(app: FastAPI):
             except Exception as e:  # noqa: BLE001
                 log.exception("telemetry write failed: %s", e)
 
-        # Always push a snapshot to WS subscribers on the prime cadence.
-        if tier == "prime":
+        # Throttled snapshot push to WS subscribers (prime cadence with
+        # a ws_push_ms floor). Events below still push immediately.
+        if tier == "prime" and (reading.ts - last_push_ts[0]) >= push_throttle_s:
+            last_push_ts[0] = reading.ts
             payload = {
                 "type": "snapshot",
                 "ts": reading.ts,
@@ -353,11 +364,28 @@ def create_app() -> FastAPI:
     )
 
     # CORS — only used in dev when Vite serves on 5173 and API on 8000.
-    cors_origins = os.environ.get("GENWATCH_CORS_ORIGINS")
-    if cors_origins:
+    # Resolves from (in priority order): the GENWATCH_CORS_ORIGINS env
+    # var, then the `cors_origins` list in config.yaml. The env var is
+    # CSV; the YAML field is a real list. We keep the env-var path so
+    # one-off "GENWATCH_CORS_ORIGINS=… genwatch …" still works for ad-hoc
+    # debugging.
+    cors_env = os.environ.get("GENWATCH_CORS_ORIGINS")
+    if cors_env:
+        cors_list = [o.strip() for o in cors_env.split(",") if o.strip()]
+    else:
+        # settings is loaded lazily inside lifespan — peek at the same
+        # source (config.yaml + env) so CORS reflects what the operator
+        # configured on disk.
+        from .config import load as _load_settings
+        try:
+            _s = _load_settings()
+            cors_list = [o.strip() for o in (_s.cors_origins or []) if o.strip()]
+        except Exception:  # noqa: BLE001
+            cors_list = []
+    if cors_list:
         app.add_middleware(
             CORSMiddleware,
-            allow_origins=[o.strip() for o in cors_origins.split(",")],
+            allow_origins=cors_list,
             allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],

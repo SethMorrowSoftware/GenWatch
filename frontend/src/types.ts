@@ -80,6 +80,13 @@ export interface StatusBody {
     severity: Severity;
     message: string;
   } | null;
+  panel: {
+    mode: "auto" | "manual" | "off" | "unknown";
+    keySwitchRaw: number | null;
+    engineStatusCode: number | null;
+    activeAlarmCountHw: number | null;
+    quietTestStatusRaw: number | null;
+  };
   serverTs: number;
 }
 

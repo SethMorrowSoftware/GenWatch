@@ -114,6 +114,7 @@ function Shell({ auth, view, setView, theme, onToggleTheme, onLogout }: {
 
   const status = live.status;
   const comms = status?.comms;
+  const panel = status?.panel;
   const activeAlarmCount = status?.activeAlarms.length ?? 0;
   const dateStr = clock.toLocaleString("en-US", {
     month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit",
@@ -193,6 +194,7 @@ function Shell({ auth, view, setView, theme, onToggleTheme, onLogout }: {
               <span>STALE DATA</span>
             </div>
           )}
+          {panel && <PanelChip mode={panel.mode} />}
           <div className="comms-badge" data-state={comms?.state ?? "lost"}
                title={`Modbus comms: ${comms?.state ?? "lost"} · ${commsLabel} success · ${commsRate} poll`}>
             <span className="pulse" />
@@ -254,6 +256,36 @@ function Shell({ auth, view, setView, theme, onToggleTheme, onLogout }: {
             : `poll ${(comms?.rateMs ?? 1500) / 1000}s`}
         </span>
       </footer>
+    </div>
+  );
+}
+
+// Topbar chip showing the H-100 front-panel key-switch position.
+// Operator commands from this UI only engage the controller when the
+// panel is in AUTO; MANUAL/OFF means remote writes are ignored locally
+// at the unit. Decoded from input_status_1 bits via panel_mode_bits in
+// the YAML — if the bits don't match a known mode the chip shows
+// "PANEL: ?" so the operator knows the YAML needs verifying.
+function PanelChip({ mode }: { mode: "auto" | "manual" | "off" | "unknown" }) {
+  const label = mode === "unknown" ? "?" : mode.toUpperCase();
+  // Reuse the comms-badge CSS scheme: healthy (green) / degraded (amber) /
+  // lost (red). auto → healthy, manual → degraded, off/unknown → lost.
+  const state =
+    mode === "auto"   ? "healthy" :
+    mode === "manual" ? "degraded" :
+    "lost";
+  const title =
+    mode === "auto"
+      ? "H-100 panel key switch in AUTO — remote commands will engage."
+      : mode === "manual"
+      ? "H-100 panel key switch in MANUAL — remote start/stop/exercise are ignored at the controller. Set to AUTO at the unit."
+      : mode === "off"
+      ? "H-100 panel key switch in OFF — engine is locked out. Remote commands will not run."
+      : "Panel key-switch position not recognized — verify panel_mode_bits in h100.yaml against your firmware.";
+  return (
+    <div className="comms-badge" data-state={state} title={title}>
+      <span className="pulse" />
+      <span>Panel · {label}</span>
     </div>
   );
 }
