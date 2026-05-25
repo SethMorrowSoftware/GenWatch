@@ -53,6 +53,10 @@ site:
   rating_kw: 200
   engine: "Cummins QSB7-G5"
   tank_gal: 220
+  # diesel | lp (propane) | ng (natural gas) — selects the fuel
+  # consumption model in services/fuel.py. Defaults to diesel for the
+  # QSB7-G5; override per install.
+  fuel_type: diesel
   exercise:
     enabled: true
     day: sun        # mon|tue|wed|thu|fri|sat|sun

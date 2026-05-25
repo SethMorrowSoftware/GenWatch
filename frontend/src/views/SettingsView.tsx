@@ -9,7 +9,7 @@ import { api } from "../api/client";
 import { Card, Icon, Pill, Skeleton, Switch } from "../components/primitives";
 import type { SlackConfigView, SlackUpdate } from "../types";
 
-type Section = "link" | "modbus" | "registers" | "retention" | "alerts";
+type Section = "link" | "modbus" | "registers" | "retention" | "alerts" | "backup";
 type Transport = "serial" | "tcp";
 
 interface Config {
@@ -79,6 +79,7 @@ export function SettingsView() {
     { id: "registers", label: "Register Map", icon: "list" },
     { id: "retention", label: "Retention", icon: "history" },
     { id: "alerts", label: "Alerts · Slack", icon: "bell" },
+    { id: "backup", label: "Backup · Restore", icon: "folder" },
   ];
 
   return (
@@ -146,9 +147,100 @@ export function SettingsView() {
               set={(patch) => setDirty((d) => ({ ...d, slack: { ...(d.slack || {}), ...patch } }))}
             />
           )}
+          {section === "backup" && <BackupSection />}
         </div>
       </div>
     </>
+  );
+}
+
+function BackupSection() {
+  const [restoring, setRestoring] = useState(false);
+  const [result, setResult] = useState<{ ok: boolean; msg: string } | null>(null);
+  const fileRef = (typeof document !== "undefined" ? document.createElement("input") : null);
+
+  const onPick = () => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".tar.gz,application/gzip";
+    input.onchange = async () => {
+      const f = input.files?.[0];
+      if (!f) return;
+      if (!window.confirm(
+        `Restore /etc/genwatch from ${f.name}? Existing files will be overwritten. ` +
+        `You'll need to restart genwatch.service afterwards.`,
+      )) return;
+      setRestoring(true);
+      setResult(null);
+      try {
+        const r = await api.restoreBackup(f);
+        setResult({
+          ok: r.ok,
+          msg: r.ok
+            ? `Restored ${r.restored.length} file(s). ${r.note}`
+            : "Restore extracted 0 files — bad tarball or path-traversal filter rejected everything.",
+        });
+      } catch (e: any) {
+        setResult({ ok: false, msg: e?.message ?? "restore failed" });
+      } finally {
+        setRestoring(false);
+      }
+    };
+    input.click();
+  };
+
+  return (
+    <div className="settings-section">
+      <div className="settings-head">
+        <h2>Backup &amp; restore</h2>
+        <p>
+          Download a tarball of <span className="mono">/etc/genwatch</span> (config + any local
+          register-map edits). Use it to seed a fresh Pi after a hardware swap or to keep an
+          off-site copy of working settings. The telemetry SQLite database is <strong>not</strong>{" "}
+          included — keep that on a separate rsync schedule.
+        </p>
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">
+          Download backup
+          <span className="desc">tar.gz of /etc/genwatch — admin only</span>
+        </div>
+        <a className="btn btn-primary" href={api.backupDownloadUrl()} download>
+          <Icon name="download" size={14} /> Download backup
+        </a>
+      </div>
+
+      <div className="field-row">
+        <div className="lbl">
+          Restore from backup
+          <span className="desc">
+            Replaces /etc/genwatch contents. Restart genwatch.service after to apply.
+          </span>
+        </div>
+        <button className="btn btn-ghost" onClick={onPick} disabled={restoring}>
+          <Icon name="folder" size={14} /> {restoring ? "Restoring…" : "Choose tarball…"}
+        </button>
+      </div>
+
+      {result && (
+        <div
+          className="field-row"
+          style={{
+            background: result.ok
+              ? "color-mix(in oklch, var(--green) 12%, var(--panel-2))"
+              : "color-mix(in oklch, var(--red) 12%, var(--panel-2))",
+            border: `1px solid ${result.ok ? "var(--green)" : "var(--red)"}`,
+            borderRadius: 10,
+            padding: "10px 14px",
+            marginTop: 12,
+            fontSize: 13,
+          }}
+        >
+          {result.msg}
+        </div>
+      )}
+    </div>
   );
 }
 

@@ -9,9 +9,11 @@ import { EventsView } from "./views/EventsView";
 import { HistoryView } from "./views/HistoryView";
 import { LiveView } from "./views/LiveView";
 import { LoginView } from "./views/LoginView";
+import { MaintenanceView } from "./views/MaintenanceView";
+import { OutagesView } from "./views/OutagesView";
 import { SettingsView } from "./views/SettingsView";
 
-type View = "live" | "history" | "events" | "settings";
+type View = "live" | "history" | "events" | "outages" | "maintenance" | "settings";
 type Theme = "dark" | "light";
 
 const THEME_KEY = "genwatch.theme";
@@ -109,6 +111,8 @@ function Shell({ auth, view, setView, theme, onToggleTheme, onLogout }: {
     { id: "live", label: "Live", icon: "activity" },
     { id: "history", label: "History", icon: "history" },
     { id: "events", label: "Events", icon: "bell" },
+    { id: "outages", label: "Outages", icon: "bolt" },
+    { id: "maintenance", label: "Maintenance", icon: "bookmark" },
     { id: "settings", label: "Settings", icon: "settings" },
   ];
 
@@ -235,6 +239,8 @@ function Shell({ auth, view, setView, theme, onToggleTheme, onLogout }: {
             {view === "live" && <LiveView status={tickedStatus} history={live.history} operator={auth.operator ?? "operator"} />}
             {view === "history" && <HistoryView />}
             {view === "events" && <EventsView />}
+            {view === "outages" && <OutagesView />}
+            {view === "maintenance" && <MaintenanceView />}
             {view === "settings" && <SettingsView />}
           </div>
         )}

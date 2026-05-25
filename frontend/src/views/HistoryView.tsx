@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
-import { Card, EmptyState, LineChart, LiveTick, Pill, Skeleton, fmt } from "../components/primitives";
+import { Card, EmptyState, Icon, LineChart, LiveTick, Pill, Skeleton, fmt } from "../components/primitives";
 
 type MetricKey = "kw" | "rpm" | "hz" | "oilP" | "coolT" | "batt" | "vAB" | "iA";
 type RangeKey = "10M" | "1H" | "6H" | "24H" | "7D" | "30D";
@@ -65,6 +65,16 @@ export function HistoryView() {
         </div>
         <div className="flex ai-c gap-8">
           <Pill tone="info">{data.length} samples</Pill>
+          <a
+            className="btn btn-ghost"
+            href={api.exportTelemetryUrl({
+              from: Math.floor(Date.now() / 1000 - RANGES[range]),
+              to: Math.floor(Date.now() / 1000),
+            })}
+            download
+          >
+            <Icon name="download" size={14} /> Export CSV
+          </a>
         </div>
       </div>
 

@@ -3,7 +3,15 @@
 import { useEffect, useState } from "react";
 import { api } from "../api/client";
 import { Card, EmptyState, Icon, LiveTick, Pill, Sparkline, fmt, formatTimeInState } from "../components/primitives";
-import type { ActiveAlarm, EngineState, EventRow, Reading, StatusBody } from "../types";
+import type {
+  ActiveAlarm,
+  EngineState,
+  EventRow,
+  FuelStatus,
+  Reading,
+  StatusBody,
+  SystemHealth,
+} from "../types";
 import { ConfirmModal } from "./ConfirmModal";
 
 interface Props {
@@ -86,6 +94,11 @@ export function LiveView({ status, history, operator }: Props) {
       <div className="row" style={{ marginTop: "var(--gap)" }}>
         <EngineCard reading={reading} history={history} />
         <FuelMaintCard reading={reading} status={status} />
+      </div>
+
+      <div className="row" style={{ marginTop: "var(--gap)" }}>
+        <FuelBurnCard />
+        <SystemHealthCard />
       </div>
 
       <div style={{ marginTop: "var(--gap)" }}>
@@ -657,6 +670,240 @@ function EventsFeed({ limit = 6 }: { limit?: number }) {
       </div>
     </Card>
   );
+}
+
+// ─── Fuel burn card (estimator) ──────────────────────────────────────────
+// Cumulative gallons / scf burned since midnight, this month, and lifetime,
+// plus the projected hours-remaining at the current rate. Always present
+// when the backend has the fuel accumulator initialised; surfaces as
+// "engine idle" when no burn rate is observable.
+function FuelBurnCard() {
+  const [s, setS] = useState<FuelStatus | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const r = await api.fuel();
+        if (!cancelled) setS(r);
+      } catch (e: any) {
+        if (!cancelled) setErr(e?.message ?? "fetch failed");
+      }
+    };
+    load();
+    const t = setInterval(load, 15_000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, []);
+
+  if (err || !s) {
+    return (
+      <Card title="Fuel burn" sub="Estimated">
+        <div style={{ color: "var(--text-3)" }}>{err ?? "Loading…"}</div>
+      </Card>
+    );
+  }
+  if (!s.enabled) {
+    return (
+      <Card title="Fuel burn" sub="Estimator not initialised">
+        <div style={{ color: "var(--text-3)" }}>{s.reason ?? "Disabled"}</div>
+      </Card>
+    );
+  }
+
+  const fuelLabel = s.fuelType === "ng" ? "Natural gas" : s.fuelType === "lp" ? "Propane (LP)" : "Diesel";
+  const u = s.unit ?? "gph";
+  const totalUnit = u === "scfh" ? "scf" : "gal";
+  return (
+    <Card title="Fuel burn" sub={`${fuelLabel} · load-curve estimate`}
+          actions={
+            <Pill tone={s.engineRunning ? "ok" : "info"}>
+              {s.engineRunning ? "Engine running" : "Engine idle"}
+            </Pill>
+          }>
+      <div className="grid g-4" style={{ gap: 14 }}>
+        <div>
+          <div className="label-row"><span>Current rate</span></div>
+          <div className="mono" style={{ fontSize: 22, fontWeight: 500, marginTop: 4 }}>
+            {(s.rateNow ?? 0).toFixed(2)}<span style={{ fontSize: 12, color: "var(--text-3)", marginLeft: 4 }}>{u}</span>
+          </div>
+        </div>
+        <div>
+          <div className="label-row"><span>Today</span></div>
+          <div className="mono" style={{ fontSize: 22, fontWeight: 500, marginTop: 4 }}>
+            {(s.dayTotal ?? 0).toFixed(2)}<span style={{ fontSize: 12, color: "var(--text-3)", marginLeft: 4 }}>{totalUnit}</span>
+          </div>
+        </div>
+        <div>
+          <div className="label-row"><span>This month</span></div>
+          <div className="mono" style={{ fontSize: 22, fontWeight: 500, marginTop: 4 }}>
+            {(s.monthTotal ?? 0).toFixed(2)}<span style={{ fontSize: 12, color: "var(--text-3)", marginLeft: 4 }}>{totalUnit}</span>
+          </div>
+        </div>
+        <div>
+          <div className="label-row"><span>Lifetime</span></div>
+          <div className="mono" style={{ fontSize: 22, fontWeight: 500, marginTop: 4 }}>
+            {(s.lifetimeTotal ?? 0).toFixed(2)}<span style={{ fontSize: 12, color: "var(--text-3)", marginLeft: 4 }}>{totalUnit}</span>
+          </div>
+        </div>
+      </div>
+      {s.tankGal != null && s.tankPct != null && (
+        <div className="kv" style={{ marginTop: 14, paddingTop: 14, borderTop: "1px solid var(--border)" }}>
+          <div className="kv-row">
+            <span className="l">Tank capacity</span>
+            <span className="v">{s.tankGal} gal</span>
+          </div>
+          <div className="kv-row">
+            <span className="l">Tank remaining</span>
+            <span className="v">
+              {s.tankRemainingUnits != null ? `${s.tankRemainingUnits} gal` : "—"}
+              <span style={{ color: "var(--text-3)", marginLeft: 4 }}>({s.tankPct.toFixed(1)} %)</span>
+            </span>
+          </div>
+          <div className="kv-row">
+            <span className="l">At current burn</span>
+            <span className="v">
+              {s.hoursRemaining != null
+                ? `~${s.hoursRemaining} h until empty`
+                : "—"}
+            </span>
+          </div>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+// ─── System health card ──────────────────────────────────────────────────
+// Pi host stats — CPU temp, disk/memory, load, throttling. "Monitor the
+// monitor" so an operator notices the Pi is dying before it stops
+// reporting on the gen.
+function SystemHealthCard() {
+  const [s, setS] = useState<SystemHealth | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const r = await api.system();
+        if (!cancelled) setS(r);
+      } catch (e: any) {
+        if (!cancelled) setErr(e?.message ?? "fetch failed");
+      }
+    };
+    load();
+    const t = setInterval(load, 10_000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, []);
+
+  if (err || !s) {
+    return (
+      <Card title="Host health" sub="Pi / system">
+        <div style={{ color: "var(--text-3)" }}>{err ?? "Loading…"}</div>
+      </Card>
+    );
+  }
+
+  const cpuTone: "ok" | "warn" | "alarm" =
+    s.cpuTempC == null ? "ok" :
+    s.cpuTempC >= 80 ? "alarm" :
+    s.cpuTempC >= 70 ? "warn" : "ok";
+  const diskTone: "ok" | "warn" | "alarm" =
+    s.diskUsedPct == null ? "ok" :
+    s.diskUsedPct >= 95 ? "alarm" :
+    s.diskUsedPct >= 85 ? "warn" : "ok";
+  const memTone: "ok" | "warn" | "alarm" =
+    s.memUsedPct == null ? "ok" :
+    s.memUsedPct >= 95 ? "alarm" :
+    s.memUsedPct >= 85 ? "warn" : "ok";
+
+  return (
+    <Card title="Host health"
+          sub={s.piModel ?? "Pi / system"}
+          actions={
+            s.throttledFlags.length > 0
+              ? <Pill tone="warn">{s.throttledFlags.length} throttle event(s)</Pill>
+              : <Pill tone="ok">nominal</Pill>
+          }>
+      <div className="grid g-4" style={{ gap: 14 }}>
+        <SystemStat label="CPU temp" value={s.cpuTempC != null ? `${s.cpuTempC.toFixed(1)} °C` : "—"} tone={cpuTone} />
+        <SystemStat label="Load (1m)" value={s.cpuLoad1m != null ? s.cpuLoad1m.toFixed(2) : "—"} tone="ok" />
+        <SystemStat
+          label="Memory"
+          value={s.memUsedPct != null ? `${s.memUsedPct.toFixed(0)}%` : "—"}
+          sub={s.memUsedMb != null && s.memTotalMb != null
+            ? `${s.memUsedMb} / ${s.memTotalMb} MB`
+            : undefined}
+          tone={memTone}
+        />
+        <SystemStat
+          label="Disk"
+          value={s.diskUsedPct != null ? `${s.diskUsedPct.toFixed(0)}%` : "—"}
+          sub={s.diskUsedMb != null && s.diskTotalMb != null
+            ? `${(s.diskUsedMb / 1024).toFixed(1)} / ${(s.diskTotalMb / 1024).toFixed(1)} GB`
+            : undefined}
+          tone={diskTone}
+        />
+      </div>
+      <div className="kv" style={{ marginTop: 14, paddingTop: 14, borderTop: "1px solid var(--border)" }}>
+        <div className="kv-row">
+          <span className="l">Uptime</span>
+          <span className="v">{s.uptimeS != null ? formatUptime(s.uptimeS) : "—"}</span>
+        </div>
+        <div className="kv-row">
+          <span className="l">Service uptime</span>
+          <span className="v">{s.procUptimeS != null ? formatUptime(s.procUptimeS) : "—"}</span>
+        </div>
+        <div className="kv-row">
+          <span className="l">Service memory</span>
+          <span className="v">{s.procRssMb != null ? `${s.procRssMb} MB` : "—"}</span>
+        </div>
+        {s.throttledFlags.length > 0 && (
+          <div className="kv-row">
+            <span className="l">Throttle flags</span>
+            <span className="v mono" style={{ color: "var(--amber)" }}>
+              {s.throttledFlags.join(", ")}
+            </span>
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+function SystemStat({ label, value, sub, tone }: {
+  label: string; value: string; sub?: string; tone: "ok" | "warn" | "alarm";
+}) {
+  const color =
+    tone === "alarm" ? "var(--red)" :
+    tone === "warn" ? "var(--amber)" : "var(--text)";
+  return (
+    <div>
+      <div className="label-row"><span>{label}</span></div>
+      <div className="mono" style={{ fontSize: 22, fontWeight: 500, marginTop: 4, color }}>
+        {value}
+      </div>
+      {sub && (
+        <div className="mono" style={{ fontSize: 11, color: "var(--text-3)", marginTop: 4 }}>
+          {sub}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function formatUptime(s: number): string {
+  if (s < 60) return `${Math.floor(s)}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) {
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    return `${h}h ${m}m`;
+  }
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  return `${d}d ${h}h`;
 }
 
 export function relTime(ts: number): string {

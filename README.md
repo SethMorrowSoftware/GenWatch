@@ -2,11 +2,13 @@
 
 Professional monitoring and control software for the **Generac H-100** industrial generator, running on a **Raspberry Pi 5** and talking to the controller over a **Modbus-RTU-over-TCP** network bridge (Lantronix UDS / EDS / xDirect, Moxa NPort, Digi PortServer, ser2net, etc.).
 
-A single-pane operator console: live engine state, electrical output, two-step-confirm controls (start / stop / quiet-test / transfer) gated on the H-100 front-panel key switch, time-series history, alarms, and on-device configuration of the link, register map, and retention policy.
+A single-pane operator console: live engine state, electrical output, two-step-confirm controls (start / stop / quiet-test / transfer) gated on the H-100 front-panel key switch, time-series history, alarms, utility-outage tracking, maintenance journal with hour-and-day reminders, fuel-burn estimation, Pi host health, CSV exports, on-device config backup/restore, and on-device configuration of the link, register map, and retention policy.
 
 > **Note on naming.** The product was previously called *GenWatch*. The internal Python package, systemd unit, CLI, and on-disk paths (`/etc/genwatch/`, `genwatch.service`, the `genwatch` CLI) keep those identifiers so existing deployments don't break. Only the operator-facing copy was rebranded.
 
-> **Reliability summary.** Hardware watchdog on pid 1 (Pi reboots on kernel hang); software watchdog on the polling loop driven by a monotonic prime-poll heartbeat (service restarts on a deadlocked read); TCP keepalive on the Modbus socket (dead Lantronix detected in ~60 s); SQLite WAL with `synchronous=FULL` (audit/alarm rows survive a power cut); graceful degradation when the link is down (UI stays reachable, comms shown as LOST, reconnect in the background); panel-mode gate on every remote command (server rejects with 409 unless the H-100 key switch is in AUTO); batch-read fan-out preserves last-good values when a single register fails (no sentinel zeros that could trip an alarm comparator); register-map hot-reload propagates to the live poller without a service restart; login rate-limited; audit log on every control command. Test coverage under `backend/tests/` (71 tests).
+> **Reliability summary.** Hardware watchdog on pid 1 (Pi reboots on kernel hang); software watchdog on the polling loop driven by a monotonic prime-poll heartbeat (service restarts on a deadlocked read); TCP keepalive on the Modbus socket (dead Lantronix detected in ~60 s); SQLite WAL with `synchronous=FULL` (audit/alarm rows survive a power cut); graceful degradation when the link is down (UI stays reachable, comms shown as LOST, reconnect in the background); panel-mode gate on every remote command (server rejects with 409 unless the H-100 key switch is in AUTO); batch-read fan-out preserves last-good values when a single register fails (no sentinel zeros that could trip an alarm comparator); register-map hot-reload propagates to the live poller without a service restart; login rate-limited; audit log on every control command. Test coverage under `backend/tests/` (97 tests).
+
+> **Feature parity vs genmon.** Modeled after `jgyates/genmon` for register accuracy, but extends with: panel-key-switch gate, two-step confirm tokens, hot-reload, SQLite WAL+FULL durability, single-register fan-out with last-good preservation, hardware + software watchdogs, login rate-limiter, **utility-outage tracker with peak-kW and kWh totals, maintenance journal seeded with 10 default schedule items, fuel-burn estimator (diesel/LP/NG), Pi host-health probes, CSV exports for telemetry / events / audit, and one-click config backup/restore.**
 
 ---
 
@@ -25,8 +27,9 @@ A single-pane operator console: live engine state, electrical output, two-step-c
 - [10. Troubleshooting](#10-troubleshooting)
 - [11. Architecture overview](#11-architecture-overview)
 - [12. Adapting the register map](#12-adapting-the-register-map)
-- [13. Development](#13-development)
-- [14. License](#14-license)
+- [13. Operational features](#13-operational-features) (outages · fuel · maintenance · host health · CSV · backup)
+- [14. Development](#14-development)
+- [15. License](#15-license)
 
 ---
 
@@ -327,10 +330,12 @@ Every command is audit-logged with the operator, timestamp, action, the actual r
 
 ### Views
 
-- **Live** — Real-time operator console. Sparklines update every 1.5 s; main telemetry every 15 s. Top-right shows comms health and a STALE DATA badge if the live push has stopped.
-- **History** — Chart of any metric over 10 min to 30 days. SQLite-backed, decimated server-side.
-- **Events** — Append-only log of state transitions, alarms, comms changes, and operator commands.
-- **Settings** — Bridge endpoint, Modbus, register map, retention, Slack alerts. Changes saved to `/etc/genwatch/config.yaml`; the UI warns when a restart is required.
+- **Live** — Real-time operator console. Sparklines update every 1.5 s; main telemetry every 15 s. Top-right shows comms health and a STALE DATA badge if the live push has stopped. Includes a Fuel-burn card (diesel/LP/NG load-curve estimate with day/month/lifetime totals + hours-until-empty) and a Host-Health card (CPU temp, memory, disk, throttle flags) so an operator sees the Pi degrading before it stops reporting on the generator.
+- **History** — Chart of any metric over 10 min to 30 days. SQLite-backed, decimated server-side. **Export CSV** button downloads the raw rows in the current range with ISO timestamps for Excel / Sheets / Grafana ingestion.
+- **Events** — Append-only log of state transitions, alarms, comms changes, and operator commands. **Export CSV** for the current filtered view, plus a one-click **Audit log** download (every login, control command, config edit).
+- **Outages** — Auto-detected utility-outage history. Each outage logs start/end timestamp, duration, peak kW, integrated kWh delivered, and a free-form operator notes field. Summary stats over 30 days and 365 days. An open outage shows a "LIVE" chip with the duration counter ticking in real time.
+- **Maintenance** — Service journal. Ships with 10 default scheduled items (oil change, oil filter, air filter, fuel filter, coolant, battery test/replace, belt + hose inspection, annual service). Each item tracks both an hours interval and a calendar-day interval — whichever trips first goes overdue. "Mark done" stamps the current run-hours reading. Append-only log shows the service history forever. Admins can add custom items.
+- **Settings** — Bridge endpoint, Modbus, register map, retention, Slack alerts, and **Backup · Restore**. Changes saved to `/etc/genwatch/config.yaml`; the UI warns when a restart is required. The Backup tab downloads a tar.gz of `/etc/genwatch` (config + any local register-map edits) for off-site safekeeping, and accepts that same tarball back to seed a fresh Pi.
 
 ### CLI commands
 
@@ -606,7 +611,13 @@ Pi 5 needs a true 5 V / 5 A supply. Cheap USB-C chargers brown out under USB per
 │   ├─ /api/events      event/alarm log                           │
 │   ├─ /api/control     confirm-token-gated start/stop/etc.       │
 │   ├─ /api/config      read/write /etc/genwatch/config.yaml      │
-│   └─ /api/registers   read/reload register map                  │
+│   ├─ /api/registers   read/reload register map                  │
+│   ├─ /api/system      Pi host health (CPU temp, disk, memory)   │
+│   ├─ /api/fuel        burn rate + day/month/lifetime totals     │
+│   ├─ /api/outages     utility outage history + 30/365 summary   │
+│   ├─ /api/maintenance schedule / log / due-status               │
+│   ├─ /api/*/export    CSV exports (telemetry / events / audit)  │
+│   └─ /api/backup/...  config tarball download + restore         │
 │                                                                  │
 │  Two-tier Modbus poller:                                         │
 │   • prime (1.5 s): output_status_1..8 bitfields, key switch,    │
@@ -627,7 +638,15 @@ Pi 5 needs a true 5 V / 5 A supply. Cheap USB-C chargers brown out under USB per
 │  Storage (SQLite WAL, synchronous=FULL):                         │
 │   • telemetry / telemetry_1m / telemetry_1h                      │
 │   • events / alarms_active / audit / kv                          │
+│   • outages (peak_kw, kwh, duration_s per utility outage)        │
+│   • maintenance_schedule / maintenance_log (service journal)     │
 │   • retention task aggregates and prunes every 5 min             │
+│                                                                  │
+│  Background services:                                            │
+│   • OutageTracker — opens/closes rows on engine-state transitions│
+│   • FuelAccumulator — integrates kW × load-curve into gal / scf │
+│   • MaintenanceMonitor — hourly due-state scan, emits MAINT     │
+│                          events on OK→soon→overdue transitions   │
 └─────────────────────────────┬───────────────────────────────────┘
                               │ Modbus RTU over TCP (raw-TCP tunnel)
                               │ 9600 8N1, slave 100
@@ -728,7 +747,159 @@ The YAML schema is documented in comments at the top of `h100.yaml`. Key section
 
 ---
 
-## 13. Development
+## 13. Operational features
+
+The features below extend a plain Modbus monitor into a full operations
+journal. They run automatically — no extra config needed beyond the
+defaults shipped in `/etc/genwatch/config.yaml` and the
+`fuel_type` field on the register YAML's `site:` block.
+
+### 13.1 Utility-outage tracker
+
+Auto-detects when the H-100 starts in response to a utility outage:
+the engine transitions `stopped → cranking → running` while the
+front-panel key switch is in AUTO. (MANUAL starts are operator-driven
+and not counted as outages.) An open outage row accumulates peak kW
+and integrated kWh for as long as the engine is producing power. The
+next transition out of `running` closes the row with a duration stamp.
+
+The **Outages** view shows two summary cards (30 days, 365 days) and a
+table of every recorded outage with a free-form notes field per row.
+An in-progress outage shows a `LIVE` chip and ticks its duration in
+real time. Backend state survives a service restart — an open row is
+re-attached on boot rather than orphaned.
+
+```bash
+# REST: list outages
+curl -b cookies.txt http://localhost:8000/api/outages | jq
+
+# REST: annotate an outage
+curl -b cookies.txt -X POST http://localhost:8000/api/outages/42/notes \
+     -H 'Content-Type: application/json' \
+     -d '{"notes": "ice storm, neighbourhood down ~4h"}'
+```
+
+### 13.2 Maintenance journal
+
+`backend/genwatch/services/maintenance.py` ships with ten default
+scheduled items derived from the Cummins QSB7-G5 service manual: oil
+change (250 h / annually), oil filter (250 h), air filter (500 h),
+fuel filter (500 h), coolant flush (2000 h / 5 y), battery replace
+(3 y), battery test (180 d), belt + hose inspection (1000 h /
+annually), full annual service. Each item carries both an hours
+trigger and a calendar-day trigger — whichever trips first goes
+overdue.
+
+The **Maintenance** view shows each item's status (`ok` /
+`soon` / `overdue` / `never`) computed from the most recent log entry's
+`run_hours_at` against the current run-hours reading and against
+`now() - last_ts` for the day trigger. The "Mark done" button records a
+new log entry stamped with the current run-hours reading; entries are
+append-only so the service history is preserved forever.
+
+Admins can add custom items (e.g. `dpf_clean`, `ats_inspect`) via the
+schedule editor on the same page, or directly via REST:
+
+```bash
+curl -b cookies.txt -X PUT http://localhost:8000/api/maintenance/schedule \
+     -H 'Content-Type: application/json' \
+     -d '{"kind": "ats_inspect", "interval_hours": 0, "interval_days": 365, "notes": "Inspect HTS-1 contactor"}'
+```
+
+A background `MaintenanceMonitor` re-scans hourly and emits `MAINT`
+events into the standard event log on every `ok → soon → overdue`
+transition — so the Slack channel and Events feed pick them up
+automatically.
+
+### 13.3 Fuel-burn estimator
+
+A simple load-curve model (`services/fuel.py`) converts the live kW
+reading into a gallons-per-hour (diesel/LP) or scf-per-hour (NG)
+estimate. The accumulator integrates that rate over time into three
+running totals: since local midnight (day), since the first of the
+month (month), and lifetime (since the service started). At the
+current rate, when a tank percentage is available, it also projects
+how many hours remain until empty.
+
+Set the fuel type in `registers/h100.yaml`'s `site:` block:
+
+```yaml
+site:
+  # ...
+  fuel_type: diesel   # diesel | lp | ng
+```
+
+Defaults:
+- **diesel**: 0.6 gph idle + 0.07 gph/kW (~14 gph at 200 kW)
+- **lp**:    0.85 gph idle + 0.10 gph/kW
+- **ng**:    30 scfh idle + 10 scfh/kW
+
+Accuracy: ±10–15 % on a steady load. Useful for *"are we burning more
+fuel this month than last"* trending; not a custody-transfer meter.
+The model intentionally doesn't chase exact spec curves (which vary
+with altitude, temperature, and load history).
+
+Surfaced on the Live view's *Fuel burn* card and at `GET /api/fuel`.
+
+### 13.4 Host (Pi) health
+
+`GET /api/system` returns CPU temperature, load averages, memory
+utilisation, disk utilisation on the SQLite data dir, system + service
+uptime, service RSS, and the Pi's firmware-reported throttle bits
+(`under_voltage`, `arm_freq_capped`, `throttled`, `soft_temp_limit` —
+both "right now" and "since last reboot" flavours).
+
+Surfaced on the Live view's *Host health* card with severity colouring
+(amber ≥ 70 °C / 85 % util, red ≥ 80 °C / 95 % util). Lets an operator
+see the Pi degrading — under-voltage on a cheap PSU, SD card filling
+up, runaway log — *before* the monitor stops reporting.
+
+Probes are pure `/proc` / `/sys` reads with no shell-out, so the
+endpoint is safe to poll every ~10 s.
+
+### 13.5 CSV exports
+
+Three streaming CSV endpoints with UTF-8 BOM (so Excel double-clicks
+correctly), ISO-8601 timestamps in local TZ plus epoch-seconds, and a
+hard cap of 500 k rows per pull:
+
+- `GET /api/telemetry/export?from=<epoch>&to=<epoch>&columns=kw,rpm`
+- `GET /api/events/export?from=<epoch>&to=<epoch>&severity=alarm,warn`
+- `GET /api/audit/export?from=<epoch>&to=<epoch>`
+
+UI: an **Export CSV** button on the History view (uses the chart's
+current range and metric) and on the Events view (uses the active
+filters), plus a separate **Audit log** download for compliance use.
+
+### 13.6 Config backup + restore
+
+`Settings → Backup · Restore` downloads a gzipped tar of
+`/etc/genwatch` (config.yaml + any local register-map edits + a
+MANIFEST.yaml with the source hostname and version). The same tarball
+can be uploaded back on a fresh Pi after a hardware swap; the restore
+endpoint refuses path-traversal members and atomically writes each
+file. The SQLite database is **not** included — that file is big and
+has its own rsync-nightly story.
+
+```bash
+# CLI alternative (cookie auth required)
+curl -b cookies.txt -o backup.tar.gz http://localhost:8000/api/backup/download
+
+# Inspect contents
+tar tzf backup.tar.gz
+# genwatch/config.yaml
+# genwatch/MANIFEST.yaml
+# genwatch/registers/h100.yaml   (if locally edited)
+
+# Restore
+curl -b cookies.txt -F file=@backup.tar.gz \
+     http://localhost:8000/api/backup/restore
+sudo systemctl restart genwatch
+```
+
+---
+
+## 14. Development
 
 ### Local development (no hardware)
 
@@ -848,6 +1019,6 @@ All errors return JSON `{ detail: { code, message } }` with appropriate HTTP sta
 
 ---
 
-## 14. License
+## 15. License
 
 MIT — see [LICENSE](LICENSE).

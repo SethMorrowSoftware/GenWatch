@@ -94,6 +94,10 @@ class SiteConfig:
     rating_kw: int = 200
     engine: str = "Cummins QSB7-G5"
     tank_gal: int = 220
+    # 'diesel' | 'lp' | 'ng' — drives the fuel consumption estimator.
+    # Defaults to diesel to match the shipped QSB7-G5 example. Override
+    # in registers/h100.yaml's `site:` block for LP / NG installs.
+    fuel_type: str = "diesel"
     exercise_enabled: bool = True
     exercise_day: str = "sun"
     exercise_time: str = "03:00"
@@ -292,6 +296,7 @@ def load_register_map(path: Path | str) -> RegisterMap:
         rating_kw=int(site_d.get("rating_kw", 200)),
         engine=site_d.get("engine", "Cummins QSB7-G5"),
         tank_gal=int(site_d.get("tank_gal", 220)),
+        fuel_type=str(site_d.get("fuel_type", "diesel")).lower(),
         exercise_enabled=bool(ex.get("enabled", True)),
         exercise_day=str(ex.get("day", "sun")).lower(),
         exercise_time=str(ex.get("time", "03:00")),

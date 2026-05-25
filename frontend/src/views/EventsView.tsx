@@ -58,6 +58,23 @@ export function EventsView() {
           </div>
         </div>
         <div className="flex ai-c gap-8">
+          <a
+            className="btn btn-ghost"
+            href={api.exportEventsUrl({
+              severity: Object.entries(filters).filter(([, v]) => v).map(([k]) => k).join(",") || undefined,
+              type: typeFilter === "ALL" ? undefined : typeFilter,
+            })}
+            download
+          >
+            <Icon name="download" size={14} /> Export CSV
+          </a>
+          <a
+            className="btn btn-ghost"
+            href={api.exportAuditUrl()}
+            download
+          >
+            <Icon name="download" size={14} /> Audit log
+          </a>
           <button className="btn btn-ghost" onClick={refresh}><Icon name="refresh" size={14} /> Refresh</button>
         </div>
       </div>

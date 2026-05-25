@@ -169,3 +169,100 @@ export interface SlackUpdate {
   alert_on_command?: boolean;
   alert_on_comms_lost?: boolean;
 }
+
+// ─── Audit-pass features (system health, fuel, outages, maintenance) ──
+
+// GET /api/system — Pi host probes. All fields may be null when the
+// underlying /proc or /sys path isn't readable (non-Pi dev box, etc).
+export interface SystemHealth {
+  cpuTempC: number | null;
+  cpuLoad1m: number | null;
+  cpuLoad5m: number | null;
+  cpuLoad15m: number | null;
+  memTotalMb: number | null;
+  memUsedMb: number | null;
+  memUsedPct: number | null;
+  diskTotalMb: number | null;
+  diskUsedMb: number | null;
+  diskUsedPct: number | null;
+  uptimeS: number | null;
+  procUptimeS: number | null;
+  procRssMb: number | null;
+  piModel: string | null;
+  throttledRaw: number | null;
+  throttledFlags: string[];
+}
+
+// GET /api/fuel — current burn rate + running totals.
+export interface FuelStatus {
+  enabled: boolean;
+  reason?: string;
+  fuelType?: "diesel" | "lp" | "ng";
+  unit?: "gph" | "scfh";
+  rateNow?: number;
+  dayTotal?: number;
+  monthTotal?: number;
+  lifetimeTotal?: number;
+  engineRunning?: boolean;
+  tankGal?: number | null;
+  tankPct?: number | null;
+  tankRemainingUnits?: number | null;
+  hoursRemaining?: number | null;
+}
+
+export interface Outage {
+  id: number;
+  startedTs: number;
+  endedTs: number | null;
+  durationS: number | null;
+  peakKw: number;
+  kwh: number;
+  samples: number;
+  cause: string;
+  notes: string;
+}
+
+export interface OutageSummary {
+  count: number;
+  completed: number;
+  open: number;
+  totalDurationS: number;
+  totalKwh: number;
+  peakKw: number;
+  longestDurationS: number;
+}
+
+export interface MaintenanceSchedule {
+  id: number;
+  kind: string;
+  intervalHours: number;
+  intervalDays: number;
+  notes: string;
+  enabled: boolean;
+}
+
+export type MaintenanceStatus = "ok" | "soon" | "overdue" | "never";
+
+export interface MaintenanceDue {
+  kind: string;
+  intervalHours: number;
+  intervalDays: number;
+  lastTs: number | null;
+  lastRunHours: number | null;
+  hoursSince: number | null;
+  daysSince: number | null;
+  hoursToNext: number | null;
+  daysToNext: number | null;
+  status: MaintenanceStatus;
+  enabled: boolean;
+}
+
+export interface MaintenanceLogEntry {
+  id: number;
+  ts: number;
+  kind: string;
+  runHoursAt: number | null;
+  performedBy: string;
+  notes: string;
+  costUsd: number | null;
+}

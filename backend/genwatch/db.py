@@ -102,6 +102,46 @@ CREATE TABLE IF NOT EXISTS kv (
     v           TEXT NOT NULL,
     updated_at  REAL NOT NULL
 );
+
+-- Maintenance journal: scheduled service items and their completion log.
+-- Default rows seeded once at first boot from services/maintenance.py.
+CREATE TABLE IF NOT EXISTS maintenance_schedule (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind            TEXT NOT NULL UNIQUE,
+    interval_hours  INTEGER NOT NULL DEFAULT 0,
+    interval_days   INTEGER NOT NULL DEFAULT 0,
+    notes           TEXT NOT NULL DEFAULT '',
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    created_at      REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS maintenance_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              REAL NOT NULL,
+    kind            TEXT NOT NULL,
+    run_hours_at    REAL,
+    performed_by    TEXT NOT NULL DEFAULT '',
+    notes           TEXT NOT NULL DEFAULT '',
+    cost_usd        REAL
+);
+CREATE INDEX IF NOT EXISTS idx_maint_log_kind_ts ON maintenance_log(kind, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_maint_log_ts ON maintenance_log(ts DESC);
+
+-- Utility outage tracker: one row per detected outage, open until the
+-- engine returns to a non-running state. peak_kw and kwh accumulated by
+-- the OutageTracker while the row is open.
+CREATE TABLE IF NOT EXISTS outages (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_ts      REAL NOT NULL,
+    ended_ts        REAL,
+    duration_s      REAL,
+    peak_kw         REAL NOT NULL DEFAULT 0.0,
+    kwh             REAL NOT NULL DEFAULT 0.0,
+    samples         INTEGER NOT NULL DEFAULT 0,
+    cause           TEXT NOT NULL DEFAULT 'auto_start',
+    notes           TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_outages_started ON outages(started_ts DESC);
 """
 
 # Map register name -> telemetry column name. Names not present here

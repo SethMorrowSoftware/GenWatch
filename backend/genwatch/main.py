@@ -26,18 +26,27 @@ from fastapi.staticfiles import StaticFiles
 
 from . import __version__, config as cfgmod
 from .api import auth as auth_routes
+from .api import backup as backup_routes
 from .api import control as control_routes
 from .api import events as events_routes
+from .api import export as export_routes
+from .api import fuel as fuel_routes
+from .api import maintenance as maintenance_routes
+from .api import outage as outage_routes
 from .api import settings as settings_routes
 from .api import status as status_routes
+from .api import system as system_routes
 from .api import telemetry as telemetry_routes
 from .api import ws as ws_routes
 from .db import Database
 from .modbus.client import MockModbusClient, ModbusClient, SerialModbusClient, TcpRtuModbusClient
 from .modbus.poller import Poller
 from .modbus.registers import load_register_map
+from .services import maintenance as maintenance_svc
 from .services import notify
 from .services.control import ControlService
+from .services.fuel import MODELS as FUEL_MODELS, FuelAccumulator, FuelType
+from .services.outage import OutageTracker
 from .services.ratelimit import RateLimiter
 from .services.retention import RetentionService
 from .services.slack import SlackNotifier
@@ -138,6 +147,36 @@ async def lifespan(app: FastAPI):
     slack = SlackNotifier(settings.slack, db, site_name=regmap.site.name)
     control_service = ControlService(regmap, client, db, state_machine, slack=slack)
 
+    # Maintenance journal: seed the default schedule on first boot (no-op
+    # once the operator has entries) and start the hourly due-check task.
+    seeded = maintenance_svc.seed_default_schedule(db)
+    if seeded:
+        log.info("Seeded %d default maintenance schedule items", seeded)
+
+    def _get_run_hours_for_maint() -> float | None:
+        v = state_machine.snap.last_reading.values.get("run_hours")
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    maintenance_monitor = maintenance_svc.MaintenanceMonitor(db, _get_run_hours_for_maint)
+
+    # Utility outage tracker: bound to the state machine via on_transition
+    # below; samples kw on every base poll for kWh integration.
+    outage_tracker = OutageTracker(db)
+
+    # Fuel consumption estimator. Fuel type currently inferred from the
+    # site config (`fuel_type` field, default 'diesel' to match the
+    # shipped Cummins QSB7-G5 example).
+    fuel_type_raw = getattr(regmap.site, "fuel_type", None) or "diesel"
+    if fuel_type_raw not in FUEL_MODELS:
+        log.warning("Unknown fuel_type %r in site config; defaulting to diesel", fuel_type_raw)
+        fuel_type_raw = "diesel"
+    fuel_accum = FuelAccumulator(model=FUEL_MODELS[fuel_type_raw])  # type: ignore[arg-type]
+
     # WebSocket snapshot push cadence. Defaults to the prime-poll interval
     # but operators can dial back the UI refresh rate via ws_push_ms
     # (e.g. lower CPU on the Pi, or fewer updates over a slow VPN). We
@@ -155,6 +194,22 @@ async def lifespan(app: FastAPI):
             log.exception("state machine update failed: %s", e)
             emitted = []
 
+        # Fold outage-tracker reactions into the emitted event list so
+        # the existing WS / Slack fan-out picks them up.
+        for evt in list(emitted):
+            if evt.get("type") == "transition":
+                try:
+                    out_evt = outage_tracker.on_transition(
+                        from_state=str(evt.get("from", "")),
+                        to_state=str(evt.get("to", "")),
+                        panel_mode=state_machine.snap.panel_mode,
+                        ts=float(evt.get("ts") or time.time()),
+                    )
+                    if out_evt:
+                        emitted.append(out_evt)
+                except Exception as e:  # noqa: BLE001
+                    log.exception("outage tracker transition hook failed: %s", e)
+
         # Persist a wide row per *base* tier poll (every ~15s by default).
         # Prime polls don't include all metrics — we'd write mostly nulls.
         if tier == "base":
@@ -167,6 +222,21 @@ async def lifespan(app: FastAPI):
                 )
             except Exception as e:  # noqa: BLE001
                 log.exception("telemetry write failed: %s", e)
+
+            # Outage kWh integration + fuel burn estimation use the kW
+            # reading from the base poll. Cheap; ~2 SQLite writes per
+            # 15 s cadence while an outage is open, none when closed.
+            try:
+                kw_now = reading.values.get("total_kw")
+                outage_tracker.on_sample(reading.ts, kw_now)
+                fuel_accum.update(
+                    ts=reading.ts,
+                    kw=float(kw_now) if kw_now is not None else None,
+                    engine_running=state_machine.snap.engine_state
+                    in ("running", "exercising", "cooling", "cranking"),
+                )
+            except Exception as e:  # noqa: BLE001
+                log.exception("outage/fuel sample hook failed: %s", e)
 
         # Throttled snapshot push to WS subscribers (prime cadence with
         # a ws_push_ms floor). Events below still push immediately.
@@ -230,6 +300,9 @@ async def lifespan(app: FastAPI):
     app.state.login_limiter = login_limiter
     app.state.version = __version__
     app.state.started_at = time.time()
+    app.state.outage_tracker = outage_tracker
+    app.state.fuel_accum = fuel_accum
+    app.state.maintenance_monitor = maintenance_monitor
 
     if settings.mock:
         boot_mode = "mock"
@@ -241,6 +314,7 @@ async def lifespan(app: FastAPI):
     await slack.start()
     await poller.start()
     await retention.start()
+    await maintenance_monitor.start()
 
     # Signal systemd that we're ready, then start a watchdog ping task.
     # If systemd's WatchdogSec is unset (dev / non-systemd), both are no-ops.
@@ -300,6 +374,7 @@ async def lifespan(app: FastAPI):
                 pass
         await poller.stop()
         await retention.stop()
+        await maintenance_monitor.stop()
         await slack.stop()
         await client.close()
         db.write_event("info", "BOOT", "Castle Generator Monitor stopped", None)
@@ -390,6 +465,12 @@ def create_app() -> FastAPI:
     app.include_router(auth_routes.router)
     app.include_router(settings_routes.router)
     app.include_router(ws_routes.router)
+    app.include_router(system_routes.router)
+    app.include_router(fuel_routes.router)
+    app.include_router(maintenance_routes.router)
+    app.include_router(outage_routes.router)
+    app.include_router(export_routes.router)
+    app.include_router(backup_routes.router)
 
     # Static UI — mount only if the built frontend is present. In dev,
     # Vite serves itself on a different port.
