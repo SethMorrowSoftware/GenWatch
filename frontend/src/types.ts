@@ -70,7 +70,23 @@ export interface StatusBody {
     durationMin: number;
   };
   activeAlarms: ActiveAlarm[];
-  hts: { transferredToGen: boolean };
+  hts: {
+    transferredToGen: boolean;
+    lastTransferTs: number | null;
+    transfers30d: number;
+  };
+  lastAlarm: {
+    ts: number;
+    severity: Severity;
+    message: string;
+  } | null;
+  panel: {
+    mode: "auto" | "manual" | "off" | "unknown";
+    keySwitchRaw: number | null;
+    engineStatusCode: number | null;
+    activeAlarmCountHw: number | null;
+    quietTestStatusRaw: number | null;
+  };
   serverTs: number;
 }
 

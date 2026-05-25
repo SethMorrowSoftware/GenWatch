@@ -12,7 +12,7 @@ const SPECS: Record<Verb, { title: string; verb: string; danger: boolean; bullet
     title: "Confirm Remote Start", verb: "Start", danger: false,
     bullets: [
       "Engine will crank within 2 seconds",
-      "HTS-1 will transfer to GENERATOR",
+      "HTS-1 stays on UTILITY (no load transfer)",
       "Run hours will accumulate",
     ],
   },

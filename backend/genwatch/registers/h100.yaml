@@ -81,6 +81,23 @@ engine_state_bits:
   - { state: running,    register: output_status_1, mask: 0x2000 }   # Generator Running
   - { state: stopped,    register: output_status_1, mask: 0x0100 }   # Stopped
 
+# ─── Panel key-switch decoding ────────────────────────────────────────────
+# H-100 front-panel key switch position. Remote control commands from this
+# UI only engage the controller when the panel is in AUTO. If MANUAL or
+# OFF, the operator at the unit has taken local control and remote writes
+# will be ignored (and audit-logged at the controller). Surfacing this in
+# the topbar prevents the "I clicked Start but nothing happened" mystery.
+#
+# First match wins. The AUTO bit (input_status_1 mask 0x8000 — "Switch In
+# Auto") is firmly known. MANUAL (0x4000) and OFF (0x2000) bit positions
+# are typical for H-100 / genmon-derived maps; verify on your unit with
+# `genwatch panel` while toggling the physical key switch, and adjust if
+# your firmware uses a different encoding.
+panel_mode_bits:
+  - { mode: "auto",    register: input_status_1, mask: 0x8000 }
+  - { mode: "manual",  register: input_status_1, mask: 0x4000 }   # verify on your H-100
+  - { mode: "off",     register: input_status_1, mask: 0x2000 }   # verify on your H-100
+
 # ─── Alarm decoding ───────────────────────────────────────────────────────
 # Each entry is one bit in one of the output_status_N bitfield registers.
 # When the bit is set, the alarm is active. Multiple can be active at
@@ -167,7 +184,7 @@ registers:
   - { name: oil_temp,          addr: 0x008A, fc: 3, type: u32, tier: base, group: "Engine", unit: F }
   - { name: coolant_temp,      addr: 0x008C, fc: 3, type: u32, tier: base, group: "Engine", unit: F,    warn_range: [170, 210], alarm_range: [120, 235] }
   - { name: oil_pressure,      addr: 0x008E, fc: 3, type: u32, tier: base, group: "Engine", unit: psi,  warn_range: [35, 80] }
-  - { name: coolant_level,     addr: 0x0090, fc: 3, type: u32, tier: base, group: "Engine", unit: pct }
+  - { name: coolant_level,     addr: 0x0090, fc: 3, type: u32, tier: base, group: "Engine", unit: pct, scale: 0.1 }
   - { name: fuel_level_pct,    addr: 0x0092, fc: 3, type: u32, tier: base, group: "Engine", unit: pct }
   - { name: throttle_position, addr: 0x0096, fc: 3, type: u32, tier: base, group: "Engine", unit: pct }
   - { name: o2_sensor,         addr: 0x0098, fc: 3, type: u32, tier: base, group: "Engine", unit: pct }
