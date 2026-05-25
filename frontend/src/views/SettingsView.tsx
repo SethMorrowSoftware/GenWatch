@@ -85,6 +85,7 @@ export function SettingsView() {
     <>
       <div className="page-head">
         <div>
+          <div className="page-eyebrow">Configuration</div>
           <h1 className="page-title">Settings</h1>
           <div className="page-sub">
             {cfg.mock ? <span style={{ color: "var(--amber)" }}>MOCK mode (no real link) · </span> : null}

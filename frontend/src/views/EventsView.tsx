@@ -51,6 +51,7 @@ export function EventsView() {
     <>
       <div className="page-head">
         <div>
+          <div className="page-eyebrow">Audit log</div>
           <h1 className="page-title">Events &amp; Alarms</h1>
           <div className="page-sub">
             {list.length} of {events.length} events · {activeAlarms.length} active alarm{activeAlarms.length === 1 ? "" : "s"}
@@ -109,7 +110,7 @@ export function EventsView() {
             />
           ) : (
             list.map((e) => (
-              <div key={e.id} className="ev-row">
+              <div key={e.id} className="ev-row" data-sev={e.severity}>
                 <span className="ev-time">{relTime(e.ts)}</span>
                 <span className="ev-dot" data-sev={e.severity} />
                 <span className="ev-type">{e.type}</span>
