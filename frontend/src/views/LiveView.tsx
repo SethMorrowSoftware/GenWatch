@@ -381,7 +381,7 @@ function ElectricalCard({ reading: r, history, rateMs }: { reading: Reading; his
         </div>
       </div>
 
-      <div className="grid g-3" style={{ gap: 16, marginTop: 22, paddingTop: 20, borderTop: "1px solid var(--border)" }}>
+      <div className="grid g-4" style={{ gap: 16, marginTop: 22, paddingTop: 20, borderTop: "1px solid var(--border)" }}>
         <BigMetric label="Frequency" value={r.hz != null ? r.hz.toFixed(1) : "—"} unit="Hz"
                    tone={r.hz != null && r.hz > 1 ? (Math.abs(r.hz - 60) < 0.5 ? "ok" : "warn") : undefined}
                    sparkPoints={history.map((h) => h.hz ?? 0).reverse()} sparkColor="var(--green)" />
@@ -389,6 +389,9 @@ function ElectricalCard({ reading: r, history, rateMs }: { reading: Reading; his
                    sparkPoints={history.map((h) => h.kw ?? 0).reverse()} sparkColor="var(--amber)" />
         <BigMetric label="Apparent" value={fmt(r.kw != null ? Math.round(r.kw * 1.07) : null)} unit="kVA"
                    sparkPoints={history.map((h) => (h.kw ?? 0) * 1.07).reverse()} sparkColor="var(--blue)" />
+        <BigMetric label="Power factor"
+                   value={r.pf != null ? r.pf.toFixed(2) : "—"} unit="pf"
+                   sparkPoints={history.map((h) => h.pf ?? 0).reverse()} sparkColor="var(--violet)" />
       </div>
     </Card>
   );
@@ -421,14 +424,23 @@ function avgOf(xs: Array<number | null>): number {
 
 // ─── Engine card ──────────────────────────────────────────────────────────
 function EngineCard({ reading: r, history }: { reading: Reading; history: Reading[] }) {
+  // Battery range covers both 12V and 24V systems — the H-100 is wired
+  // for a 24V starting bank on most installs (~26 V float), but smaller
+  // configurations exist. We don't hard-code which; the warn range is
+  // a permissive band covering both float-charged states.
+  const battWarn: [number, number] = (r.batt ?? 0) > 18 ? [25.0, 29.5] : [12.6, 14.4];
   return (
     <Card title="Engine" sub="Cummins QSB7-G5"
           actions={<Pill tone={r.oilP != null && r.oilP < 25 && (r.rpm ?? 0) > 100 ? "alarm" : "ok"}>nominal</Pill>}>
-      <div className="grid g-2" style={{ gap: 18 }}>
-        <EngineMetric label="RPM"        value={fmt(r.rpm)}            unit="rpm" sparkPoints={history.map((h) => h.rpm ?? 0).reverse()} color="var(--green)" warnRange={[1750, 1850]} numeric={r.rpm} min={0} max={2200} />
-        <EngineMetric label="Oil pres."  value={r.oilP != null ? r.oilP.toFixed(0) : "—"} unit="psi" sparkPoints={history.map((h) => h.oilP ?? 0).reverse()} color="var(--blue)"  warnRange={[35, 80]} numeric={r.oilP} min={0} max={100} />
-        <EngineMetric label="Coolant"    value={r.coolT != null ? r.coolT.toFixed(0) : "—"} unit="°F" sparkPoints={history.map((h) => h.coolT ?? 0).reverse()} color="var(--amber)" warnRange={[170, 210]} numeric={r.coolT} min={50} max={250} />
-        <EngineMetric label="Battery"    value={r.batt != null ? r.batt.toFixed(2) : "—"} unit="V" sparkPoints={history.map((h) => h.batt ?? 0).reverse()} color="var(--violet)" warnRange={[12.6, 14.4]} numeric={r.batt} min={10} max={16} />
+      <div className="grid g-4" style={{ gap: 18 }}>
+        <EngineMetric label="RPM"           value={fmt(r.rpm)}            unit="rpm" sparkPoints={history.map((h) => h.rpm ?? 0).reverse()} color="var(--green)"  warnRange={[1750, 1850]} numeric={r.rpm}      min={0}  max={2200} />
+        <EngineMetric label="Oil pres."     value={r.oilP != null ? r.oilP.toFixed(0) : "—"} unit="psi" sparkPoints={history.map((h) => h.oilP ?? 0).reverse()} color="var(--blue)"   warnRange={[35, 80]}     numeric={r.oilP}     min={0}  max={100} />
+        <EngineMetric label="Oil temp"      value={r.oilT != null ? r.oilT.toFixed(0) : "—"} unit="°F"  sparkPoints={history.map((h) => h.oilT ?? 0).reverse()} color="var(--amber)"  warnRange={[160, 250]}   numeric={r.oilT}     min={0}  max={300} />
+        <EngineMetric label="Coolant temp"  value={r.coolT != null ? r.coolT.toFixed(0) : "—"} unit="°F" sparkPoints={history.map((h) => h.coolT ?? 0).reverse()} color="var(--amber)" warnRange={[170, 210]}   numeric={r.coolT}    min={50} max={250} />
+        <EngineMetric label="Battery"       value={r.batt != null ? r.batt.toFixed(2) : "—"} unit="V"   sparkPoints={history.map((h) => h.batt ?? 0).reverse()} color="var(--violet)" warnRange={battWarn}     numeric={r.batt}     min={10} max={32} />
+        <EngineMetric label="Charge curr."  value={r.battA != null ? r.battA.toFixed(1) : "—"} unit="A" sparkPoints={history.map((h) => h.battA ?? 0).reverse()} color="var(--green)" warnRange={[0, 25]}      numeric={r.battA}    min={-5} max={40} />
+        <EngineMetric label="Throttle"      value={r.throttle != null ? r.throttle.toFixed(0) : "—"} unit="%" sparkPoints={history.map((h) => h.throttle ?? 0).reverse()} color="var(--blue)" warnRange={[0, 100]} numeric={r.throttle} min={0}  max={100} />
+        <EngineMetric label="O₂ sensor" value={r.o2 != null ? r.o2.toFixed(0) : "—"} unit="%"     sparkPoints={history.map((h) => h.o2 ?? 0).reverse()}      color="var(--text-2)" warnRange={[0, 100]}     numeric={r.o2}       min={0}  max={100} />
       </div>
     </Card>
   );
@@ -450,12 +462,12 @@ function EngineMetric({ label, value, unit, sparkPoints, color, warnRange, numer
           </span>
         )}
       </div>
-      <div className="mono" style={{ fontSize: 30, fontWeight: 500, marginTop: 8, letterSpacing: "-0.018em",
+      <div className="mono" style={{ fontSize: 24, fontWeight: 500, marginTop: 8, letterSpacing: "-0.018em",
                                      color: inBand ? "var(--text)" : "var(--amber)" }}>
-        {value}<span style={{ fontSize: 14, color: "var(--text-3)", marginLeft: 4, fontWeight: 400 }}>{unit}</span>
+        {value}<span style={{ fontSize: 12, color: "var(--text-3)", marginLeft: 3, fontWeight: 400 }}>{unit}</span>
       </div>
       <div style={{ marginTop: 8 }}>
-        <Sparkline points={sparkPoints} width={220} height={44} color={color} />
+        <Sparkline points={sparkPoints} width={170} height={36} color={color} />
       </div>
     </div>
   );
@@ -504,15 +516,32 @@ function ControlsPanel({ state, onCommand }: {
   );
 }
 
-// ─── Fuel + maintenance card ─────────────────────────────────────────────
+// ─── Fluid levels + maintenance card ─────────────────────────────────────
 function FuelMaintCard({ reading: r, status }: { reading: Reading; status: StatusBody }) {
   const fuel = r.fuelPct ?? 0;
   const lowFuel = fuel < 25;
   const gal = Math.round(fuel * (status.site.tankGal / 100));
+  const coolLevel = r.coolLevel;
+  const lowCool = coolLevel != null && coolLevel < 50;
   return (
     <Card title="Tank · Maintenance" sub={`Local diesel · ${status.site.tankGal} gal`}>
+      <div style={{ padding: "4px 0 14px" }}>
+        <div className="label-row" style={{ padding: "0 0 8px" }}>
+          <span>Coolant level</span>
+          <span className="mono" style={{ textTransform: "none", letterSpacing: 0, color: lowCool ? "var(--amber)" : "var(--text-2)" }}>
+            {coolLevel != null ? `${coolLevel.toFixed(1)} %` : "—"}
+          </span>
+        </div>
+        <div className="fuel-bar">
+          <i style={{ width: `${coolLevel ?? 0}%`, background: lowCool ? "linear-gradient(90deg, var(--amber), var(--red))" : "linear-gradient(90deg, var(--blue), color-mix(in oklch, var(--blue) 70%, var(--green)))" }} />
+          <div className="ticks">
+            {Array.from({ length: 9 }).map((_, i) => <i key={i} />)}
+          </div>
+        </div>
+      </div>
+
       <div style={{ padding: "4px 0 16px" }}>
-        <div className="label-row" style={{ padding: "0 0 10px" }}>
+        <div className="label-row" style={{ padding: "0 0 8px" }}>
           <span>Fuel level</span>
           <span className="mono" style={{ textTransform: "none", letterSpacing: 0, color: lowFuel ? "var(--amber)" : "var(--text-2)" }}>
             {fuel.toFixed(1)} % · ~{gal} gal

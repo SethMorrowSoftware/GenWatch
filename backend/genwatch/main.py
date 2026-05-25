@@ -184,7 +184,7 @@ async def lifespan(app: FastAPI):
                     "rateMs": comms.rate_ms,
                     "p95LatencyMs": comms.p95_latency_ms,
                 },
-                "reading": _reading_to_ui(reading.values),
+                "reading": status_routes.reading_to_ui(reading.values),
             }
             await bus.publish(payload)
 
@@ -330,28 +330,7 @@ async def _forward_to_slack(slack: SlackNotifier, evt: dict) -> None:
         )
 
 
-def _reading_to_ui(values: dict) -> dict:
-    """Translate internal register names to the UI's camelCase keys.
-
-    Centralised here so we don't drift between WS and REST.
-    """
-    return {
-        "rpm": values.get("rpm"),
-        "hz": values.get("frequency"),
-        "kw": values.get("total_kw"),
-        "oilP": values.get("oil_pressure"),
-        "coolT": values.get("coolant_temp"),
-        "batt": values.get("battery_volts"),
-        "vAB": values.get("gen_voltage_ab"),
-        "vBC": values.get("gen_voltage_bc"),
-        "vCA": values.get("gen_voltage_ca"),
-        "iA": values.get("gen_current_a"),
-        "iB": values.get("gen_current_b"),
-        "iC": values.get("gen_current_c"),
-        "fuelPct": values.get("fuel_level_pct"),
-        "runHours": values.get("run_hours"),
-        "startCount": values.get("start_count"),
-    }
+# UI reading transform is owned by api/status.py — see reading_to_ui.
 
 
 def create_app() -> FastAPI:
