@@ -239,3 +239,86 @@ async def test_icd_major_mismatch_falls_back(
     sm.update(Reading(values=_h100_values("stopped")), _healthy())
     # H-100 fallback wins
     assert sm.snap.load_source == "utility"
+
+
+# ─── Event-emission de-duplication ──────────────────────────────────────
+
+
+async def test_no_duplicate_load_source_event_when_ats_authoritative(
+    h100_regmap, ats_regmap, fake_db, bus, ats_store,
+):
+    """When the ATS-Pi is the authoritative source, AtsService emits the
+    `ats-position` event for a transition; StateMachine must NOT also
+    emit a `load-source` event for the same physical change. Without
+    this, the events feed would show two rows per real-world event.
+    """
+    ats = AtsService(ats_regmap, fake_db, bus)
+    # Seed: ATS-Pi healthy, position=utility, authoritative
+    await ats.on_poll("base", ats_store.as_reading("base"), _healthy())
+    assert ats.is_authoritative()
+
+    sm = StateMachine(h100_regmap, fake_db, bus, ats_service=ats)
+    sm.update(Reading(values=_h100_values("stopped")), _healthy())
+    assert sm.snap.load_source == "utility"
+
+    # Now ATS-Pi observes a transition to generator. This emits
+    # ats-position (and writes ATS_POSITION).
+    fake_db.write_event.reset_mock()
+    ats_store.set_position("generator")
+    await ats.on_poll("prime", ats_store.as_reading("prime"), _healthy())
+
+    # AtsService should have written its ATS_POSITION row
+    ats_position_calls = [
+        c for c in fake_db.write_event.call_args_list
+        if c.kwargs.get("type_") == "ATS_POSITION"
+    ]
+    assert len(ats_position_calls) == 1
+
+    # Now the next H-100 poll comes in. StateMachine re-derives
+    # load_source via precedence → generator. The snapshot updates but
+    # NO load-source event should fire because ats is authoritative.
+    fake_db.write_event.reset_mock()
+    emitted = sm.update(
+        Reading(values=_h100_values("running", current=200, kw=150)),
+        _healthy(),
+    )
+
+    # snapshot updated
+    assert sm.snap.load_source == "generator"
+    # but no LOAD_SOURCE DB row written
+    load_source_db_calls = [
+        c for c in fake_db.write_event.call_args_list
+        if c.kwargs.get("type_") == "LOAD_SOURCE"
+    ]
+    assert load_source_db_calls == []
+    # and no load-source bus event emitted
+    bus_load_source = [e for e in emitted if e.get("type") == "load-source"]
+    assert bus_load_source == []
+
+
+async def test_load_source_event_still_emitted_when_ats_not_authoritative(
+    h100_regmap, ats_regmap, fake_db, bus, ats_store,
+):
+    """The opposite case: when ATS-Pi is the fallback (degraded or absent),
+    StateMachine must emit load-source events as before — otherwise sites
+    relying purely on H-100 telemetry would lose their event log.
+    """
+    # No ats_service at all — pure H-100 fallback
+    sm = StateMachine(h100_regmap, fake_db, bus, ats_service=None)
+    sm.update(Reading(values=_h100_values("stopped")), _healthy())
+    fake_db.write_event.reset_mock()
+
+    # Now H-100 detects a transition to loaded running
+    emitted = sm.update(
+        Reading(values=_h100_values("running", current=200, kw=150)),
+        _healthy(),
+    )
+    assert sm.snap.load_source == "generator"
+
+    load_source_calls = [
+        c for c in fake_db.write_event.call_args_list
+        if c.kwargs.get("type_") == "LOAD_SOURCE"
+    ]
+    assert len(load_source_calls) == 1
+    bus_load_source = [e for e in emitted if e.get("type") == "load-source"]
+    assert len(bus_load_source) == 1

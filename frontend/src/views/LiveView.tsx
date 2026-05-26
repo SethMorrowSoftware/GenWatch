@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api/client";
 import { Card, EmptyState, Icon, LiveTick, Pill, Sparkline, fmt, formatTimeInState } from "../components/primitives";
-import type { ActiveAlarm, EngineState, EventRow, LoadSource, Reading, StatusBody } from "../types";
+import type { ActiveAlarm, AtsMode, EngineState, EventRow, LoadSource, Reading, StatusBody } from "../types";
 import { ConfirmModal } from "./ConfirmModal";
 
 interface Props {
@@ -35,6 +35,9 @@ const STATE_SUB: Record<EngineState, string> = {
   unknown: "—",
 };
 function stateSubFor(state: EngineState, loadSource: LoadSource | undefined): string {
+  if (loadSource === "transferring") {
+    return "ATS transferring · brief load gap";
+  }
   if (state === "running" && loadSource === "utility") {
     return "Running unloaded · Pre-transfer warm-up";
   }
@@ -42,6 +45,13 @@ function stateSubFor(state: EngineState, loadSource: LoadSource | undefined): st
     return "Engine cool-down · Load on utility";
   }
   return STATE_SUB[state];
+}
+
+function loadSourceLabel(ls: LoadSource): string {
+  if (ls === "generator") return "GENERATOR";
+  if (ls === "utility") return "UTILITY";
+  if (ls === "transferring") return "TRANSFERRING…";
+  return "—";
 }
 const STATE_BADGE: Record<EngineState, string> = {
   stopped: "STOPPED",
@@ -140,7 +150,7 @@ function StatusHero({ status, history }: { status: StatusBody; history: Reading[
           <div className="state-sub">
             <strong>{stateSubFor(state, status.loadSource)}</strong>
             <span className="dot-sep" />
-            <span>HTS-1 on {status.loadSource === "generator" ? "GENERATOR" : status.loadSource === "unknown" ? "—" : "UTILITY"}</span>
+            <span>HTS-1 on {loadSourceLabel(status.loadSource)}</span>
           </div>
         </div>
         <div className="hero-load">
@@ -238,16 +248,48 @@ function AtsCard({ status }: { status: StatusBody }) {
   // quiet-test exercises (engine running, load still on utility) and
   // during the pre-transfer warm-up window.
   const onGen = status.loadSource === "generator";
+  const transferring = status.loadSource === "transferring";
   const r = status.reading;
   const loadPct = r.kw != null ? Math.round((r.kw / Math.max(1, status.site.ratingKw)) * 100) : 0;
+
+  // ATS-Pi block — when present, surface its richer signals. When
+  // ats.enabled is false, the card behaves exactly as before (driven
+  // off the H-100-derived loadSource).
+  const ats = status.ats.enabled ? status.ats : null;
+
+  // Last-transfer source preference: prefer ATS-Pi's direct observation
+  // when available; fall back to the H-100-derived event-log estimate.
+  const lastTransferTs =
+    ats?.lastTransferToGenTs ?? status.hts.lastTransferTs ?? null;
+  const transfers24h = ats?.transferCount24h;
+
+  // Status pill (top-right): describes what the switch is doing.
+  const pill = transferring
+    ? { tone: "info" as const, label: "Transferring…" }
+    : onGen
+    ? { tone: "ok" as const, label: "Transferred" }
+    : { tone: "info" as const, label: "Normal" };
+
+  // Provenance pill — shown only when an ATS-Pi is configured.
+  // Operators care which path the displayed source comes from when
+  // making decisions during commissioning or a fault.
+  const provenance = ats
+    ? ats.authoritative
+      ? { tone: "ok" as const, label: "via ATS-Pi" }
+      : ats.comms.state === "healthy"
+      ? { tone: "warn" as const, label: "ATS-Pi waiting" }
+      : { tone: "warn" as const, label: "ATS-Pi link down · using gen telemetry" }
+    : null;
+
   return (
     <Card
       title="HTS-1 Transfer Switch"
-      sub={`Source: ${onGen ? "Generator" : "Utility"} · Load ${loadPct}%`}
+      sub={`Source: ${transferring ? "Transferring…" : onGen ? "Generator" : "Utility"} · Load ${loadPct}%`}
       actions={
-        <Pill tone={status.state === "alarm" ? "alarm" : onGen ? "ok" : "info"}>
-          {onGen ? "Transferred" : "Normal"}
-        </Pill>
+        <div className="flex ai-c gap-8">
+          {provenance && <Pill tone={provenance.tone}>{provenance.label}</Pill>}
+          <Pill tone={status.state === "alarm" ? "alarm" : pill.tone}>{pill.label}</Pill>
+        </div>
       }
     >
       <div className="ats">
@@ -264,23 +306,55 @@ function AtsCard({ status }: { status: StatusBody }) {
               </linearGradient>
             </defs>
 
-            {/* Utility block */}
+            {/* Utility block — colour reflects source availability when
+                the ATS-Pi reports it: amber when reportedly unavailable. */}
             <rect x="12" y="22" width="120" height="48" rx="9"
-                  fill="var(--panel)" stroke={!onGen ? "var(--blue)" : "var(--border-2)"} strokeWidth="1.5" />
+                  fill="var(--panel)"
+                  stroke={
+                    ats && ats.normalAvailable === false ? "var(--amber)"
+                      : !onGen ? "var(--blue)"
+                      : "var(--border-2)"
+                  }
+                  strokeWidth="1.5" />
             <text x="72" y="42" textAnchor="middle" fontSize="10" fontFamily="Geist" fontWeight="600" fill="var(--text-3)" letterSpacing="2">UTILITY</text>
-            <text x="72" y="60" textAnchor="middle" fontSize="13" fontFamily="JetBrains Mono" fontWeight="500" fill="var(--text)">480 V</text>
+            <text x="72" y="60" textAnchor="middle" fontSize="13" fontFamily="JetBrains Mono" fontWeight="500" fill="var(--text)">
+              {ats && ats.normalAvailable === false ? "LOST" : "480 V"}
+            </text>
 
             {/* Generator block */}
             <rect x="12" y="98" width="120" height="48" rx="9"
-                  fill="var(--panel)" stroke={onGen ? "var(--green)" : "var(--border-2)"} strokeWidth="1.5" />
+                  fill="var(--panel)"
+                  stroke={
+                    ats && ats.emergencyAvailable === false ? "var(--amber)"
+                      : onGen ? "var(--green)"
+                      : "var(--border-2)"
+                  }
+                  strokeWidth="1.5" />
             <text x="72" y="118" textAnchor="middle" fontSize="10" fontFamily="Geist" fontWeight="600" fill="var(--text-3)" letterSpacing="2">GENERATOR</text>
             <text x="72" y="136" textAnchor="middle" fontSize="13" fontFamily="JetBrains Mono" fontWeight="500" fill="var(--text)">
-              {r.vAB != null ? Math.round(r.vAB) : 0} V
+              {ats && ats.emergencyAvailable === false ? "NOT READY"
+                : r.vAB != null ? `${Math.round(r.vAB)} V` : "0 V"}
             </text>
 
-            {/* Wires */}
-            <line x1="132" y1="46" x2="210" y2="46" stroke={!onGen ? "url(#ats-glow-b)" : "var(--border-2)"} strokeWidth="2" />
-            <line x1="132" y1="122" x2="210" y2="122" stroke={onGen ? "url(#ats-glow-g)" : "var(--border-2)"} strokeWidth="2" />
+            {/* Wires — animated dashed during transferring */}
+            <line x1="132" y1="46" x2="210" y2="46"
+                  stroke={!onGen && !transferring ? "url(#ats-glow-b)" : "var(--border-2)"}
+                  strokeWidth="2"
+                  strokeDasharray={transferring ? "5 3" : undefined}
+                  opacity={transferring ? 0.6 : 1}>
+              {transferring && (
+                <animate attributeName="stroke-dashoffset" from="0" to="-16" dur="0.6s" repeatCount="indefinite" />
+              )}
+            </line>
+            <line x1="132" y1="122" x2="210" y2="122"
+                  stroke={onGen && !transferring ? "url(#ats-glow-g)" : "var(--border-2)"}
+                  strokeWidth="2"
+                  strokeDasharray={transferring ? "5 3" : undefined}
+                  opacity={transferring ? 0.6 : 1}>
+              {transferring && (
+                <animate attributeName="stroke-dashoffset" from="0" to="-16" dur="0.6s" repeatCount="indefinite" />
+              )}
+            </line>
 
             {/* ATS block */}
             <rect x="210" y="32" width="84" height="104" rx="11"
@@ -288,16 +362,32 @@ function AtsCard({ status }: { status: StatusBody }) {
             <text x="252" y="54" textAnchor="middle" fontSize="10" fontFamily="Geist" fontWeight="600" fill="var(--text-3)" letterSpacing="2">ATS</text>
             <text x="252" y="68" textAnchor="middle" fontSize="9" fontFamily="JetBrains Mono" fill="var(--text-4)">HTS-1</text>
 
-            {/* Contacts */}
-            <circle cx="226" cy="86" r="3.5" fill={!onGen ? "var(--blue)" : "var(--text-4)"} />
-            <circle cx="226" cy="116" r="3.5" fill={onGen ? "var(--green)" : "var(--text-4)"} />
+            {/* Contacts — mid-position during transferring */}
+            <circle cx="226" cy="86" r="3.5"
+                    fill={!onGen && !transferring ? "var(--blue)" : "var(--text-4)"} />
+            <circle cx="226" cy="116" r="3.5"
+                    fill={onGen && !transferring ? "var(--green)" : "var(--text-4)"} />
             <circle cx="278" cy="101" r="3.5" fill="var(--text-2)" />
-            <line x1="226" y1={onGen ? 116 : 86} x2="278" y2="101"
-                  stroke={onGen ? "var(--green)" : "var(--blue)"} strokeWidth="2.5" strokeLinecap="round" />
+            {!transferring && (
+              <line x1="226" y1={onGen ? 116 : 86} x2="278" y2="101"
+                    stroke={onGen ? "var(--green)" : "var(--blue)"}
+                    strokeWidth="2.5" strokeLinecap="round" />
+            )}
+            {transferring && (
+              <line x1="226" y1={101} x2="278" y2="101"
+                    stroke="var(--amber)" strokeWidth="2.5" strokeLinecap="round"
+                    strokeDasharray="4 3">
+                <animate attributeName="stroke-dashoffset" from="0" to="-14" dur="0.4s" repeatCount="indefinite" />
+              </line>
+            )}
 
             {/* Load wire */}
             <line x1="294" y1="84" x2="378" y2="84"
-                  stroke={onGen ? "url(#ats-glow-g)" : "url(#ats-glow-b)"} strokeWidth="2" />
+                  stroke={transferring ? "var(--amber)"
+                    : onGen ? "url(#ats-glow-g)"
+                    : "url(#ats-glow-b)"}
+                  strokeWidth="2"
+                  opacity={transferring ? 0.5 : 1} />
 
             {/* Load block */}
             <rect x="378" y="60" width="90" height="48" rx="9"
@@ -307,6 +397,25 @@ function AtsCard({ status }: { status: StatusBody }) {
           </svg>
         </div>
 
+        {/* Source-availability + mode chips, only when the ATS-Pi is
+            present. These are the signals you can't derive from the
+            H-100 alone — utility-side health, manual lockout, etc. */}
+        {ats && (
+          <div className="ats-chips" style={{
+            display: "flex", gap: 10, padding: "8px 4px 12px", flexWrap: "wrap",
+          }}>
+            <SourceChip label="Normal" available={ats.normalAvailable} />
+            <SourceChip label="Emergency" available={ats.emergencyAvailable} />
+            <ModeChip mode={ats.atsMode} />
+            {ats.engineStartCalling && (
+              <Pill tone="info">ATS calling engine start</Pill>
+            )}
+            {ats.faultCodes.map((c) => (
+              <Pill key={c} tone="warn">{c.replace(/^ATS_PI_/, "")}</Pill>
+            ))}
+          </div>
+        )}
+
         <div className="ats-grid">
           <div className="ats-stat">
             <div className="l">Load</div>
@@ -315,17 +424,35 @@ function AtsCard({ status }: { status: StatusBody }) {
           <div className="ats-stat">
             <div className="l">Last transfer</div>
             <div className="v dim">
-              {status.hts.lastTransferTs != null ? relTime(status.hts.lastTransferTs) : "—"}
+              {lastTransferTs != null ? relTime(lastTransferTs) : "—"}
             </div>
           </div>
           <div className="ats-stat">
-            <div className="l">Transfers (30d)</div>
-            <div className="v">{status.hts.transfers30d}</div>
+            <div className="l">{transfers24h !== undefined ? "Transfers (24h)" : "Transfers (30d)"}</div>
+            <div className="v">{transfers24h ?? status.hts.transfers30d}</div>
           </div>
         </div>
       </div>
     </Card>
   );
+}
+
+function SourceChip({ label, available }: { label: string; available: boolean | null | undefined }) {
+  if (available === null || available === undefined) {
+    return <Pill tone="info">{label}: —</Pill>;
+  }
+  return (
+    <Pill tone={available ? "ok" : "warn"}>
+      {label}: {available ? "available" : "lost"}
+    </Pill>
+  );
+}
+
+function ModeChip({ mode }: { mode: AtsMode }) {
+  if (mode === "auto") return <Pill tone="ok">ATS · AUTO</Pill>;
+  if (mode === "manual") return <Pill tone="warn">ATS · MANUAL</Pill>;
+  if (mode === "test") return <Pill tone="info">ATS · TEST</Pill>;
+  return <Pill tone="info">ATS · mode unknown</Pill>;
 }
 
 // ─── Alarm strip ──────────────────────────────────────────────────────────

@@ -232,6 +232,36 @@ async def lifespan(app: FastAPI):
                 "activeAlarmCountHw": reading.values.get("active_alarm_count"),
                 "quietTestStatusRaw": reading.values.get("quiettest_status"),
             }
+            # ATS-Pi block — only emitted when the companion service is
+            # active so non-ATS sites don't pay the payload cost. Mirrors
+            # the shape in api/status.py so the frontend can consume it
+            # identically whether it arrives via REST seed or WS push.
+            ats_push: dict | None = None
+            if ats_service is not None:
+                a = ats_service.snap
+                ats_push = {
+                    "enabled": True,
+                    "position": a.position,
+                    "normalAvailable": a.normal_available,
+                    "emergencyAvailable": a.emergency_available,
+                    "engineStartCalling": a.engine_start_calling,
+                    "atsMode": a.ats_mode,
+                    "faultCodes": sorted(a.fault_codes),
+                    "lastTransferToGenTs": a.last_transfer_to_gen_ts,
+                    "lastRetransferToUtilTs": a.last_retransfer_to_util_ts,
+                    "transferCount24h": a.transfer_count_24h,
+                    "transferCountLifetime": a.transfer_count_lifetime,
+                    "cmdTestActive": a.cmd_test_active,
+                    "cmdInhibitActive": a.cmd_inhibit_active,
+                    "cmdForceTransferActive": a.cmd_force_transfer_active,
+                    "cmdBypassDelayActive": a.cmd_bypass_delay_active,
+                    "comms": {
+                        "state": a.comms.state,
+                        "successPct": a.comms.success_pct,
+                    },
+                    "authoritative": ats_service.is_authoritative(),
+                }
+
             payload = {
                 "type": "snapshot",
                 "ts": reading.ts,
@@ -252,6 +282,7 @@ async def lifespan(app: FastAPI):
                 },
                 "reading": status_routes.reading_to_ui(reading.values),
                 "panel": panel,
+                "ats": ats_push,
             }
             await bus.publish(payload)
 
