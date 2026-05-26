@@ -126,6 +126,76 @@ def test_notify_watchdog_interval_parses_usec(monkeypatch):
     assert notify.watchdog_interval_s() is None
 
 
+# ─── Watchdog ping-decision logic (audit H1) ──────────────────────────────
+
+
+def test_watchdog_pings_during_cold_start_grace():
+    """Boot window: no prime poll has succeeded yet, but we're still
+    within the cold-start grace. Ping so systemd doesn't kill us before
+    the bridge has a chance to come up."""
+    should_ping, reason = notify.should_ping_watchdog(
+        mono_last_prime_good=None,
+        service_start_mono=1000.0,
+        now_mono=1010.0,           # 10 s into grace
+        stale_after_s=10.0,
+        cold_start_grace_s=300.0,
+    )
+    assert should_ping is True
+    assert reason is None
+
+
+def test_watchdog_withholds_when_cold_start_grace_exhausted():
+    """Misconfigured host (wrong IP, etc.): the first prime poll never
+    arrives. Past the grace, withhold pings so systemd restart-loops
+    the unit instead of leaving it silently zombie."""
+    should_ping, reason = notify.should_ping_watchdog(
+        mono_last_prime_good=None,
+        service_start_mono=1000.0,
+        now_mono=1000.0 + 301.0,   # 1 s past 5 min grace
+        stale_after_s=10.0,
+        cold_start_grace_s=300.0,
+    )
+    assert should_ping is False
+    assert reason is not None
+    assert "300" in reason and "genwatch doctor" in reason
+
+
+def test_watchdog_pings_in_steady_state():
+    """Normal operation: prime poll succeeded recently, well within
+    stale_after."""
+    should_ping, reason = notify.should_ping_watchdog(
+        mono_last_prime_good=1050.0,
+        service_start_mono=1000.0,
+        now_mono=1055.0,           # 5 s since last good prime
+        stale_after_s=10.0,
+        cold_start_grace_s=300.0,
+    )
+    assert should_ping is True
+    assert reason is None
+
+
+def test_watchdog_withholds_on_silent_poll_loop():
+    """The deadlocked-poller case the watchdog was designed for: prime
+    poll did succeed once but the loop has gone silent past stale_after."""
+    should_ping, reason = notify.should_ping_watchdog(
+        mono_last_prime_good=1000.0,
+        service_start_mono=900.0,  # well past grace
+        now_mono=1050.0,           # 50 s of silence
+        stale_after_s=10.0,
+        cold_start_grace_s=300.0,
+    )
+    assert should_ping is False
+    assert reason is not None
+    assert "50" in reason  # silence value reported
+
+
+def test_watchdog_grace_default_is_five_minutes():
+    """Pin the default to 5 minutes — explicit value the audit picked
+    based on real bridge/network boot timings. A future bump should be
+    a deliberate, reviewed change rather than a silent drift."""
+    assert notify.WATCHDOG_COLD_START_GRACE_S == 300.0
+
+
 # ─── No silent mock fallback ──────────────────────────────────────────────
 
 

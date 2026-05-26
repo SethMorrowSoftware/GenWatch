@@ -346,12 +346,21 @@ async def lifespan(app: FastAPI):
         # A simple `poller.is_running` flag isn't enough: a deadlocked
         # poll task keeps the flag True while telemetry freezes.
         stale_after = max(10.0, (regmap.prime_poll_ms / 1000.0) * 6.0)
+        # Captured at watchdog-loop start so the cold-start grace is
+        # measured from when *this* lifespan started, not from process
+        # boot — important across systemd restarts where Python is
+        # respawned but the monotonic clock isn't reset.
+        service_start_mono = time.monotonic()
 
         async def _watchdog_loop() -> None:
             log.info(
-                "sd_notify watchdog ticker every %.1fs (stale_after=%.1fs)",
-                interval, stale_after,
+                "sd_notify watchdog ticker every %.1fs "
+                "(stale_after=%.1fs, cold_start_grace=%.0fs)",
+                interval, stale_after, notify.WATCHDOG_COLD_START_GRACE_S,
             )
+            # Track regime so we only log on transitions instead of
+            # spamming the journal every interval while withholding.
+            withholding = False
             while True:
                 try:
                     await asyncio.sleep(interval)
@@ -359,23 +368,24 @@ async def lifespan(app: FastAPI):
                     return
                 if not poller.is_running:
                     continue
-                mono_last = poller.health.last_prime_good_monotonic
-                # On first start the link may legitimately take a while to
-                # come up; we ping during this grace period so systemd
-                # doesn't kill us before the first prime poll completes.
-                if mono_last is None:
+                should_ping, reason = notify.should_ping_watchdog(
+                    mono_last_prime_good=poller.health.last_prime_good_monotonic,
+                    service_start_mono=service_start_mono,
+                    now_mono=time.monotonic(),
+                    stale_after_s=stale_after,
+                )
+                if should_ping:
                     notify.watchdog()
-                    continue
-                silence = time.monotonic() - mono_last
-                if silence <= stale_after:
-                    notify.watchdog()
+                    if withholding:
+                        log.info("watchdog: pings resumed (prime poll recovered)")
+                        withholding = False
                 else:
-                    # Stop pinging — systemd will SIGKILL and restart us.
-                    log.warning(
-                        "watchdog: prime poll silent for %.1fs (>%.1fs); "
-                        "withholding ping so systemd can restart",
-                        silence, stale_after,
-                    )
+                    if not withholding:
+                        log.warning(
+                            "watchdog: withholding ping so systemd can "
+                            "restart us — %s", reason,
+                        )
+                        withholding = True
         watchdog_task = asyncio.create_task(_watchdog_loop(), name="sd-watchdog")
 
     try:

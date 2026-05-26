@@ -59,3 +59,56 @@ def watchdog_interval_s() -> float | None:
         return float(usec) / 1_000_000 / 2.0
     except ValueError:
         return None
+
+
+# Maximum time we tolerate "no prime poll has succeeded yet" before
+# withholding the watchdog ping and letting systemd restart us. The
+# legitimate use of the cold-start grace is a slow-to-boot Modbus
+# bridge / network coming up after the Pi (DHCP, Lantronix firmware
+# init, etc.) — those resolve well under a minute in practice. Five
+# minutes leaves comfortable headroom for unusual cases while bounding
+# how long a misconfigured host (wrong IP, wrong port) can keep the
+# service "healthy" to systemd. Past the cap, systemd's `Restart=always`
+# + `StartLimitBurst=10 / IntervalSec=600` will eventually flip the
+# unit to `failed`, surfacing the misconfiguration to the operator
+# instead of leaving the service silently zombie.
+WATCHDOG_COLD_START_GRACE_S = 300.0
+
+
+def should_ping_watchdog(
+    *,
+    mono_last_prime_good: float | None,
+    service_start_mono: float,
+    now_mono: float,
+    stale_after_s: float,
+    cold_start_grace_s: float = WATCHDOG_COLD_START_GRACE_S,
+) -> tuple[bool, str | None]:
+    """Pure decision: should the watchdog loop ping systemd this tick?
+
+    Returns ``(should_ping, withhold_reason)``. When ``should_ping`` is
+    False the caller withholds the ping (so systemd's WatchdogSec elapses
+    and SIGKILLs the unit) and logs ``withhold_reason`` at warning level
+    for diagnostic context.
+
+    Three regimes:
+
+    1. **Cold-start grace** — ``mono_last_prime_good is None`` and we're
+       still within ``cold_start_grace_s`` of service start. Ping
+       (legitimate boot window before the first prime poll lands).
+    2. **Cold-start cap exceeded** — ``mono_last_prime_good is None``
+       past the grace. Withhold; this is the misconfigured-host case.
+    3. **Steady state** — at least one prime poll has succeeded.
+       Withhold iff that success was more than ``stale_after_s`` ago.
+    """
+    if mono_last_prime_good is None:
+        if now_mono - service_start_mono <= cold_start_grace_s:
+            return True, None
+        return False, (
+            f"no prime poll completed in {cold_start_grace_s:.0f}s since "
+            "service start — check modbus_tcp.host / serial.device or run "
+            "`sudo genwatch doctor`"
+        )
+    silence = now_mono - mono_last_prime_good
+    if silence <= stale_after_s:
+        return True, None
+    return False, f"prime poll silent for {silence:.1f}s (>{stale_after_s:.1f}s)"
