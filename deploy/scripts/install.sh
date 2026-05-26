@@ -107,7 +107,20 @@ case "$OS_TAG" in
   debian-bookworm|raspbian-bookworm|debian-trixie|raspbian-trixie)
     ;;
   *)
-    warn "Unsupported OS tag '$OS_TAG' — proceeding anyway. Bookworm or newer is recommended."
+    # Pre-Bookworm distros ship systemd <243, which doesn't understand
+    # `RebootWatchdogSec` in our hwwatchdog drop-in (and may reject
+    # other modern hardening directives). Continuing on a "looks
+    # plausible" install previously left those features silently
+    # inactive — the operator only found out via journalctl. Fail
+    # fast with an actionable message instead. Override at your own
+    # risk by setting GENWATCH_ALLOW_UNSUPPORTED_OS=1.
+    if [[ "${GENWATCH_ALLOW_UNSUPPORTED_OS:-0}" == "1" ]]; then
+      warn "Unsupported OS tag '$OS_TAG' but GENWATCH_ALLOW_UNSUPPORTED_OS=1 — proceeding."
+    else
+      err "Unsupported OS tag '$OS_TAG'. GenWatch supports Raspberry Pi OS / Debian Bookworm or Trixie."
+      err "Set GENWATCH_ALLOW_UNSUPPORTED_OS=1 to override at your own risk (hardware watchdog may not configure correctly)."
+      exit 1
+    fi
     ;;
 esac
 
@@ -153,7 +166,20 @@ install -d -m 0750 -o "$USER" -g "$USER" "$ETC_DIR"
 # as root by a manual `genwatch doctor`) would keep its old owner and
 # break the service with "attempt to write a readonly database". Force
 # consistent ownership on every install.
-chown -R "$USER:$USER" "$DATA_DIR" "$LOG_DIR" "$ETC_DIR"
+#
+# DATA_DIR / LOG_DIR: recursive chown is fine — we own everything in
+# them (SQLite DBs, logs we wrote). ETC_DIR: only chown files that
+# WE manage. An operator may drop a sensitive file (root:root 0600)
+# into /etc/genwatch (e.g. a hand-managed secrets shim, an Ansible-
+# placed override). Recursively chowning to genwatch:genwatch would
+# silently widen its trust boundary, exposing anything inside to a
+# future RCE in the service. Scoping the chown to our own files
+# preserves operator-placed artifacts intact.
+chown -R "$USER:$USER" "$DATA_DIR" "$LOG_DIR"
+chown "$USER:$USER" "$ETC_DIR"
+if [[ -f "$ETC_DIR/config.yaml" ]]; then
+  chown "$USER:$USER" "$ETC_DIR/config.yaml"
+fi
 
 # ─── 4. Frontend bundle ───────────────────────────────────────────────────
 # Build if dist is missing or older than any source file.
@@ -173,7 +199,15 @@ fi
 if (( build_needed )); then
   log "Building frontend bundle (this can take ~30 s on a Pi 4)"
   pushd "$REPO_ROOT/frontend" >/dev/null
-  npm install --no-audit --no-fund --silent
+  # `npm ci` (rather than `npm install`) requires package-lock.json,
+  # refuses to write to it, and installs exactly the locked versions
+  # — reproducible builds across reinstalls and across customer Pis.
+  # `--ignore-scripts` blocks any pre/postinstall scripts from running
+  # under root (the installer runs as root). Vite, React, and the
+  # TypeScript toolchain are pure-JS at build time and don't need
+  # postinstall hooks; if a future dep does, the build will fail
+  # loudly and we can re-evaluate that specific case.
+  npm ci --no-audit --no-fund --ignore-scripts --silent
   npm run build
   popd >/dev/null
 fi
@@ -187,7 +221,18 @@ if [[ ! -d "$APP_DIR/venv" ]]; then
   python3 -m venv "$APP_DIR/venv"
 fi
 "$APP_DIR/venv/bin/pip" install --quiet --upgrade pip wheel
-retry "$APP_DIR/venv/bin/pip" install --quiet --upgrade -r "$REPO_ROOT/backend/requirements.txt"
+# Prefer the hash-pinned lockfile when present (Bookworm-fresh installs
+# from the repo). The lockfile pins every transitive dep with a sha256
+# so a compromised mirror or typosquat can't substitute a different
+# wheel for a pinned version. Fall back to requirements.txt for older
+# clones that predate the lockfile (the next `git pull && install.sh`
+# will pick up the lock automatically).
+if [[ -f "$REPO_ROOT/backend/requirements.lock" ]]; then
+  retry "$APP_DIR/venv/bin/pip" install --quiet --require-hashes -r "$REPO_ROOT/backend/requirements.lock"
+else
+  warn "backend/requirements.lock not found — installing from requirements.txt without hash pinning"
+  retry "$APP_DIR/venv/bin/pip" install --quiet --upgrade -r "$REPO_ROOT/backend/requirements.txt"
+fi
 
 log "Copying backend package to $APP_DIR/genwatch"
 rsync -a --delete \

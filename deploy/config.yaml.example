@@ -153,7 +153,10 @@ ws_push_ms: 1500
 ats:
   enabled: false
   host: 192.168.1.250
-  port: 502
+  # Companion starter defaults to 5020 (high port, no root needed on
+  # the companion). If you've explicitly configured the companion for
+  # 502 (the Modbus TCP convention), switch this to 502 to match.
+  port: 5020
   framer: socket            # Modbus/TCP (MBAP). 'rtu' only for RTU-over-TCP.
   slave: 1
   register_file: registers/ats_pi.yaml
