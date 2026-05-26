@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| **Version** | 1.0 |
-| **Status** | Draft — pending ICD sign-off |
+| **Version** | 1.1 |
+| **Status** | Phase 1 + Phase 2 **shipped**; Phase 3 pending companion write-side. |
 | **Companion document** | [`ats-pi-icd.md`](./ats-pi-icd.md) — the wire contract |
 | **Supersedes (partially)** | [`asco-series-300.md`](./asco-series-300.md) Path B sections 3-5, for sites with an ATS-Pi |
 
@@ -91,7 +91,9 @@ Each phase is independently shippable and individually revertible (via the `ats.
 | **Blocker for** | Phase 1 onwards. |
 | **Acceptance** | Both teams have committed to the ICD as written or with explicit deltas captured in the doc. |
 
-### Phase 1 — Read-only ATS observation
+### Phase 1 — Read-only ATS observation ✅ Shipped
+
+Landed on `main` in commit `4b2583d` (read-only consumer + companion-repo starter). Phase-1 read-only signalling in the UI followed in `9272033`.
 
 | | |
 |---|---|
@@ -102,7 +104,9 @@ Each phase is independently shippable and individually revertible (via the `ats.
 | **Files modified** | `backend/genwatch/config.py` (+1 model, +1 field); `backend/genwatch/main.py` (lifespan additions, guarded by flag); `backend/genwatch/api/status.py` (new `ats` block when enabled). |
 | **Acceptance criteria** | (1) With `ats.enabled: true` and a mock ATS-Pi serving the ICD register layout on `localhost:5020`, `GET /api/status` returns a populated `ats` block. (2) With `ats.enabled: false`, behaviour is byte-identical to the previous release. (3) ATS link going down does not affect the H-100 poller or generator state machine — verified by killing the mock mid-run. (4) `icd_version_major` mismatch logs an error and refuses to start the ATS poller; H-100 monitoring continues normally. (5) New unit tests pass; existing 91 backend tests still pass. |
 
-### Phase 2 — UI surface for read-side data
+### Phase 2 — UI surface for read-side data ✅ Shipped
+
+Landed on `main` in commit `a106ef3` (Live view consumes the ATS block). Cross-check between ATS position and H-100 output followed in `d0fe91a` and was refined in audit Batch 1 (PR #37) to avoid false-positives during the ASCO retransfer-delay window.
 
 | | |
 |---|---|
@@ -112,7 +116,9 @@ Each phase is independently shippable and individually revertible (via the `ats.
 | **Files modified** | `frontend/src/types.ts` (add `AtsBlock` type, extend snapshot WS message); `frontend/src/hooks/useLiveData.ts` (merge ATS data from snapshots and `load-source` events); `frontend/src/views/LiveView.tsx` (ATS card additions); `backend/genwatch/services/state.py` (loadSource precedence change). |
 | **Acceptance criteria** | (1) With healthy ATS-Pi mock, the HTS-1 pill on the Live view reflects the ATS-Pi's `position` value, not the H-100-derived one. (2) With ATS-Pi unreachable, the badge silently falls back to H-100 derivation and shows a small "(via gen telemetry)" subscript. (3) `UTILITY_LOST` / `UTILITY_RESTORED` events appear in the events feed within one prime-poll cycle of the simulated state change. (4) Slack receives a message on each transition, gated by the existing `alert_on_load_source_change` flag. (5) Frontend `tsc --noEmit` passes; build passes. |
 
-### Phase 3 — Bidirectional commands
+### Phase 3 — Bidirectional commands ⏳ Pending
+
+Blocked on the companion side: `docs/integrations/ats-pi-companion-starter/src/atspi/io_adam.py` is currently `NotImplementedError`. Once the companion repo lands a real ADAM-6060 driver and exposes the write-side ICD registers, this phase is GenWatch-side wiring (estimate 1 day).
 
 | | |
 |---|---|
