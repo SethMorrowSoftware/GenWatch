@@ -154,12 +154,29 @@ class StateMachine:
 
         The state machine just looks up register values by name and reads
         the YAML's engine_state_bits / alarm_bits / panel_mode_bits rules.
-        Swapping the reference is enough — Python attribute assignment is
-        atomic under the GIL, and the next update() call will use the
-        new rules. Cleared alarms whose codes no longer exist in the new
-        map will be reaped naturally on the next diff.
+        Swapping the reference is atomic under the GIL, and the next
+        update() call will use the new rules.
+
+        Reset the debounce counters but NOT the raised-this-session set.
+
+        - ``_alarm_poll_counts`` must reset, otherwise an operator
+          iterating on YAML (remove a rule, fix a bit position, re-add
+          it on the next save) could see the alarm fire instantly on
+          the first poll after the second reload because the counter
+          from before the first reload was still accumulating —
+          bypassing the ``min_poll_count`` debounce that exists
+          specifically to ride out transient bit flickers.
+
+        - ``_raised_this_session`` must be preserved. It tracks codes
+          we've called ``db.raise_alarm()`` on so we know to call
+          ``db.clear_alarm()`` when the underlying bit eventually goes
+          low. Wiping it would leak ``alarms_active`` rows for alarms
+          raised before the reload — the bit-goes-low cleanup loop in
+          update() iterates this set, so anything not in it never
+          gets cleared from the DB.
         """
         self.regmap = new_regmap
+        self._alarm_poll_counts.clear()
 
     def _derive_load_source(self, values: dict, engine_state: str, prev: str) -> str:
         """Dispatcher: prefer the ATS-Pi's direct position reading when
