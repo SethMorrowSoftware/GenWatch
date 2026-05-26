@@ -70,8 +70,23 @@ export const api = {
     request<{ alarms: Array<{ code: string; desc: string; severity: string; raised_at: number; raw: number }> }>(
       "/api/alarms?active=true"
     ),
-  ackAlarm: (code: string) =>
-    request<{ ok: boolean }>(`/api/alarms/${encodeURIComponent(code)}/ack`, { method: "POST" }),
+  ackAlarm: async (code: string) => {
+    // Server requires a fresh confirm_token on /api/alarms/{code}/ack
+    // (same gate as start/stop/transfer). The token is single-use,
+    // operator-bound, and 30s-TTL — issued via /api/control/confirm
+    // and consumed by the ack POST. Cross-site attackers can't read
+    // the confirm response body (same-origin policy), so chaining
+    // confirm→ack also closes the CSRF hole on this endpoint that
+    // existed when only an authenticated session was required.
+    const tok = await request<ConfirmToken>("/api/control/confirm");
+    return request<{ ok: boolean }>(
+      `/api/alarms/${encodeURIComponent(code)}/ack`,
+      {
+        method: "POST",
+        body: JSON.stringify({ confirm_token: tok.token }),
+      }
+    );
+  },
   alarmCodes: () =>
     request<{ codes: Array<{ code: string; desc: string; severity: string }> }>("/api/alarm-codes"),
 

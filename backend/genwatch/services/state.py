@@ -575,12 +575,25 @@ class StateMachine:
             ats_pos == "generator"
             and current_val < LOAD_OFF_CURRENT_THRESHOLD
             and kw_val < LOAD_OFF_KW_THRESHOLD
+            # Only treat ats=generator + zero-output as a fault when
+            # utility is ALSO unavailable. With utility present this is
+            # the normal ASCO retransfer-delay window: utility restored,
+            # ATS is still on `generator` waiting for its retransfer
+            # timer to expire, building load may briefly drop to zero.
+            # Without this gate the alarm fires on every legitimate
+            # utility-restore cycle. The failure mode worth catching —
+            # a stuck aux contact telling us we're on generator while
+            # the building actually has no power — is only diagnosable
+            # when utility is also reported as gone (normal_available
+            # is False).
+            and self.ats.snap.normal_available is False
         ):
             disagreement_msg = (
-                f"ATS reports GENERATOR but H-100 output is "
-                f"{kw_val:.1f} kW / {current_val:.1f} A. "
-                "Likely a stuck ATS aux contact, or load was shed but "
-                "the ATS never retransferred."
+                f"ATS reports GENERATOR with utility UNAVAILABLE but "
+                f"H-100 output is {kw_val:.1f} kW / {current_val:.1f} A. "
+                "Likely a stuck ATS aux contact (claiming generator "
+                "while the building actually has no power) or a broken "
+                "kW/A sensor on the H-100."
             )
 
         if disagreement_msg is not None:

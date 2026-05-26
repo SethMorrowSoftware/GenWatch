@@ -4,7 +4,9 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel
 
+from ..services.control import ControlError
 from .deps import Principal, require_operator
 
 log = logging.getLogger("genwatch.api.events")
@@ -60,10 +62,15 @@ async def alarm_codes(request: Request) -> dict:
     }
 
 
+class AckBody(BaseModel):
+    confirm_token: str
+
+
 @router.post("/alarms/{code}/ack")
 async def ack_alarm(
     request: Request,
     code: str,
+    body: AckBody,
     p: Principal = Depends(require_operator),
 ) -> dict:
     """Acknowledge an active alarm.
@@ -74,6 +81,14 @@ async def ack_alarm(
     (a re-raise on the next poll is harmless), but issuing the hardware
     write is what actually un-latches the alarm at the controller so the
     panel light goes out.
+
+    Two-step confirm: the operator must have issued a fresh token via
+    GET /api/control/confirm and supplied it in the body. Same gate as
+    the start/stop/exercise/transfer control endpoints — an alarm ack
+    is a write to the controller and a misclick on an active shutdown
+    alarm could re-enable a remote-start path the unit was holding
+    off. The confirm-token also defeats CSRF on this state-changing
+    endpoint regardless of cookie SameSite posture.
 
     If `ack_alarm` is not defined in the register map, we fall back to a
     local-only clear and log a warning — the H-100 will keep re-raising the
@@ -86,9 +101,19 @@ async def ack_alarm(
     db = request.app.state.db
     regmap = request.app.state.regmap
     client = request.app.state.client
+    ctl_service = request.app.state.control
 
     if code not in {a["code"] for a in db.active_alarms()}:
         raise HTTPException(404, f"alarm {code} not active")
+
+    # Validate + consume the confirm token before touching hardware.
+    # consume_token takes the control service's lock so the token is
+    # consumed atomically — the same operator's parallel ack attempt
+    # with the same token will see token_invalid.
+    try:
+        await ctl_service.consume_token(body.confirm_token, p.operator)
+    except ControlError as e:
+        raise HTTPException(e.http_status, detail={"code": e.code, "message": str(e)})
 
     ctl = regmap.controls.get("ack_alarm")
     hw_ack = False

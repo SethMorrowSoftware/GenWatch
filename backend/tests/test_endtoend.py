@@ -138,6 +138,89 @@ async def test_control_rejected_when_panel_not_auto(client, app_env):
             assert "MANUAL" in detail["message"]
 
 
+async def test_alarm_ack_requires_confirm_token(client, app_env):
+    """POST /api/alarms/{code}/ack writes Modbus (FC16 0x012E ← 0x0001).
+    Like the other control verbs it must be gated on a fresh confirm
+    token — a misclick on an active shutdown alarm could re-enable a
+    remote-start path the controller was holding off. Also closes the
+    CSRF hole that exists when the cookie's SameSite is set to lax."""
+    from genwatch.main import create_app
+
+    app = create_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        async with app.router.lifespan_context(app):
+            await asyncio.sleep(0.3)
+            await _login(c)
+
+            # Seed an active alarm to ack — the mock isn't running with
+            # any H-100 alarm bits set, so just write to the DB directly.
+            app.state.db.raise_alarm("COMMON_ALARM", "Common Alarm", "alarm", 1)
+
+            # No body / missing confirm_token → 422 (Pydantic validation)
+            r = await c.post("/api/alarms/COMMON_ALARM/ack", json={})
+            assert r.status_code == 422
+
+            # Bogus confirm_token → 400 token_invalid
+            r = await c.post(
+                "/api/alarms/COMMON_ALARM/ack",
+                json={"confirm_token": "BADTOKEN"},
+            )
+            assert r.status_code == 400, r.text
+            assert r.json()["detail"]["code"] == "token_invalid"
+
+            # Fresh token from /api/control/confirm → 200
+            r = await c.get("/api/control/confirm")
+            tok = r.json()["token"]
+            r = await c.post(
+                "/api/alarms/COMMON_ALARM/ack",
+                json={"confirm_token": tok},
+            )
+            assert r.status_code == 200, r.text
+            assert r.json()["ok"] is True
+
+
+async def test_control_state_check_runs_against_fresh_snap(client, app_env):
+    """If snap.engine_state changes after a request enters the control
+    service but before the lock is granted, the gate must reject using
+    the latest value, not the value observed pre-lock. Without the
+    in-lock re-check, two concurrent Start requests both observing
+    engine=stopped pre-lock would both consume their tokens and both
+    write to the H-100."""
+    from genwatch.main import create_app
+
+    app = create_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        async with app.router.lifespan_context(app):
+            await asyncio.sleep(0.3)
+            await _login(c)
+
+            # Simulate the race: pre-set engine_state to "running" so
+            # the start request must be rejected based on the value the
+            # gate reads UNDER the lock (not whatever the operator's UI
+            # was showing when they clicked).
+            app.state.state_machine.snap.engine_state = "running"
+
+            r = await c.get("/api/control/confirm")
+            tok = r.json()["token"]
+            r = await c.post(
+                "/api/control/start", json={"confirm_token": tok}
+            )
+            assert r.status_code == 409, r.text
+            assert r.json()["detail"]["code"] == "invalid_state"
+
+            # Token must NOT have been consumed — the gate-fail path
+            # is supposed to bail out before _consume_token_locked
+            # runs. Try a fresh request with engine_state allowing
+            # start and the same token — should still be valid.
+            app.state.state_machine.snap.engine_state = "stopped"
+            r = await c.post(
+                "/api/control/start", json={"confirm_token": tok}
+            )
+            assert r.status_code == 200, r.text
+
+
 async def test_registers_reload_propagates_to_poller(client, app_env):
     """POST /api/registers/reload must update the live poller's batches
     and cadence, not just app.state.regmap. Verifies the hot-reload path

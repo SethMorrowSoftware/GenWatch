@@ -417,11 +417,17 @@ async def test_disagree_ats_generator_h100_zero_output_raises(
     h100_regmap, ats_regmap, fake_db, bus, ats_store,
 ):
     """Reverse direction: ATS reports load on generator but the H-100
-    isn't producing any output (engine running unloaded after a load
-    was shed but ATS never retransferred). Also a real failure mode."""
+    isn't producing any output AND utility is also reported unavailable
+    — so the building should have no power. Indicates a stuck aux
+    contact (claiming generator when nothing is energized) or a broken
+    H-100 output sensor. The utility-also-unavailable gate is required
+    to avoid false-positives during the normal ASCO retransfer-delay
+    window (see test_disagree_skips_gen_arm_when_utility_available)."""
     ats = await _seed_authoritative_ats(
         ats_regmap, fake_db, bus, ats_store, "generator"
     )
+    ats_store.set_normal_available(False)
+    await ats.on_poll("base", ats_store.as_reading("base"), _healthy())
     sm = StateMachine(h100_regmap, fake_db, bus, ats_service=ats)
 
     fake_db.raise_alarm.reset_mock()
@@ -431,6 +437,35 @@ async def test_disagree_ats_generator_h100_zero_output_raises(
     assert _disagree_count(fake_db) == 1
     bus_msg = fake_db.raise_alarm.call_args.args[1]
     assert "GENERATOR" in bus_msg
+
+
+async def test_disagree_skips_gen_arm_when_utility_available(
+    h100_regmap, ats_regmap, fake_db, bus, ats_store,
+):
+    """ATS=generator + H-100 zero-output is normal during the ASCO
+    retransfer-delay window: utility just restored, ATS still on
+    generator waiting for its retransfer timer, building load briefly
+    at zero. With normal_available=True we must NOT raise the
+    disagreement alarm — otherwise it fires on every legitimate
+    utility-restore cycle and operators learn to ignore it before the
+    real failure mode (stuck-aux-during-actual-outage) ever fires."""
+    ats = await _seed_authoritative_ats(
+        ats_regmap, fake_db, bus, ats_store, "generator"
+    )
+    # Mock default already has normal_available=True but be explicit.
+    ats_store.set_normal_available(True)
+    await ats.on_poll("base", ats_store.as_reading("base"), _healthy())
+    assert ats.snap.normal_available is True
+    sm = StateMachine(h100_regmap, fake_db, bus, ats_service=ats)
+
+    fake_db.raise_alarm.reset_mock()
+    no_output = Reading(values=_h100_values("running", current=0.0, kw=0.0))
+    # Run well past the debounce window — would have raised the alarm
+    # 7 times with the pre-fix logic.
+    for _ in range(10):
+        sm.update(no_output, _healthy())
+    assert _disagree_count(fake_db) == 0
+    assert "ATS_LOADSOURCE_DISAGREE" not in sm.snap.active_alarms
 
 
 async def test_disagree_clears_when_signals_agree(
