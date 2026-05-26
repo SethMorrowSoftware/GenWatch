@@ -400,22 +400,39 @@ class StateMachine:
             old_source = self.snap.load_source
             self.snap.load_source = new_load_source
             self.snap.load_source_started_at = time.time()
-            emitted.append({
-                "type": "load-source",
-                "from": old_source,
-                "to": new_load_source,
-                "ts": time.time(),
-            })
-            db_event = self._load_source_event(old_source, new_load_source)
-            if db_event is not None:
-                severity, message = db_event
-                self.db.write_event(
-                    severity=severity,
-                    type_="LOAD_SOURCE",
-                    message=message,
-                    meta=None,
+
+            # When the ATS-Pi is the authoritative source of the load
+            # source, it has already emitted an `ats-position` event
+            # and written an ATS_POSITION row to the events log for the
+            # same physical transition. Suppress the duplicate
+            # `load-source` event here so the operator's events feed
+            # shows one entry per real-world event, not two.
+            ats_authoritative = (
+                self.ats is not None and self.ats.is_authoritative()
+            )
+            if not ats_authoritative:
+                emitted.append({
+                    "type": "load-source",
+                    "from": old_source,
+                    "to": new_load_source,
+                    "ts": time.time(),
+                })
+                db_event = self._load_source_event(old_source, new_load_source)
+                if db_event is not None:
+                    severity, message = db_event
+                    self.db.write_event(
+                        severity=severity,
+                        type_="LOAD_SOURCE",
+                        message=message,
+                        meta=None,
+                    )
+                    log.info("Load source (telemetry): %s -> %s", old_source, new_load_source)
+            else:
+                log.debug(
+                    "Load source updated from ATS-Pi authority: %s -> %s "
+                    "(no duplicate event emitted)",
+                    old_source, new_load_source,
                 )
-                log.info("Load source: %s -> %s", old_source, new_load_source)
 
         self.snap.comms = comms
         self.snap.last_reading = reading

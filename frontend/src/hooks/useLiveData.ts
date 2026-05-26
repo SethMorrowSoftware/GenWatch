@@ -12,6 +12,7 @@ import { useEffect, useRef, useState } from "react";
 import { api, EMPTY_READING } from "../api/client";
 import type {
   ActiveAlarm,
+  AtsBlock,
   CommsHealth,
   EngineState,
   LiveMessage,
@@ -147,6 +148,11 @@ export function useLiveData(): LiveState {
                 msg.loadSource !== undefined
                   ? { ...s.hts, transferredToGen: msg.loadSource === "generator" }
                   : s.hts,
+              // ATS block — backend sends null when ats.enabled=false,
+              // omits the field entirely on older deployments. Preserve
+              // previous when not provided so the UI doesn't blank out
+              // on a transient null.
+              ats: msg.ats ? mergeAts(s.ats, msg.ats) : s.ats,
               serverTs: msg.ts,
             };
             history = [s.reading, ...history].slice(0, HISTORY_SIZE);
@@ -169,6 +175,73 @@ export function useLiveData(): LiveState {
               timeInLoadSource: 0,
               hts: { ...s.hts, transferredToGen: msg.to === "generator" },
             };
+            break;
+          }
+          case "ats-position": {
+            // When the ATS-Pi is authoritative, this event is the
+            // canonical signal for a position change — the backend
+            // suppresses the redundant `load-source` event for the
+            // same transition (see services/state.py). So we update
+            // BOTH ats.position AND loadSource here, keeping the
+            // ATS card diagram and the hero badge in sync within a
+            // single tick instead of waiting for the next H-100 poll.
+            if (s.ats.enabled) {
+              const updateLoadSource = s.ats.authoritative;
+              s = {
+                ...s,
+                ats: { ...s.ats, position: msg.to },
+                loadSource: updateLoadSource ? msg.to : s.loadSource,
+                loadSourceStartedAt: updateLoadSource ? msg.ts : s.loadSourceStartedAt,
+                timeInLoadSource: updateLoadSource ? 0 : s.timeInLoadSource,
+                hts: updateLoadSource
+                  ? { ...s.hts, transferredToGen: msg.to === "generator" }
+                  : s.hts,
+              };
+            }
+            break;
+          }
+          case "ats-source": {
+            // Source-availability transition (utility lost/restored,
+            // gen ready/unavailable).
+            if (s.ats.enabled) {
+              const patch =
+                msg.source === "normal"
+                  ? { normalAvailable: msg.available }
+                  : { emergencyAvailable: msg.available };
+              s = { ...s, ats: { ...s.ats, ...patch } };
+            }
+            break;
+          }
+          case "ats-mode": {
+            if (s.ats.enabled) {
+              s = { ...s, ats: { ...s.ats, atsMode: msg.to } };
+            }
+            break;
+          }
+          case "ats-comms": {
+            // The ATS link's own comms health, separate from the
+            // H-100's. When the ATS link goes down, the loadSource
+            // automatically reverts to H-100 derivation via the
+            // backend's precedence rule (next snapshot will reflect
+            // that); we just update the displayed comms badge here.
+            if (s.ats.enabled) {
+              s = {
+                ...s,
+                ats: {
+                  ...s.ats,
+                  comms: { state: msg.to, successPct: msg.successPct },
+                  // If comms went bad, authoritative flips to false
+                  // immediately (matches backend is_authoritative()).
+                  authoritative: msg.to === "healthy" && s.ats.authoritative,
+                },
+              };
+            }
+            break;
+          }
+          case "ats-reboot": {
+            // Diagnostic event — no UI state change needed (the next
+            // snapshot will refresh uptime). The events feed will
+            // show the reboot row.
             break;
           }
           case "alarm": {
@@ -221,4 +294,24 @@ function mergeReading(prev: Reading, patch: Partial<Reading>): Reading {
     if (v !== null && v !== undefined) (out as any)[k] = v;
   }
   return out;
+}
+
+/** Merge an incoming ATS snapshot into the previous block.
+ *
+ * Identification fields (icdVersion / fw / unitId / uptimeS) typically
+ * arrive only on the REST seed; WS snapshots omit them to keep the
+ * payload small. We preserve them across pushes here so the UI's
+ * "ICD v1.0" badge etc. stay rendered.
+ */
+function mergeAts(prev: AtsBlock, incoming: AtsBlock): AtsBlock {
+  if (!incoming.enabled) return incoming;
+  if (!prev.enabled) return incoming;
+  return {
+    ...prev,
+    ...incoming,
+    icdVersion: incoming.icdVersion ?? prev.icdVersion,
+    atsPiFw: incoming.atsPiFw ?? prev.atsPiFw,
+    atsPiUnitId: incoming.atsPiUnitId ?? prev.atsPiUnitId,
+    atsPiUptimeS: incoming.atsPiUptimeS ?? prev.atsPiUptimeS,
+  };
 }
