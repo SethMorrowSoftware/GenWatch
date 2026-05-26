@@ -689,6 +689,69 @@ async def test_poller_eviction_is_per_tier(tmp_path):
     )
 
 
+async def test_modbus_read_releases_lock_between_retry_attempts(tmp_path):
+    """A failing read must release the modbus client lock between
+    retry attempts so a queued control write can pre-empt the retry
+    chain. Without this, a degraded comms link holding the lock for
+    ~5s across 3 failing attempts + backoffs would starve operator
+    Stop commands exactly when they're most needed. Closes Modbus H3."""
+    import asyncio
+    import time as time_mod
+    from genwatch.modbus.client import SerialModbusClient, ModbusResult
+
+    client = SerialModbusClient(
+        device="/dev/null", baud=9600, parity="N",
+        stopbits=1, bytesize=8, timeout_s=0.01,
+        slave=1, retries=2,
+        backoff_s=[0.05, 0.05],  # short backoffs for the test
+    )
+    # Hand-rolled fake pymodbus client: read always fails fast,
+    # write returns immediately. The point of the test is that the
+    # write doesn't wait for the read's full retry chain to finish.
+    class FakeWire:
+        async def read_holding_registers(self, *a, **kw):
+            await asyncio.sleep(0.005)
+            raise asyncio.TimeoutError
+        async def read_input_registers(self, *a, **kw):
+            return await self.read_holding_registers()
+        async def write_register(self, **kw):
+            return type("R", (), {"isError": lambda self: False})()
+        async def write_registers(self, **kw):
+            return type("R", (), {"isError": lambda self: False})()
+    client._client = FakeWire()
+
+    # Schedule a slow read and a write concurrently. The read will
+    # take ~3 attempts × 0.015s sleep + 2 × 0.05s backoff ≈ 0.145s
+    # if the lock is held throughout. With per-attempt locking the
+    # write should slip in during one of the backoffs.
+    read_done_at: list[float] = []
+    write_done_at: list[float] = []
+
+    async def do_read():
+        await client.read(0x100, 1)
+        read_done_at.append(time_mod.monotonic())
+
+    async def do_write_after_tiny_delay():
+        # Wait just long enough for the read's first attempt to be
+        # in flight and for the lock to be released for backoff.
+        await asyncio.sleep(0.02)
+        await client.write(0x200, 1, fc=6)
+        write_done_at.append(time_mod.monotonic())
+
+    t0 = time_mod.monotonic()
+    await asyncio.gather(do_read(), do_write_after_tiny_delay())
+    write_elapsed = write_done_at[0] - t0
+    read_elapsed = read_done_at[0] - t0
+
+    # Write must complete before the read's full retry chain finishes.
+    # If the lock were held throughout the read, write_elapsed would
+    # be ~= read_elapsed. We expect a meaningful gap.
+    assert write_elapsed < read_elapsed, (
+        f"write should complete before the read's retry chain finishes "
+        f"(write={write_elapsed*1000:.0f}ms, read={read_elapsed*1000:.0f}ms)"
+    )
+
+
 async def test_poller_apply_regmap_swaps_batches_and_cadence(tmp_path):
     """POST /api/registers/reload must update the live poller, not just
     app.state.regmap. Otherwise the operator edits the YAML, reloads,

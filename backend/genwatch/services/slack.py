@@ -44,6 +44,11 @@ class _PendingMessage:
     blocks: list[dict]
     fallback: str
     attempt: int = 0
+    # Wall-clock instant when the message was first enqueued. Used by
+    # the worker to abandon retries past MAX_AGE_S so a sustained Slack
+    # outage can't pile up retry tasks chewing through SEND_TIMEOUT_S
+    # each, blocking newer (more urgent) alerts behind them.
+    enqueued_at: float = 0.0
 
 
 class SlackNotifier:
@@ -53,6 +58,18 @@ class SlackNotifier:
     MAX_ATTEMPTS = 4
     BACKOFF_S = (1.0, 4.0, 16.0)
     SEND_TIMEOUT_S = 10.0
+    # Per-message wall-clock deadline. Past this, the worker drops the
+    # message regardless of how many attempts remain. 5 minutes is
+    # longer than any transient network blip but short enough that a
+    # real Slack outage doesn't leave stale messages queued for hours.
+    MAX_AGE_S = 300.0
+    # Per-(code, kind) dedupe window. An alarm bit that flaps between
+    # set and clear within this window only fires Slack ONCE per
+    # transition direction — without it, a chattery alarm could
+    # exhaust the 200-slot queue and push real alerts off the floor.
+    # State-change / load-source / command / comms events are inherently
+    # edge-triggered and don't go through dedupe.
+    DEDUPE_WINDOW_S = 60.0
 
     def __init__(self, cfg: SlackConfig, db: Database, *, site_name: str = ""):
         self.cfg = cfg
@@ -62,6 +79,9 @@ class SlackNotifier:
         self._worker_task: asyncio.Task | None = None
         self._retry_tasks: set[asyncio.Task] = set()
         self._running = False
+        # Per-(code, kind) last-sent timestamps. Read+write only from
+        # the event loop (alert_* methods are async); no lock needed.
+        self._recent_sends: dict[tuple[str, str], float] = {}
 
     # ---- lifecycle ----------------------------------------------------
     async def start(self) -> None:
@@ -107,10 +127,37 @@ class SlackNotifier:
         return bool(self.cfg.enabled and self.cfg.bot_token and self.cfg.channel)
 
     # ---- event helpers ------------------------------------------------
+    def _dedupe_skip(self, code: str, kind: str) -> bool:
+        """True if (code, kind) was sent inside DEDUPE_WINDOW_S.
+
+        Records the current time on a miss so the next call within the
+        window short-circuits. A chatty alarm bit that flickers
+        set/clear under min_poll_count threshold gets one raise and
+        one clear per window, not one of each per flicker.
+        """
+        now = time.time()
+        key = (code, kind)
+        # Best-effort housekeeping — keep the dict bounded under flap.
+        # 10× window is plenty; entries past that are useless even if
+        # the alarm later re-fires.
+        if len(self._recent_sends) > 256:
+            cutoff = now - self.DEDUPE_WINDOW_S * 10
+            self._recent_sends = {
+                k: t for k, t in self._recent_sends.items() if t > cutoff
+            }
+        last = self._recent_sends.get(key)
+        if last is not None and (now - last) < self.DEDUPE_WINDOW_S:
+            return True
+        self._recent_sends[key] = now
+        return False
+
     async def alert_alarm(self, code: str, desc: str, severity: str, ts: float) -> None:
         if severity == "alarm" and not self.cfg.alert_on_alarm:
             return
         if severity == "warn" and not self.cfg.alert_on_warning:
+            return
+        if self._dedupe_skip(code, "raised"):
+            log.debug("Slack dedupe — skipping repeat alarm %s within %.0fs", code, self.DEDUPE_WINDOW_S)
             return
         if severity == "alarm":
             title = f":rotating_light: Alarm raised — {desc}"
@@ -125,6 +172,9 @@ class SlackNotifier:
 
     async def alert_alarm_cleared(self, code: str, desc: str, ts: float) -> None:
         if not self.cfg.alert_on_alarm_cleared:
+            return
+        if self._dedupe_skip(code, "cleared"):
+            log.debug("Slack dedupe — skipping repeat clear %s within %.0fs", code, self.DEDUPE_WINDOW_S)
             return
         await self._enqueue(
             severity="ok",
@@ -245,7 +295,9 @@ class SlackNotifier:
             return
         blocks = _build_blocks(severity=severity, title=title, fields=fields)
         try:
-            self._queue.put_nowait(_PendingMessage(blocks=blocks, fallback=fallback))
+            self._queue.put_nowait(
+                _PendingMessage(blocks=blocks, fallback=fallback, enqueued_at=time.time())
+            )
         except asyncio.QueueFull:
             log.warning("Slack queue full — dropping notification: %s", fallback)
 
@@ -269,6 +321,17 @@ class SlackNotifier:
                     log.error(
                         "Slack send failed after %d attempts: %s — %s",
                         msg.attempt, err, msg.fallback,
+                    )
+                    continue
+                # Wall-clock deadline: a sustained Slack outage stops
+                # producing retry tasks for old messages. Without this,
+                # a 30-minute Slack outage with chatty events queues
+                # ~16s of retries per message; backpressure pushes
+                # newer (higher-signal) alerts off the floor.
+                if msg.enqueued_at and (time.time() - msg.enqueued_at) > self.MAX_AGE_S:
+                    log.warning(
+                        "Slack: abandoning message past %ds deadline: %s",
+                        int(self.MAX_AGE_S), msg.fallback,
                     )
                     continue
                 backoff = self.BACKOFF_S[min(msg.attempt - 1, len(self.BACKOFF_S) - 1)]

@@ -192,9 +192,18 @@ class SerialModbusClient:
             return ModbusResult.failure("not_connected")
         attempts = self.retries + 1
         last_err = "unknown"
-        async with self._lock:
-            t0 = time.perf_counter()
-            for i in range(attempts):
+        t0 = time.perf_counter()
+        for i in range(attempts):
+            # Lock acquired per-attempt (not across the entire retry
+            # chain) so a queued control write can pre-empt our retry
+            # backoff. Without this, a degraded comms link can hold the
+            # lock for ~5s across three failing attempts plus their
+            # backoffs — exactly when an operator's Stop command is
+            # most likely to be queued, and exactly when we want it
+            # serviced quickly. The Modbus wire transaction is still
+            # serialized (one transaction per lock acquisition); we're
+            # only giving up the lock during sleeps.
+            async with self._lock:
                 try:
                     rr = await asyncio.wait_for(
                         self._read_once(addr, count, fc),
@@ -210,10 +219,13 @@ class SerialModbusClient:
                     last_err = "timeout"
                 except Exception as e:  # noqa: BLE001
                     last_err = type(e).__name__
-                if i < attempts - 1:
-                    backoff = self.backoff_s[min(i, len(self.backoff_s) - 1)]
-                    await asyncio.sleep(backoff)
-            return ModbusResult.failure(last_err, (time.perf_counter() - t0) * 1000)
+            # Lock released. Inter-attempt backoff runs outside the
+            # lock so any task waiting on it (typically a control
+            # write) can jump the queue.
+            if i < attempts - 1:
+                backoff = self.backoff_s[min(i, len(self.backoff_s) - 1)]
+                await asyncio.sleep(backoff)
+        return ModbusResult.failure(last_err, (time.perf_counter() - t0) * 1000)
 
     async def write(
         self,
@@ -377,9 +389,12 @@ class TcpRtuModbusClient:
             return ModbusResult.failure("not_connected")
         attempts = self.retries + 1
         last_err = "unknown"
-        async with self._lock:
-            t0 = time.perf_counter()
-            for i in range(attempts):
+        t0 = time.perf_counter()
+        for i in range(attempts):
+            # Per-attempt lock (see SerialModbusClient.read for rationale)
+            # — inter-attempt backoff runs outside so a queued control
+            # write can pre-empt the retry chain on a degraded link.
+            async with self._lock:
                 if not await self._ensure_connected():
                     last_err = "tcp_disconnected"
                 else:
@@ -398,10 +413,10 @@ class TcpRtuModbusClient:
                         last_err = "timeout"
                     except Exception as e:  # noqa: BLE001
                         last_err = type(e).__name__
-                if i < attempts - 1:
-                    backoff = self.backoff_s[min(i, len(self.backoff_s) - 1)]
-                    await asyncio.sleep(backoff)
-            return ModbusResult.failure(last_err, (time.perf_counter() - t0) * 1000)
+            if i < attempts - 1:
+                backoff = self.backoff_s[min(i, len(self.backoff_s) - 1)]
+                await asyncio.sleep(backoff)
+        return ModbusResult.failure(last_err, (time.perf_counter() - t0) * 1000)
 
     async def write(
         self,

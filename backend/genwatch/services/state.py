@@ -294,8 +294,18 @@ class StateMachine:
         """Apply a new poll result. Returns the list of events emitted."""
         emitted: list[dict[str, Any]] = []
 
+        # Snap the regmap reference up front so every derivation in this
+        # update uses one consistent rule set. Without this, an
+        # apply_regmap() that lands mid-update could leave engine_state
+        # derived against the new map while the alarm_bits loop below
+        # still iterates the old map's rules — producing a one-tick
+        # phantom raise/clear of an alarm whose code just got renamed.
+        # The reference swap in apply_regmap is atomic under the GIL,
+        # so capturing it once gives us a coherent view.
+        regmap = self.regmap
+
         # Engine state — derived from bitfield rules.
-        new_state = self.regmap.derive_engine_state(reading.values)
+        new_state = regmap.derive_engine_state(reading.values)
         # Don't downgrade to 'unknown' if we already had a real state and
         # the prime registers just haven't been refreshed this tick.
         if new_state == "unknown" and self.snap.engine_state != "unknown":
@@ -331,7 +341,7 @@ class StateMachine:
         # still fires once the debounce elapses, and a state-suppressed
         # alarm still gets cleared in the DB when its bit goes low so
         # nothing leaks as a stale row.
-        raw_active = self.regmap.derive_active_alarms(reading.values)
+        raw_active = regmap.derive_active_alarms(reading.values)
         raw_active_codes = {ab.code for ab in raw_active}
 
         # Maintain per-code debounce counters off the raw bits, not the
@@ -384,7 +394,7 @@ class StateMachine:
         for code in list(self._raised_this_session):
             if code in raw_active_codes:
                 continue
-            ab = next((x for x in self.regmap.alarm_bits if x.code == code), None)
+            ab = next((x for x in regmap.alarm_bits if x.code == code), None)
             desc = ab.desc if ab else code
             cleared = self.db.clear_alarm(code)
             self._raised_this_session.discard(code)
@@ -425,7 +435,7 @@ class StateMachine:
             })
         # Panel key-switch — derive from the YAML's panel_mode_bits rules.
         # Falls back to 'unknown' until the prime tier polls input_status_1.
-        self.snap.panel_mode = self.regmap.derive_panel_mode(reading.values)
+        self.snap.panel_mode = regmap.derive_panel_mode(reading.values)
 
         # Load source — utility vs generator. Runs after engine state is
         # updated so cooling/cranking states immediately move us back to

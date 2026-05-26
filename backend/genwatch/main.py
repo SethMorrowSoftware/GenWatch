@@ -19,6 +19,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import anyio
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -224,13 +225,21 @@ async def lifespan(app: FastAPI):
 
         # Persist a wide row per *base* tier poll (every ~15s by default).
         # Prime polls don't include all metrics — we'd write mostly nulls.
+        # SQLite WAL writes with synchronous=FULL can spike to 100+ms on
+        # a Pi SD card during a checkpoint or fsync. Offloading to a
+        # worker thread keeps the event loop responsive to WS pushes,
+        # the watchdog ticker, and the next poll cadence — without it,
+        # a slow checkpoint can push prime polls past their deadline
+        # and chip away at the watchdog grace window.
         if tier == "base":
             try:
-                db.write_telemetry(
-                    ts=reading.ts,
-                    values=reading.values,
-                    state=state_machine.snap.engine_state,
-                    alarm_raw=state_machine.snap.alarm_raw,
+                await anyio.to_thread.run_sync(
+                    lambda: db.write_telemetry(
+                        ts=reading.ts,
+                        values=reading.values,
+                        state=state_machine.snap.engine_state,
+                        alarm_raw=state_machine.snap.alarm_raw,
+                    )
                 )
             except Exception as e:  # noqa: BLE001
                 log.exception("telemetry write failed: %s", e)
