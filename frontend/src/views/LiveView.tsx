@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api/client";
 import { Card, EmptyState, Icon, LiveTick, Pill, Sparkline, fmt, formatTimeInState } from "../components/primitives";
-import type { ActiveAlarm, EngineState, EventRow, Reading, StatusBody } from "../types";
+import type { ActiveAlarm, EngineState, EventRow, LoadSource, Reading, StatusBody } from "../types";
 import { ConfirmModal } from "./ConfirmModal";
 
 interface Props {
@@ -21,15 +21,28 @@ const STATE_LABEL: Record<EngineState, string> = {
   alarm: "Alarm",
   unknown: "Unknown",
 };
+// Sub-line under the state title. For `running` the meaning depends on
+// whether the ATS has actually transferred load — running-unloaded is
+// the warm-up window before transfer (or a forced test); running-with-
+// load is the backup-power case. stateSubFor() picks the right one.
 const STATE_SUB: Record<EngineState, string> = {
   stopped: "AUTO · Ready",
   cranking: "Engine start in progress",
-  running: "On load · Utility lost",
+  running: "On load · Backup power",       // overridden when loadSource = utility
   exercising: "Quiet-Test · No load",
   cooling: "Engine cool-down",
   alarm: "Shutdown · Operator action required",
   unknown: "—",
 };
+function stateSubFor(state: EngineState, loadSource: LoadSource | undefined): string {
+  if (state === "running" && loadSource === "utility") {
+    return "Running unloaded · Pre-transfer warm-up";
+  }
+  if (state === "cooling") {
+    return "Engine cool-down · Load on utility";
+  }
+  return STATE_SUB[state];
+}
 const STATE_BADGE: Record<EngineState, string> = {
   stopped: "STOPPED",
   cranking: "CRANKING",
@@ -84,7 +97,7 @@ export function LiveView({ status, history, operator }: Props) {
       </div>
 
       <div className="row" style={{ marginTop: "var(--gap)" }}>
-        <EngineCard reading={reading} history={history} />
+        <EngineCard status={status} history={history} />
         <FuelMaintCard reading={reading} status={status} />
       </div>
 
@@ -125,9 +138,9 @@ function StatusHero({ status, history }: { status: StatusBody; history: Reading[
           </div>
           <div className="state-title">{STATE_LABEL[state]}</div>
           <div className="state-sub">
-            <strong>{STATE_SUB[state]}</strong>
+            <strong>{stateSubFor(state, status.loadSource)}</strong>
             <span className="dot-sep" />
-            <span>HTS-1 on {status.hts.transferredToGen ? "GENERATOR" : "UTILITY"}</span>
+            <span>HTS-1 on {status.loadSource === "generator" ? "GENERATOR" : status.loadSource === "unknown" ? "—" : "UTILITY"}</span>
           </div>
         </div>
         <div className="hero-load">
@@ -220,7 +233,11 @@ function LoadRing({ pct, kw, ratingKw }: { pct: number; kw: number | null; ratin
 
 // ─── ATS card (separate from hero) ───────────────────────────────────────
 function AtsCard({ status }: { status: StatusBody }) {
-  const onGen = status.hts.transferredToGen;
+  // Drive the diagram from the load-source classifier rather than the
+  // legacy boolean — this keeps the visualization accurate during
+  // quiet-test exercises (engine running, load still on utility) and
+  // during the pre-transfer warm-up window.
+  const onGen = status.loadSource === "generator";
   const r = status.reading;
   const loadPct = r.kw != null ? Math.round((r.kw / Math.max(1, status.site.ratingKw)) * 100) : 0;
   return (
@@ -427,14 +444,32 @@ function avgOf(xs: Array<number | null>): number {
 }
 
 // ─── Engine card ──────────────────────────────────────────────────────────
-function EngineCard({ reading: r, history }: { reading: Reading; history: Reading[] }) {
+function EngineCard({ status, history }: { status: StatusBody; history: Reading[] }) {
+  const r = status.reading;
   // Battery range covers both 12V and 24V systems — the H-100 is wired
   // for a 24V starting bank on most installs (~26 V float), but smaller
   // configurations exist. We don't hard-code which; the warn range is
   // a permissive band covering both float-charged states.
   const battWarn: [number, number] = (r.batt ?? 0) > 18 ? [25.0, 29.5] : [12.6, 14.4];
+
+  // Hide the O₂ sensor entirely on diesel sites. Diesels have no O₂
+  // probe — the H-100 register reads 0 always, and showing a constant-
+  // zero gauge is just noise. Gated on site.fuelType which the operator
+  // sets in registers/h100.yaml.
+  const isDiesel = status.site.fuelType === "diesel";
+
+  // Throttle annotation: when the engine is running unloaded (warm-up
+  // or quiet-test), 0% is the correct reading, not a sensor fault.
+  // Label it so an operator scanning the panel can tell the difference
+  // between "no demand" and "missing data".
+  const isRunningClass = status.state === "running" || status.state === "exercising";
+  const throttleNote =
+    isRunningClass && status.loadSource !== "generator"
+      ? (status.state === "exercising" ? "quiet test" : "no load")
+      : undefined;
+
   return (
-    <Card title="Engine" sub="Cummins QSB7-G5"
+    <Card title="Engine" sub={status.site.engine}
           actions={<Pill tone={r.oilP != null && r.oilP < 25 && (r.rpm ?? 0) > 100 ? "alarm" : "ok"}>nominal</Pill>}>
       <div className="grid g-4" style={{ gap: 18 }}>
         <EngineMetric label="RPM"           value={fmt(r.rpm)}            unit="rpm" sparkPoints={history.map((h) => h.rpm ?? 0).reverse()} color="var(--green)"  warnRange={[1750, 1850]} numeric={r.rpm}      min={0}  max={2200} />
@@ -443,17 +478,23 @@ function EngineCard({ reading: r, history }: { reading: Reading; history: Readin
         <EngineMetric label="Coolant temp"  value={r.coolT != null ? r.coolT.toFixed(0) : "—"} unit="°F" sparkPoints={history.map((h) => h.coolT ?? 0).reverse()} color="var(--amber)" warnRange={[170, 210]}   numeric={r.coolT}    min={50} max={250} />
         <EngineMetric label="Battery"       value={r.batt != null ? r.batt.toFixed(2) : "—"} unit="V"   sparkPoints={history.map((h) => h.batt ?? 0).reverse()} color="var(--violet)" warnRange={battWarn}     numeric={r.batt}     min={10} max={32} />
         <EngineMetric label="Charge curr."  value={r.battA != null ? r.battA.toFixed(1) : "—"} unit="A" sparkPoints={history.map((h) => h.battA ?? 0).reverse()} color="var(--green)" warnRange={[0, 25]}      numeric={r.battA}    min={-5} max={40} />
-        <EngineMetric label="Throttle"      value={r.throttle != null ? r.throttle.toFixed(0) : "—"} unit="%" sparkPoints={history.map((h) => h.throttle ?? 0).reverse()} color="var(--blue)" warnRange={[0, 100]} numeric={r.throttle} min={0}  max={100} />
-        <EngineMetric label="O₂ sensor" value={r.o2 != null ? r.o2.toFixed(0) : "—"} unit="%"     sparkPoints={history.map((h) => h.o2 ?? 0).reverse()}      color="var(--text-2)" warnRange={[0, 100]}     numeric={r.o2}       min={0}  max={100} />
+        <EngineMetric label="Throttle"      value={r.throttle != null ? r.throttle.toFixed(0) : "—"} unit="%" sparkPoints={history.map((h) => h.throttle ?? 0).reverse()} color="var(--blue)" warnRange={[0, 100]} numeric={r.throttle} min={0}  max={100} note={throttleNote} />
+        {!isDiesel && (
+          <EngineMetric label="O₂ sensor" value={r.o2 != null ? r.o2.toFixed(0) : "—"} unit="%"     sparkPoints={history.map((h) => h.o2 ?? 0).reverse()}      color="var(--text-2)" warnRange={[0, 100]}     numeric={r.o2}       min={0}  max={100} />
+        )}
       </div>
     </Card>
   );
 }
 
-function EngineMetric({ label, value, unit, sparkPoints, color, warnRange, numeric }: {
+function EngineMetric({ label, value, unit, sparkPoints, color, warnRange, numeric, note }: {
   label: string; value: string; unit: string;
   sparkPoints: number[]; color: string; warnRange?: [number, number];
   numeric: number | null; min: number; max: number;
+  // Optional context string rendered alongside the value (e.g. "no load"
+  // on throttle when running unloaded). Render dim so it doesn't compete
+  // with the primary reading.
+  note?: string;
 }) {
   const inBand = numeric != null && warnRange ? numeric >= warnRange[0] && numeric <= warnRange[1] : true;
   return (
@@ -469,6 +510,10 @@ function EngineMetric({ label, value, unit, sparkPoints, color, warnRange, numer
       <div className="mono" style={{ fontSize: 24, fontWeight: 500, marginTop: 8, letterSpacing: "-0.018em",
                                      color: inBand ? "var(--text)" : "var(--amber)" }}>
         {value}<span style={{ fontSize: 12, color: "var(--text-3)", marginLeft: 3, fontWeight: 400 }}>{unit}</span>
+        {note && (
+          <span style={{ fontSize: 11, color: "var(--text-4)", marginLeft: 8, fontWeight: 400, letterSpacing: 0,
+                         textTransform: "uppercase" }}>{note}</span>
+        )}
       </div>
       <div style={{ marginTop: 8 }}>
         <Sparkline points={sparkPoints} width={170} height={36} color={color} />
@@ -509,13 +554,13 @@ function ControlsPanel({ state, panelMode, onCommand }: {
         <button className="ctl-btn" data-tone="start" disabled={!canStart} onClick={() => onCommand("start")}
                 title={panelHint ?? undefined}>
           <span className="icon"><Icon name="play" size={18} /></span>
-          <span><div className="lbl">Remote Start</div><div className="desc">Crank engine, transfer to gen</div></span>
+          <span><div className="lbl">Remote Start</div><div className="desc">Crank engine · load stays on utility</div></span>
           <span className="kbd">⌘S</span>
         </button>
         <button className="ctl-btn" data-tone="stop" disabled={!canStop} onClick={() => onCommand("stop")}
                 title={panelHint ?? undefined}>
           <span className="icon"><Icon name="stop" size={16} /></span>
-          <span><div className="lbl">Remote Stop</div><div className="desc">Cool-down then engine-off</div></span>
+          <span><div className="lbl">Remote Stop</div><div className="desc">Retransfer to utility · cool-down · stop</div></span>
           <span className="kbd">⌘.</span>
         </button>
         <button className="ctl-btn" data-tone="exer" disabled={!canExercise} onClick={() => onCommand("exercise")}
@@ -527,7 +572,7 @@ function ControlsPanel({ state, panelMode, onCommand }: {
         <button className="ctl-btn" data-tone="xfer" disabled={!canTransfer} onClick={() => onCommand("transfer")}
                 title={panelHint ?? undefined}>
           <span className="icon"><Icon name="switch_" size={20} /></span>
-          <span><div className="lbl">Transfer back</div><div className="desc">HTS-1 → Utility, cool engine</div></span>
+          <span><div className="lbl">Transfer to Gen</div><div className="desc">HTS-1 → Generator (move load)</div></span>
           <span className="kbd">⌘T</span>
         </button>
       </div>
@@ -558,8 +603,17 @@ function FuelMaintCard({ reading: r, status }: { reading: Reading; status: Statu
   const gal = Math.round(fuel * (status.site.tankGal / 100));
   const coolLevel = r.coolLevel;
   const lowCool = coolLevel != null && coolLevel < 50;
+  // Sub-label adapts to fuel type — diesel sites have a local tank we
+  // can quantify in gallons; gaseous sites typically have a utility
+  // gas connection where the "tank" volume is less meaningful, but we
+  // keep the field display in case the operator wants to track a local
+  // LP tank.
+  const fuelLabel =
+    status.site.fuelType === "diesel"  ? "Local diesel" :
+    status.site.fuelType === "gaseous" ? "Gaseous fuel" :
+    "Tank";
   return (
-    <Card title="Tank · Maintenance" sub={`Local diesel · ${status.site.tankGal} gal`}>
+    <Card title="Tank · Maintenance" sub={`${fuelLabel} · ${status.site.tankGal} gal`}>
       <div style={{ padding: "4px 0 14px" }}>
         <div className="label-row" style={{ padding: "0 0 8px" }}>
           <span>Coolant level</span>

@@ -94,6 +94,10 @@ class SiteConfig:
     rating_kw: int = 200
     engine: str = "Cummins QSB7-G5"
     tank_gal: int = 220
+    # Fuel type — 'diesel' | 'gaseous' | 'unknown'. Drives UI gating
+    # (hide O₂ sensor card on diesel, etc.). Default 'unknown' so legacy
+    # YAML files without the field continue showing every metric.
+    fuel_type: str = "unknown"
     exercise_enabled: bool = True
     exercise_day: str = "sun"
     exercise_time: str = "03:00"
@@ -286,12 +290,15 @@ def load_register_map(path: Path | str) -> RegisterMap:
 
     site_d = data.get("site") or {}
     ex = (site_d.get("exercise") or {})
+    raw_fuel = str(site_d.get("fuel_type", "unknown")).strip().lower()
+    fuel_type = raw_fuel if raw_fuel in ("diesel", "gaseous", "unknown") else "unknown"
     site = SiteConfig(
         id=site_d.get("id", "SITE-1"),
         name=site_d.get("name", "Generac H-100"),
         rating_kw=int(site_d.get("rating_kw", 200)),
         engine=site_d.get("engine", "Cummins QSB7-G5"),
         tank_gal=int(site_d.get("tank_gal", 220)),
+        fuel_type=fuel_type,
         exercise_enabled=bool(ex.get("enabled", True)),
         exercise_day=str(ex.get("day", "sun")).lower(),
         exercise_time=str(ex.get("time", "03:00")),

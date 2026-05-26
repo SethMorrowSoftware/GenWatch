@@ -9,6 +9,11 @@ export type EngineState =
   | "alarm"
   | "unknown";
 
+// Which source is currently supplying the load. Inferred from engine
+// state + output kW/current — see backend services/state.py. Until the
+// first base-tier poll completes after boot, this defaults to 'utility'.
+export type LoadSource = "utility" | "generator" | "unknown";
+
 export type CommsState = "healthy" | "degraded" | "lost";
 
 export type Severity = "ok" | "info" | "warn" | "alarm";
@@ -68,6 +73,10 @@ export interface StatusBody {
   alarmRaw: number;
   timeInState: number;
   stateStartedAt: number;
+  // Derived: 'utility' | 'generator' | 'unknown'. See LoadSource.
+  loadSource: LoadSource;
+  loadSourceStartedAt: number;
+  timeInLoadSource: number;
   comms: CommsHealth;
   reading: Reading;
   site: {
@@ -76,6 +85,9 @@ export interface StatusBody {
     ratingKw: number;
     engine: string;
     tankGal: number;
+    // 'diesel' | 'gaseous' | 'unknown' — drives UI gating (hide O₂ on
+    // diesel, etc.). Optional for forward-compat with older backends.
+    fuelType?: "diesel" | "gaseous" | "unknown";
   };
   exercise: {
     enabled: boolean;
@@ -128,8 +140,14 @@ export type LiveMessage =
       // v0.1.1 onwards. Used to gate the control buttons on the
       // H-100 front-panel key switch being in AUTO.
       panel?: PanelBlock;
+      // Optional for forward-compat — present once the load-source
+      // derivation lands server-side. The hook falls back to the
+      // seeded value when the field is absent.
+      loadSource?: LoadSource;
+      timeInLoadSource?: number;
     }
   | { type: "transition"; from: EngineState; to: EngineState; ts: number }
+  | { type: "load-source"; from: LoadSource; to: LoadSource; ts: number }
   | { type: "alarm"; code: string; desc: string; severity: Severity; ts: number }
   | { type: "alarm-cleared"; code: string; ts: number }
   | { type: "event"; sev: Severity; eventType: string; msg: string; meta: string; ts: number };
@@ -153,6 +171,7 @@ export interface SlackConfigView {
   alertOnStateChange: boolean;
   alertOnCommand: boolean;
   alertOnCommsLost: boolean;
+  alertOnLoadSourceChange: boolean;
 }
 
 // Sent in PUT /api/config.slack — omit a field to leave it unchanged.
@@ -168,4 +187,5 @@ export interface SlackUpdate {
   alert_on_state_change?: boolean;
   alert_on_command?: boolean;
   alert_on_comms_lost?: boolean;
+  alert_on_load_source_change?: boolean;
 }

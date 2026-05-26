@@ -36,6 +36,58 @@ def test_engine_state_bits_present(regmap):
     assert {"running", "stopped", "cranking", "cooling", "exercising", "alarm"} <= states
 
 
+def test_site_rating_and_tank_loaded(regmap):
+    # On-site values for SITE-23 — a 350 kW genset with a 680 gal local tank.
+    assert regmap.site.rating_kw == 350
+    assert regmap.site.tank_gal == 680
+
+
+def test_site_fuel_type_loaded(regmap):
+    # The on-disk YAML declares this site as a diesel install. UI uses
+    # this to hide the O₂ sensor card (diesels have no O₂ probe).
+    assert regmap.site.fuel_type == "diesel"
+
+
+_MIN_YAML = (
+    "modbus: { slave: 100, read_fc: 3 }\n"
+    "engine_state_bits: []\n"
+    "alarm_bits: []\n"
+    "registers:\n"
+    "  - { name: dummy, addr: 0x0080, fc: 3, type: u16, tier: prime, group: x, unit: bits }\n"
+    "controls: []\n"
+)
+
+
+def test_site_fuel_type_defaults_to_unknown_when_absent(tmp_path):
+    # Legacy YAMLs without the fuel_type key keep showing every metric.
+    p = tmp_path / "legacy.yaml"
+    p.write_text(
+        "site: { id: X, name: Y, rating_kw: 200, engine: E, tank_gal: 100 }\n" + _MIN_YAML
+    )
+    rm = load_register_map(p)
+    assert rm.site.fuel_type == "unknown"
+
+
+def test_site_fuel_type_invalid_falls_back_to_unknown(tmp_path):
+    # An operator typo (e.g. "natural_gas" instead of "gaseous") shouldn't
+    # crash the loader — we accept lowercase-canonical or fall back.
+    p = tmp_path / "typo.yaml"
+    p.write_text(
+        "site: { id: X, name: Y, rating_kw: 200, engine: E, tank_gal: 100, fuel_type: natural_gas }\n" + _MIN_YAML
+    )
+    rm = load_register_map(p)
+    assert rm.site.fuel_type == "unknown"
+
+
+def test_site_fuel_type_normalizes_case_and_whitespace(tmp_path):
+    p = tmp_path / "mixed.yaml"
+    p.write_text(
+        "site: { id: X, name: Y, rating_kw: 200, engine: E, tank_gal: 100, fuel_type: '  Diesel  ' }\n" + _MIN_YAML
+    )
+    rm = load_register_map(p)
+    assert rm.site.fuel_type == "diesel"
+
+
 def test_alarm_bits_present(regmap):
     codes = {a.code for a in regmap.alarm_bits}
     assert "OVERCRANK" in codes

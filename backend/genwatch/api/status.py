@@ -90,6 +90,12 @@ async def status(request: Request) -> dict:
         "alarmRaw": snap.alarm_raw,
         "timeInState": snap.time_in_state_s,
         "stateStartedAt": snap.state_started_at,
+        # Derived load source — 'utility' | 'generator' | 'unknown'.
+        # Inferred from engine state + output kW/current; see
+        # services/state._derive_load_source.
+        "loadSource": snap.load_source,
+        "loadSourceStartedAt": snap.load_source_started_at,
+        "timeInLoadSource": snap.time_in_load_source_s,
         "comms": {
             "state": snap.comms.state,
             "successPct": snap.comms.success_pct,
@@ -104,6 +110,7 @@ async def status(request: Request) -> dict:
             "ratingKw": regmap.site.rating_kw,
             "engine": regmap.site.engine,
             "tankGal": regmap.site.tank_gal,
+            "fuelType": regmap.site.fuel_type,
         },
         "exercise": {
             "enabled": regmap.site.exercise_enabled,
@@ -113,7 +120,11 @@ async def status(request: Request) -> dict:
         },
         "activeAlarms": db.active_alarms(),
         "hts": {
-            "transferredToGen": snap.engine_state in ("running", "exercising"),
+            # Now derived from the load-source classifier rather than
+            # engine_state alone, which incorrectly reported "on
+            # generator" during quiet-test exercises (always unloaded)
+            # and during the warm-up window before the ATS transfers.
+            "transferredToGen": snap.load_source == "generator",
             "lastTransferTs": last_xfer["ts"] if last_xfer else None,
             "transfers30d": xfer_30d,
         },

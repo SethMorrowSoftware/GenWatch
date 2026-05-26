@@ -143,6 +143,37 @@ class SlackNotifier:
             fallback=f"Engine state {old} → {new} @ {self._site()}",
         )
 
+    async def alert_load_source_change(self, old: str, new: str, ts: float) -> None:
+        """Notify on a utility ↔ generator load-source transition.
+
+        Suppresses the boot-time 'unknown → utility' (just initial
+        firming, not an operational event). 'utility → generator' is
+        the high-signal alert: the load just moved to backup power.
+        'generator → utility' is the recovery announcement.
+        """
+        if not self.cfg.alert_on_load_source_change:
+            return
+        if old == "unknown" and new == "utility":
+            return
+        if new == "generator":
+            emoji = ":zap:"
+            sev = "warn"
+            title = f"{emoji} Load on GENERATOR (was {old})"
+        elif new == "utility":
+            emoji = ":electric_plug:"
+            sev = "ok"
+            title = f"{emoji} Load on UTILITY (was {old})"
+        else:
+            emoji = ":grey_question:"
+            sev = "warn"
+            title = f"{emoji} Load source UNKNOWN (was {old})"
+        await self._enqueue(
+            severity=sev,
+            title=title,
+            fields=[("Site", self._site())],
+            fallback=f"Load source {old} → {new} @ {self._site()}",
+        )
+
     async def alert_command(self, verb: str, operator: str, result: str, ts: float) -> None:
         if not self.cfg.alert_on_command:
             return

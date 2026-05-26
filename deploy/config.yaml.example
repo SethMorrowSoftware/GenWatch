@@ -111,6 +111,7 @@ slack:
   alert_on_state_change: false    # every stopped/cranking/running/cooling — chatty
   alert_on_command: true          # operator-issued start/stop/exercise/transfer
   alert_on_comms_lost: true       # Modbus link lost / recovered
+  alert_on_load_source_change: true   # utility ↔ generator load transitions
 
 # WebSocket push cadence (ms). Leave at prime_poll_ms unless the UI
 # feels sluggish.

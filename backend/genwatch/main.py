@@ -190,6 +190,12 @@ async def lifespan(app: FastAPI):
                 "state": state_machine.snap.engine_state,
                 "timeInState": state_machine.snap.time_in_state_s,
                 "alarmRaw": state_machine.snap.alarm_raw,
+                # Derived utility-vs-generator indicator. Without this,
+                # an operator key-switch toggle at the ATS (or an
+                # automatic transfer triggered by a utility loss) would
+                # not refresh until a manual page reload.
+                "loadSource": state_machine.snap.load_source,
+                "timeInLoadSource": state_machine.snap.time_in_load_source_s,
                 "comms": {
                     "state": comms.state,
                     "successPct": comms.success_pct,
@@ -339,6 +345,12 @@ async def _forward_to_slack(slack: SlackNotifier, evt: dict) -> None:
             old=str(evt.get("from", "")),
             new=str(evt.get("to", "")),
             success_pct=float(evt.get("successPct", 0.0)),
+            ts=ts,
+        )
+    elif t == "load-source":
+        await slack.alert_load_source_change(
+            old=str(evt.get("from", "")),
+            new=str(evt.get("to", "")),
             ts=ts,
         )
 

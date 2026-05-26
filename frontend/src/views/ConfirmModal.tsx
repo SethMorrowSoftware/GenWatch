@@ -33,11 +33,16 @@ const SPECS: Record<Verb, { title: string; verb: string; danger: boolean; bullet
     ],
   },
   transfer: {
-    title: "Confirm Transfer Back", verb: "Transfer", danger: false,
+    // The underlying Modbus command (`starttransfer`) asserts the
+    // H-100's transfer-signal output, which closes the ATS onto the
+    // generator. This moves load FROM utility TO generator — the
+    // opposite of what an earlier version of this modal claimed.
+    title: "Confirm Transfer to Generator", verb: "Transfer", danger: true,
     bullets: [
-      "HTS-1 → UTILITY",
-      "Engine continues running through cool-down",
-      "Brief 100-200 ms power gap on load",
+      "HTS-1 → GENERATOR (load moves onto generator)",
+      "Engine continues running carrying load",
+      "Brief 100-200 ms power gap on load during the transfer",
+      "Use Remote Stop to retransfer back to utility",
     ],
   },
 };

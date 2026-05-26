@@ -107,6 +107,10 @@ class SlackConfig(BaseModel):
     alert_on_state_change: bool = False
     alert_on_command: bool = True
     alert_on_comms_lost: bool = True
+    # Utility ↔ generator load-source transitions. Defaults on because
+    # an outage / restored-power notification is high-signal — operators
+    # want to know immediately, even if engine state change alerts are off.
+    alert_on_load_source_change: bool = True
 
 
 class Settings(BaseSettings):
