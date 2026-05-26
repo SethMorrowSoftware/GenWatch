@@ -105,7 +105,7 @@ class ControlService:
 
     async def issue_token(self, operator: str) -> ConfirmToken:
         async with self._lock:
-            await self._evict_expired()
+            await self._evict_expired_locked()
             tok = secrets.token_hex(4).upper()  # 8 hex chars to match design
             # Avoid collisions
             while tok in self._tokens:
@@ -122,21 +122,35 @@ class ControlService:
             return ct
 
     async def consume_token(self, token: str, operator: str) -> ConfirmToken:
-        async with self._lock:
-            await self._evict_expired()
-            ct = self._tokens.pop(token, None)
-            if ct is None:
-                self.db.write_audit(operator, "control.consume_token", "missing", token, "denied")
-                raise ControlError("token_invalid", "Invalid or expired confirm token", 400)
-            if ct.expires_at < time.time():
-                self.db.write_audit(operator, "control.consume_token", "expired", token, "denied")
-                raise ControlError("token_expired", "Confirm token expired (>30s)", 400)
-            if ct.operator != operator:
-                self.db.write_audit(operator, "control.consume_token", "operator_mismatch", token, "denied")
-                raise ControlError("token_mismatch", "Confirm token was issued to a different operator", 403)
-            return ct
+        """Validate + consume a confirm token (takes self._lock).
 
-    async def _evict_expired(self) -> None:
+        Used by callers that need a confirm-token gate but don't go
+        through the full execute() flow — currently the alarm-ack
+        endpoint. The control execute() path uses
+        _consume_token_locked directly so the entire
+        gate-recheck → consume → modbus-write critical section runs
+        under a single lock acquisition.
+        """
+        async with self._lock:
+            return await self._consume_token_locked(token, operator)
+
+    async def _consume_token_locked(self, token: str, operator: str) -> ConfirmToken:
+        """Caller MUST hold self._lock — does not acquire it itself."""
+        await self._evict_expired_locked()
+        ct = self._tokens.pop(token, None)
+        if ct is None:
+            self.db.write_audit(operator, "control.consume_token", "missing", token, "denied")
+            raise ControlError("token_invalid", "Invalid or expired confirm token", 400)
+        if ct.expires_at < time.time():
+            self.db.write_audit(operator, "control.consume_token", "expired", token, "denied")
+            raise ControlError("token_expired", "Confirm token expired (>30s)", 400)
+        if ct.operator != operator:
+            self.db.write_audit(operator, "control.consume_token", "operator_mismatch", token, "denied")
+            raise ControlError("token_mismatch", "Confirm token was issued to a different operator", 403)
+        return ct
+
+    async def _evict_expired_locked(self) -> None:
+        """Caller MUST hold self._lock — does not acquire it itself."""
         now = time.time()
         for t, ct in list(self._tokens.items()):
             if ct.expires_at < now:
@@ -152,57 +166,84 @@ class ControlService:
             raise ControlError("unknown_verb", f"unknown control verb {verb!r}", 400)
 
         ctl_name = VERB_TO_CONTROL[verb]
-        ctl: ControlDef | None = self.regmap.controls.get(ctl_name)
-        if ctl is None:
-            self.db.write_audit(operator, f"control.{verb}", "no_register", token, "failed")
-            raise ControlError(
-                "no_register",
-                f"control {ctl_name!r} is not present in the register map. "
-                f"Edit registers/h100.yaml or settings.",
-                500,
-            )
 
-        # Panel key-switch gate. The H-100 ignores remote writes unless
-        # the front-panel key is in AUTO; surfacing this server-side
-        # turns the failure mode from "silent no-op at the unit" into a
-        # visible 409 the UI can render. Skip the check only if the verb
-        # doesn't require AUTO (none today, but the table leaves room).
-        if verb in PANEL_AUTO_REQUIRED:
-            panel_mode = self.state.snap.panel_mode
-            if panel_mode != "auto":
-                self.db.write_audit(
-                    operator, f"control.{verb}", f"panel_mode={panel_mode}", token, "denied"
-                )
+        # Critical section: regmap-resolve → snap-read → gate-check →
+        # token-consume → modbus-write all run under self._lock so
+        # concurrent control requests serialize. Without this, two
+        # operators (or the same operator's frontend retry) clicking
+        # Start in the same window can both observe engine_state=
+        # "stopped" pre-lock, both pass to consume_token, both end up
+        # writing remote_start to the H-100. Re-reading the state
+        # snapshot here (instead of before the lock) ensures the gate
+        # is evaluated against the latest poll result and not a
+        # potentially-stale value captured before queueing on the lock.
+        async with self._lock:
+            # Resolve control register against the CURRENT regmap.
+            # apply_regmap() also takes self._lock, so a hot-reload
+            # that lands while this request was queued is reflected
+            # here — we won't write to a register the new YAML doesn't
+            # define.
+            ctl: ControlDef | None = self.regmap.controls.get(ctl_name)
+            if ctl is None:
+                self.db.write_audit(operator, f"control.{verb}", "no_register", token, "failed")
                 raise ControlError(
-                    "panel_mode_locked",
-                    f"cannot {verb}: H-100 front-panel key switch is {panel_mode.upper()}. "
-                    f"Set the panel to AUTO at the unit before issuing remote commands.",
-                    409,
+                    "no_register",
+                    f"control {ctl_name!r} is not present in the register map. "
+                    f"Edit registers/h100.yaml or settings.",
+                    500,
                 )
 
-        # Server-side state-validity guard (defense in depth).
-        cur = self.state.snap.engine_state
-        allowed = ALLOWED.get(verb, set())
-        if cur not in allowed:
-            self.db.write_audit(operator, f"control.{verb}", f"state={cur}", token, "denied")
-            raise ControlError("invalid_state", f"cannot {verb} while engine is {cur}", 409)
+            # Panel key-switch gate. The H-100 ignores remote writes
+            # unless the front-panel key is in AUTO; surfacing this
+            # server-side turns the failure mode from "silent no-op at
+            # the unit" into a visible 409 the UI can render. Snap is
+            # re-read here so we catch a key turn that landed between
+            # the request arriving and the lock being granted. Verbs
+            # not in PANEL_AUTO_REQUIRED skip this gate.
+            if verb in PANEL_AUTO_REQUIRED:
+                panel_mode = self.state.snap.panel_mode
+                if panel_mode != "auto":
+                    self.db.write_audit(
+                        operator, f"control.{verb}", f"panel_mode={panel_mode}", token, "denied"
+                    )
+                    raise ControlError(
+                        "panel_mode_locked",
+                        f"cannot {verb}: H-100 front-panel key switch is {panel_mode.upper()}. "
+                        f"Set the panel to AUTO at the unit before issuing remote commands.",
+                        409,
+                    )
 
-        # Consume token (atomic with state check)
-        await self.consume_token(token, operator)
+            # Server-side state-validity guard (defense in depth).
+            # Re-read under the lock so a state change observed by the
+            # poller between request-arrival and lock-grant is honored.
+            cur = self.state.snap.engine_state
+            allowed = ALLOWED.get(verb, set())
+            if cur not in allowed:
+                self.db.write_audit(operator, f"control.{verb}", f"state={cur}", token, "denied")
+                raise ControlError("invalid_state", f"cannot {verb} while engine is {cur}", 409)
 
-        # Write the Modbus register(s). FC16 multi-register writes use `values`;
-        # FC06/FC16 single-register writes use a one-element list.
-        write_words = list(ctl.write_values)
-        log.warning(
-            "CONTROL %s by %s -> %s @0x%04X fc=%d values=%s",
-            verb, operator, ctl.name, ctl.addr, ctl.fc,
-            [f"0x{w:04X}" for w in write_words],
-        )
-        if len(write_words) == 1 and ctl.fc == 6:
-            res = await self.client.write(ctl.addr, write_words[0], fc=6)
-        else:
-            res = await self.client.write(ctl.addr, fc=ctl.fc, values=write_words)
-        ts = time.time()
+            # All gates passed against the freshest snap. Commit by
+            # consuming the token. If the modbus write below fails,
+            # the operator must issue a fresh token to retry — that's
+            # intentional (same behavior as before this refactor).
+            await self._consume_token_locked(token, operator)
+
+            # Write the Modbus register(s). FC16 multi-register writes use `values`;
+            # FC06/FC16 single-register writes use a one-element list.
+            write_words = list(ctl.write_values)
+            log.warning(
+                "CONTROL %s by %s -> %s @0x%04X fc=%d values=%s",
+                verb, operator, ctl.name, ctl.addr, ctl.fc,
+                [f"0x{w:04X}" for w in write_words],
+            )
+            if len(write_words) == 1 and ctl.fc == 6:
+                res = await self.client.write(ctl.addr, write_words[0], fc=6)
+            else:
+                res = await self.client.write(ctl.addr, fc=ctl.fc, values=write_words)
+            ts = time.time()
+        # End critical section. Audit/event/Slack writes don't need to
+        # be serialized against other control requests.
+
         if not res.ok:
             self.db.write_audit(operator, f"control.{verb}", res.error or "modbus_write_failed", token, "failed")
             self.db.write_event(
