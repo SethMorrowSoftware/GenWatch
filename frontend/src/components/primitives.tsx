@@ -56,7 +56,8 @@ type IconName =
   | "switch_" | "lock" | "user" | "filter" | "download" | "plus"
   | "flame" | "drop" | "spark" | "wave" | "cable" | "cpu" | "bookmark"
   | "folder" | "list" | "plug" | "bars"
-  | "sun" | "moon" | "info" | "inbox" | "search" | "logout";
+  | "sun" | "moon" | "info" | "inbox" | "search" | "logout"
+  | "wifi-off";
 
 export const Icon = ({ name, size = 16, stroke = 1.6 }: { name: IconName; size?: number; stroke?: number }) => {
   const p = (d: string) => (
@@ -102,6 +103,7 @@ export const Icon = ({ name, size = 16, stroke = 1.6 }: { name: IconName; size?:
     inbox:     <>{p("M4 13h4l2 3h4l2-3h4")}{p("M4 13l3-8h10l3 8v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z")}</>,
     search:    <>{c(11,11,7)}{p("M16 16l5 5")}</>,
     logout:    <>{p("M16 17l5-5-5-5M21 12H9M9 5H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h4")}</>,
+    "wifi-off": <>{p("M3 8.5a15 15 0 0 1 4.5-2.7")}{p("M16 6.2a15 15 0 0 1 5 2.3")}{p("M6 12a10 10 0 0 1 3.5-2")}{p("M14.5 10a10 10 0 0 1 3.5 2")}{p("M9 15.5a5 5 0 0 1 6 0")}{c(12,19,0.5)}{p("M3 3l18 18")}</>,
   };
   return <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true">{paths[name]}</svg>;
 };
