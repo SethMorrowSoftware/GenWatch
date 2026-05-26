@@ -43,6 +43,25 @@ def get_principal(request: Request) -> Principal:
     )
 
 
+# Role model — single password today, structured for two roles tomorrow.
+#
+# The only login path (api/auth.py:login) authenticates against
+# `admin_password_hash` and issues a token with `role="admin"`. There is
+# no operator login and no viewer login. So in current behavior:
+#
+#   - require_operator admits {operator, admin} → admits the one real
+#     login, plus any future operator role.
+#   - require_admin admits {admin} only → also admits the one real login.
+#
+# Both gates therefore pass for every authenticated user TODAY — the
+# distinction is forward-compat scaffolding for the day a second password
+# is introduced. Keep that in mind when adding new sensitive endpoints:
+# `require_admin` is not a stronger gate than `require_operator` until
+# the second login lands. Pick the gate that documents *intent* (which
+# role SHOULD this require if we later split them) rather than treating
+# `require_admin` as a real boundary. Anything secret-handling should use
+# require_admin; anything operational (control, read, status) should use
+# require_operator.
 def require_operator(p: Principal = Depends(get_principal)) -> Principal:
     if p.role not in ("operator", "admin"):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "operator role required")

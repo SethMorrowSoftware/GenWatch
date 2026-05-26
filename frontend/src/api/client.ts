@@ -29,6 +29,13 @@ async function request<T>(
     credentials: "include",
     headers: {
       "Content-Type": "application/json",
+      // Custom header that browsers will not allow a cross-origin form
+      // POST to set without a CORS preflight — adds a second layer of
+      // CSRF defense alongside the server's Origin/Referer middleware.
+      // The server doesn't currently require it (would break legitimate
+      // non-browser clients), but the FE marks every request so the
+      // header is available if/when server-side enforcement lands.
+      "X-Requested-With": "XMLHttpRequest",
       ...(init.headers || {}),
     },
     ...init,

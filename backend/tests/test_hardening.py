@@ -308,6 +308,49 @@ def test_hash_command_argv_path_works_but_warns(monkeypatch, capsys):
 # ─── No silent mock fallback ──────────────────────────────────────────────
 
 
+async def test_lifespan_refuses_empty_jwt_secret_in_production(monkeypatch, tmp_path):
+    """In production (non-mock) the service must refuse to start with
+    an empty jwt_secret. Silently minting an ephemeral one under
+    Restart=always produces a unit that's "up" but logs every operator
+    out on each restart — masking the real config problem and
+    invalidating sessions repeatedly. Fail fast instead."""
+    from genwatch.main import create_app
+
+    monkeypatch.delenv("GENWATCH_MOCK", raising=False)  # non-mock
+    monkeypatch.setenv("GENWATCH_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("GENWATCH_AUTH__JWT_SECRET", "")  # empty
+    monkeypatch.setenv("GENWATCH_AUTH__ADMIN_PASSWORD_HASH", "$2b$12$" + "x" * 53)
+    # Point at a TCP target that can't connect — lifespan should raise
+    # on the JWT check BEFORE attempting any Modbus I/O.
+    monkeypatch.setenv("GENWATCH_TRANSPORT", "tcp")
+    monkeypatch.setenv("GENWATCH_MODBUS_TCP__HOST", "127.0.0.1")
+    monkeypatch.setenv("GENWATCH_MODBUS_TCP__PORT", "1")  # unused port
+
+    app = create_app()
+    with pytest.raises(RuntimeError, match=r"jwt_secret"):
+        async with app.router.lifespan_context(app):
+            pass  # should never enter
+
+
+async def test_lifespan_mock_mode_still_generates_ephemeral_secret(monkeypatch, tmp_path):
+    """Dev/CI shouldn't be blocked by an unset secret — mock mode
+    generates an ephemeral one (and logs a warning). The production-
+    only refusal preserves that workflow."""
+    from genwatch.main import create_app
+
+    monkeypatch.setenv("GENWATCH_MOCK", "true")
+    monkeypatch.setenv("GENWATCH_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("GENWATCH_AUTH__JWT_SECRET", "")
+    monkeypatch.setenv("GENWATCH_AUTH__ADMIN_PASSWORD_HASH", "$2b$12$" + "x" * 53)
+
+    app = create_app()
+    # Should boot cleanly — no RuntimeError, no auth complaint.
+    async with app.router.lifespan_context(app):
+        # The settings object inside lifespan got the ephemeral secret;
+        # verify by issuing a token using the live state.
+        assert app.state.settings.auth.jwt_secret != ""
+
+
 def test_config_does_not_auto_mock_when_device_missing(monkeypatch, tmp_path):
     """When the serial device is absent and mock isn't requested, the
     config layer must leave mock=False — we never silently switch to

@@ -15,7 +15,7 @@ import yaml
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from .deps import Principal, require_admin
+from .deps import Principal, require_admin, require_operator
 
 log = logging.getLogger("genwatch.api.settings")
 
@@ -23,7 +23,10 @@ router = APIRouter(prefix="/api", tags=["settings"])
 
 
 @router.get("/config")
-async def get_config(request: Request) -> dict:
+async def get_config(
+    request: Request,
+    p: Principal = Depends(require_operator),
+) -> dict:
     s = request.app.state.settings
     return {
         "configPath": s.config_path,
@@ -213,7 +216,10 @@ async def test_slack(
 
 
 @router.get("/registers")
-async def get_registers(request: Request) -> dict:
+async def get_registers(
+    request: Request,
+    p: Principal = Depends(require_operator),
+) -> dict:
     rm = request.app.state.regmap
     snap = request.app.state.state_machine.snap
     reading = snap.last_reading.values
