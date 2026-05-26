@@ -41,9 +41,17 @@ if TYPE_CHECKING:
 log = logging.getLogger("genwatch.ats")
 
 
-# This consumer is built against ICD v1.x. A major version bump on the
-# ATS-Pi side requires updating this constant and the consumer logic.
+# This consumer is built against ICD v1.0. Per ICD §5.4:
+#   - Major mismatch  → refuse authority (is_authoritative() returns False).
+#   - Minor ahead     → warn but continue: the ATS-Pi may expose newer
+#                       registers we don't read, but everything we DO
+#                       read is still wire-compatible.
+#   - Minor behind    → error but continue: the ATS-Pi is missing
+#                       registers we expect; those reads return 0 per
+#                       the RESERVED rule and may surface as null/zero
+#                       fields in the UI.
 EXPECTED_ICD_MAJOR = 1
+EXPECTED_ICD_MINOR = 0
 
 # Decoding tables for the enum registers. Values outside the documented
 # range decode to 'unknown' for forward compatibility with future ICD
@@ -362,19 +370,11 @@ class AtsService:
                 "ts": now,
             })
 
-        # ICD version validation — log once per session if mismatch
+        # ICD version validation — run once per session per ICD §5.4.
+        # ``icd_major > 0`` guards against the boot window where the
+        # base poll hasn't landed yet (the snapshot defaults are zero).
         if not self._icd_version_validated and icd_major > 0:
-            if icd_major != EXPECTED_ICD_MAJOR:
-                log.error(
-                    "ATS-Pi reports ICD major v%d, GenWatch expects v%d. "
-                    "is_authoritative() will return False until aligned.",
-                    icd_major, EXPECTED_ICD_MAJOR,
-                )
-            else:
-                log.info(
-                    "ATS-Pi ICD version OK: v%d.%d (consumer expects v%d.x)",
-                    icd_major, icd_minor, EXPECTED_ICD_MAJOR,
-                )
+            self._validate_icd_version(icd_major, icd_minor, now, emitted)
             self._icd_version_validated = True
 
         # ── Update the snapshot ───────────────────────────────────────
@@ -521,6 +521,113 @@ class AtsService:
         evt = {"type": ev_type, "ts": ts, **payload}
         emitted.append(evt)
         log.info("ats event: %s %s", ev_type, payload)
+
+    def _validate_icd_version(
+        self,
+        icd_major: int,
+        icd_minor: int,
+        now: float,
+        emitted: list[dict[str, Any]],
+    ) -> None:
+        """Apply ICD §5.4 version-mismatch policy.
+
+        Four cases:
+
+        - **major mismatch** — refuse authority (handled in
+          ``is_authoritative``). Log at error level + emit a
+          warn-severity event so the operator sees the contract break
+          in the events feed, not just journalctl.
+        - **minor ahead** — the ATS-Pi has registers we don't read.
+          Forward-compatible per the wire contract, but worth telling
+          the operator their UI may be missing newer fields the
+          companion supports. Info severity.
+        - **minor behind** — the ATS-Pi is missing registers we
+          expect. Reads return 0 per the RESERVED rule, so dependent
+          UI fields will show null/zero. Warn severity.
+        - **exact match** — log only, no event (happy path doesn't
+          need a row in the feed).
+        """
+        if icd_major != EXPECTED_ICD_MAJOR:
+            msg = (
+                f"ATS-Pi reports ICD v{icd_major}.{icd_minor}, GenWatch "
+                f"expects v{EXPECTED_ICD_MAJOR}.x. Major mismatch — "
+                "ATS-Pi readings will not drive loadSource until aligned."
+            )
+            log.error(msg)
+            self._emit_event(
+                emitted,
+                ev_type="ats-icd-version",
+                payload={
+                    "ats_major": icd_major,
+                    "ats_minor": icd_minor,
+                    "expected_major": EXPECTED_ICD_MAJOR,
+                    "expected_minor": EXPECTED_ICD_MINOR,
+                    "compatibility": "major_mismatch",
+                },
+                severity="warn",
+                type_="ATS_ICD_VERSION",
+                message=msg,
+                ts=now,
+            )
+            return
+
+        if icd_minor > EXPECTED_ICD_MINOR:
+            msg = (
+                f"ATS-Pi reports ICD v{icd_major}.{icd_minor}, GenWatch "
+                f"expects v{EXPECTED_ICD_MAJOR}.{EXPECTED_ICD_MINOR}. "
+                "Minor-ahead: the companion may expose newer registers "
+                "this version of GenWatch doesn't read. Existing fields "
+                "are wire-compatible."
+            )
+            log.info(msg)
+            self._emit_event(
+                emitted,
+                ev_type="ats-icd-version",
+                payload={
+                    "ats_major": icd_major,
+                    "ats_minor": icd_minor,
+                    "expected_major": EXPECTED_ICD_MAJOR,
+                    "expected_minor": EXPECTED_ICD_MINOR,
+                    "compatibility": "minor_ahead",
+                },
+                severity="info",
+                type_="ATS_ICD_VERSION",
+                message=msg,
+                ts=now,
+            )
+            return
+
+        if icd_minor < EXPECTED_ICD_MINOR:
+            msg = (
+                f"ATS-Pi reports ICD v{icd_major}.{icd_minor}, GenWatch "
+                f"expects v{EXPECTED_ICD_MAJOR}.{EXPECTED_ICD_MINOR}. "
+                "Minor-behind: registers added in newer minor versions "
+                "will read as zero. Some UI fields may be missing — "
+                "update the ATS-Pi firmware to align."
+            )
+            log.error(msg)
+            self._emit_event(
+                emitted,
+                ev_type="ats-icd-version",
+                payload={
+                    "ats_major": icd_major,
+                    "ats_minor": icd_minor,
+                    "expected_major": EXPECTED_ICD_MAJOR,
+                    "expected_minor": EXPECTED_ICD_MINOR,
+                    "compatibility": "minor_behind",
+                },
+                severity="warn",
+                type_="ATS_ICD_VERSION",
+                message=msg,
+                ts=now,
+            )
+            return
+
+        # Exact match — log only, no event.
+        log.info(
+            "ATS-Pi ICD version OK: v%d.%d (matches consumer expectation)",
+            icd_major, icd_minor,
+        )
 
     async def _forward_to_slack(self, evt: dict[str, Any]) -> None:
         """Route ATS events into the existing Slack notifier."""
