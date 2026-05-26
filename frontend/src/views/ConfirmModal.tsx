@@ -80,9 +80,21 @@ export function ConfirmModal({ command, operator, onClose, onSuccess }: Props) {
     api.confirmToken()
       .then((r) => {
         setToken(r.token);
-        // Backend returns expires_at as unix seconds (float). Convert
-        // to ms to match Date.now() for the countdown math.
-        setTokenExpiresAtMs(r.expiresAt * 1000);
+        // Anchor expiry to OUR clock at receipt, not the server's
+        // absolute unix timestamp. The Pi runs without an RTC and NTP
+        // is not guaranteed; the operator's laptop clock can also be
+        // off by minutes. Using r.expiresAt directly produced bad
+        // countdowns ("valid -30s" or infinite auto-refresh loops)
+        // whenever the two clocks diverged. Subtracting the server-
+        // derived lifetime (expiresAt - issuedAt) from Date.now()
+        // makes the countdown depend on a duration the server is
+        // authoritative on plus our local clock — drift-immune.
+        // We sacrifice the network-latency portion of the TTL (server
+        // started counting when it issued; we start counting now), but
+        // that's the conservative direction and the server remains
+        // the authority on the actual expiry.
+        const lifetimeMs = Math.max(0, (r.expiresAt - r.issuedAt) * 1000);
+        setTokenExpiresAtMs(Date.now() + lifetimeMs);
       })
       .catch((e: ApiError) => {
         setFetchFailed(true);

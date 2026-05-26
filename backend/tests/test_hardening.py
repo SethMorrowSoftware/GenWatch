@@ -492,6 +492,160 @@ async def test_poller_skips_registers_whose_fanout_fails(tmp_path):
     )
 
 
+async def test_poller_stamps_value_ages_on_successful_decode(tmp_path):
+    """Every successful register decode bumps its monotonic age stamp.
+    Downstream eviction logic uses this to retire entries whose fan-out
+    has been failing for many cycles — without per-register age, a
+    boot-time value can linger forever and masquerade as fresh."""
+    import time
+    from genwatch.modbus.client import MockModbusClient
+    from genwatch.modbus.poller import Poller
+    from genwatch.modbus.registers import load_register_map
+
+    regmap = load_register_map("genwatch/registers/h100.yaml")
+    client = MockModbusClient(regmap)
+    await client.connect()
+
+    async def cb(tier, reading, health):
+        pass
+
+    p = Poller(client, regmap, cb)
+    assert p.reading.value_ages == {}
+    t0 = time.monotonic()
+    await p._poll_tier("prime")
+    # Every decoded prime register has an age, and it's monotonic-clock
+    # based (not wall clock).
+    assert len(p.reading.value_ages) > 0
+    for name, age_ts in p.reading.value_ages.items():
+        assert t0 <= age_ts <= time.monotonic(), (
+            f"age for {name} should be a monotonic timestamp inside the poll window"
+        )
+        assert name in p.reading.values, "every aged register should have a value"
+
+
+async def test_poller_evicts_stale_values_past_tier_threshold(tmp_path):
+    """A register whose fan-out keeps failing for many cycles must
+    eventually be dropped from `Reading.values`. The TTL is
+    TIER_STALE_MULTIPLIER × tier_cadence; before that threshold the
+    last-good is preserved (test_poller_skips_registers_whose_fanout_fails),
+    after it the value disappears so consumers see None instead of a
+    phantom-fresh datum that could fool an alarm comparator."""
+    from dataclasses import dataclass, field
+    from genwatch.modbus.client import ModbusResult
+    from genwatch.modbus.poller import Poller, TIER_STALE_MULTIPLIER
+    from genwatch.modbus.registers import load_register_map
+
+    regmap = load_register_map("genwatch/registers/h100.yaml")
+    target = regmap.by_name("output_status_1")
+    assert target is not None
+
+    @dataclass
+    class FakeClient:
+        # Always succeed except for the target address — both batches
+        # covering it and its single-read fallback fail.
+        addrs_failed: list[int] = field(default_factory=list)
+
+        async def connect(self): return True
+
+        async def close(self): pass
+
+        async def read(self, addr, count, fc=3):
+            if count == 1:
+                if addr == target.addr:
+                    self.addrs_failed.append(addr)
+                    return ModbusResult.failure("simulated", 1.0)
+                return ModbusResult.success([0x1234], 1.0)
+            # All batches fail so we fall through to single reads — that
+            # exercises the per-register fan-out path including the
+            # target's failure case.
+            return ModbusResult.failure("simulated_batch_failure", 1.0)
+
+    fc = FakeClient()
+
+    async def cb(tier, reading, health):
+        pass
+
+    p = Poller(fc, regmap, cb)
+    # Pre-seed a known last-good value AND a fresh age stamp so we can
+    # observe the eviction transition. Without the age stamp the
+    # eviction logic correctly skips the register (no age = never
+    # decoded = nothing to evict).
+    import time
+    p.reading.values[target.name] = 0xABCD
+    p.reading.value_ages[target.name] = time.monotonic()
+
+    # First poll: target's fan-out fails but the value is still fresh
+    # (age stamped just now). Must preserve.
+    await p._poll_tier("prime")
+    assert p.reading.values.get(target.name) == 0xABCD, (
+        "value should survive a single failing cycle while still fresh"
+    )
+
+    # Now backdate the age past the eviction threshold so the next
+    # poll's eviction sweep will drop it. Cadence × multiplier seconds
+    # of simulated age, plus a margin.
+    threshold_s = (regmap.prime_poll_ms / 1000.0) * TIER_STALE_MULTIPLIER
+    p.reading.value_ages[target.name] = time.monotonic() - threshold_s - 1.0
+
+    await p._poll_tier("prime")
+    # The eviction sweep ran, target's age was over threshold, and the
+    # fan-out still couldn't refresh it — so the value is now gone.
+    # Downstream consumers will see None and degrade gracefully.
+    assert target.name not in p.reading.values, (
+        "stale value past TIER_STALE_MULTIPLIER × cadence should be evicted"
+    )
+    assert target.name not in p.reading.value_ages
+
+
+async def test_poller_eviction_is_per_tier(tmp_path):
+    """A prime-tier poll must not evict base-tier values (and vice
+    versa). Each tier walks only its own registers. Without this,
+    a frozen prime cycle would silently retire every base-tier metric
+    even though base reads might be working fine."""
+    from dataclasses import dataclass
+    from genwatch.modbus.client import ModbusResult
+    from genwatch.modbus.poller import Poller, TIER_STALE_MULTIPLIER
+    from genwatch.modbus.registers import load_register_map
+
+    import time
+
+    regmap = load_register_map("genwatch/registers/h100.yaml")
+
+    @dataclass
+    class FakeClient:
+        async def connect(self): return True
+
+        async def close(self): pass
+
+        async def read(self, addr, count, fc=3):
+            # Always fail so the fan-out fails and the eviction sweep
+            # runs but doesn't refresh anything.
+            return ModbusResult.failure("simulated", 1.0)
+
+    fc = FakeClient()
+
+    async def cb(tier, reading, health):
+        pass
+
+    p = Poller(fc, regmap, cb)
+    # Pre-seed a base-tier value that's well past the prime tier's
+    # eviction threshold but still within base tier's threshold.
+    base_reg = next(r for r in regmap.tier("base"))
+    p.reading.values[base_reg.name] = 0xBEEF
+    # Age = 5× prime_cadence ago: past prime threshold (3× prime),
+    # under base threshold (3× base, which is much longer).
+    age_for_prime_eviction = (regmap.prime_poll_ms / 1000.0) * 5
+    p.reading.value_ages[base_reg.name] = time.monotonic() - age_for_prime_eviction
+
+    # Run a PRIME poll. Even though we'd be past the prime threshold
+    # if the base reg were on prime, it's actually on base — the
+    # prime sweep must not touch it.
+    await p._poll_tier("prime")
+    assert p.reading.values.get(base_reg.name) == 0xBEEF, (
+        "prime poll's eviction sweep must not retire base-tier values"
+    )
+
+
 async def test_poller_apply_regmap_swaps_batches_and_cadence(tmp_path):
     """POST /api/registers/reload must update the live poller, not just
     app.state.regmap. Otherwise the operator edits the YAML, reloads,

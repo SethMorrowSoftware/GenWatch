@@ -55,12 +55,33 @@ class Reading:
     Indexed by register name. Values are post-scale (e.g. frequency=60.0
     not 600). engine_state and alarm_state stay raw int — the state
     machine layer turns them into semantic names.
+
+    ``value_ages`` carries a monotonic timestamp per successfully-decoded
+    register name. The poller stamps it on every successful decode and
+    uses it in ``_poll_tier`` to evict last-good values that have aged
+    past ``TIER_STALE_MULTIPLIER × tier_cadence`` — without this, a
+    base-tier value decoded once at boot can linger forever in
+    ``values`` and masquerade as fresh to alarm comparators and UI
+    metrics. ``ts`` stays wall-clock for UI display; ``value_ages`` is
+    monotonic so NTP steps can't fool the staleness check.
     """
     values: dict[str, float | int] = field(default_factory=dict)
     ts: float = field(default_factory=time.time)
+    value_ages: dict[str, float] = field(default_factory=dict)
 
     def get(self, name: str, default=None):
         return self.values.get(name, default)
+
+
+# How many tier-cadences a register's last successful decode can age
+# before we drop it from ``Reading.values``. At 1.5 s prime cadence
+# this is ~4.5 s — long enough to ride through a one-cycle batch failure
+# that the fan-out path recovers from, short enough that a sustained
+# per-register failure surfaces as None to downstream consumers (alarm
+# comparators, status API, state machine derivations) instead of a
+# stale value that looks fresh. Per-tier so a slow base poll doesn't
+# evict legitimate base values while prime hums along.
+TIER_STALE_MULTIPLIER = 3
 
 
 PollCallback = Callable[[str, Reading, CommsHealth], Awaitable[None]]
@@ -246,6 +267,8 @@ class Poller:
         # skipped entirely (rather than decoded against a sentinel zero),
         # preserving the previous good value in self.reading.values.
         new_values: dict[str, float | int] = dict(self.reading.values)
+        new_ages: dict[str, float] = dict(self.reading.value_ages)
+        mono_now = time.monotonic()
         for reg in regmap.tier(tier):
             for start, words, failed_offsets in results:
                 if not (start <= reg.addr and (start + len(words)) >= reg.addr + reg.words):
@@ -256,7 +279,9 @@ class Poller:
                     # One or more words for this register failed even
                     # after fan-out. Leave the prior value in place
                     # rather than overwriting with a sentinel that could
-                    # trip an out-of-range alarm comparator.
+                    # trip an out-of-range alarm comparator. Per-tier
+                    # eviction below will retire the entry if the
+                    # failure persists across multiple cycles.
                     log.debug(
                         "skipping decode of %s @0x%04X — fan-out read failed",
                         reg.name, reg.addr,
@@ -266,9 +291,41 @@ class Poller:
                 decoded = decode_value(reg, reg_words)
                 if decoded is not None:
                     new_values[reg.name] = decoded
+                    new_ages[reg.name] = mono_now
                 break
 
-        self.reading = Reading(values=new_values, ts=time.time())
+        # Per-tier TTL on last-good values. A register that failed to
+        # decode this cycle keeps its prior value (handled above) — but
+        # only up to TIER_STALE_MULTIPLIER × tier_cadence. Past that
+        # threshold the value is dropped: a stale coolant_temp from
+        # boot would otherwise look fresh forever to consumers that
+        # don't track ages (e.g. the YAML alarm comparators). Downstream
+        # consumers already handle None gracefully (`values.get(...)`
+        # returns None and the derivation rules skip the register), so
+        # eviction degrades to a safe "metric unknown" rather than a
+        # phantom-fresh datum.
+        tier_cadence_s = (regmap.prime_poll_ms if tier == "prime" else regmap.base_poll_ms) / 1000.0
+        stale_threshold_s = tier_cadence_s * TIER_STALE_MULTIPLIER
+        for reg in regmap.tier(tier):
+            age_ts = new_ages.get(reg.name)
+            if age_ts is None:
+                # Never decoded successfully yet — nothing to evict.
+                # The first-poll case is naturally handled because the
+                # value dict won't have this key either.
+                continue
+            if (mono_now - age_ts) > stale_threshold_s:
+                if reg.name in new_values:
+                    log.debug(
+                        "evicting stale value for %s "
+                        "(last decoded %.1fs ago, threshold %.1fs)",
+                        reg.name, mono_now - age_ts, stale_threshold_s,
+                    )
+                    new_values.pop(reg.name, None)
+                # Drop the age entry too so it doesn't linger forever
+                # for a register the operator later removes from YAML.
+                new_ages.pop(reg.name, None)
+
+        self.reading = Reading(values=new_values, ts=time.time(), value_ages=new_ages)
 
         # Heartbeat for the systemd watchdog: only stamp on a *prime* poll
         # cycle that produced at least one good batch. A wholly failed

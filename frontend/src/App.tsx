@@ -149,6 +149,14 @@ function Shell({ auth, view, setView, theme, onToggleTheme, onLogout }: {
   const staleThresholdMs = Math.max(6000, (comms?.rateMs ?? 1500) * 3);
   const sinceLastPushMs = live.lastPushAt == null ? Infinity : Date.now() - live.lastPushAt;
   const stale = (live.wsDown || sinceLastPushMs > staleThresholdMs) && !!status;
+  // Panel-mode freshness gate (defense in depth against a backend
+  // mismatch that drops `panel` from snapshots while keeping the WS
+  // alive). The control buttons consume this — when the panel block
+  // hasn't been refreshed inside the staleness window, treat the
+  // panel as unknown and block remote commands, even if other parts
+  // of the snapshot keep flowing.
+  const sincePanelMs = live.panelLastSeenAt == null ? Infinity : Date.now() - live.panelLastSeenAt;
+  const panelStale = sincePanelMs > staleThresholdMs && !!status;
   // Reference `clock` so the memoizer recomputes once per second.
   void clock;
 
@@ -238,7 +246,7 @@ function Shell({ auth, view, setView, theme, onToggleTheme, onLogout }: {
         )}
         {tickedStatus && (
           <div className="view" key={view}>
-            {view === "live" && <LiveView status={tickedStatus} history={live.history} operator={auth.operator ?? "operator"} stale={stale} />}
+            {view === "live" && <LiveView status={tickedStatus} history={live.history} operator={auth.operator ?? "operator"} stale={stale} panelStale={panelStale} />}
             {view === "history" && <HistoryView />}
             {view === "events" && <EventsView />}
             {view === "settings" && <SettingsView />}
