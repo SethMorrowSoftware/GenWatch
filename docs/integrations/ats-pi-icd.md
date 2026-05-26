@@ -181,7 +181,7 @@ All timestamps are **Unix epoch seconds (UTC), u32 big-endian**.
 | Addr | Words | Type | Field | Encoding | Notes |
 |---|---|---|---|---|---|
 | `0x0010` | 2 | u32 | `last_transfer_to_gen_ts` | epoch s | When the ATS last transferred load *to* the generator. `0` if never observed since the ATS-Pi was installed. |
-| `0x0012` | 2 | u32 | `last_retransfer_to_utility_ts` | epoch s | When the ATS last retransferred *to* utility. `0` if never observed. |
+| `0x0012` | 2 | u32 | `last_retransfer_to_util_ts` | epoch s | When the ATS last retransferred *to* utility. `0` if never observed. |
 | `0x0014` | 2 | u32 | `ats_pi_uptime_s` | seconds since boot | Monotonic, resets only on reboot. Lets GenWatch detect an undetected reboot of the ATS-Pi. |
 | `0x0016` | 2 | u32 | `ats_pi_wallclock` | epoch s | The ATS-Pi's *current* wall-clock time at the moment of read. GenWatch will compare against its own clock; a discrepancy > 5 s raises a `TIME_SKEW` warn. |
 | `0x0018` – `0x001F` | — | — | RESERVED | | |
@@ -320,7 +320,7 @@ Every observable state change (position, source-availability, mode, fault) MUST 
 |---|
 | The ATS-Pi MUST come up in a "no commands asserted" state. All write registers start at `0x0000`, all read-back registers read `0x0000`. |
 | `transfer_count_lifetime` MUST be persistent — restoration of this counter from disk is REQUIRED. Other registers MAY initialize to default values. |
-| `last_transfer_to_gen_ts` / `last_retransfer_to_utility_ts` SHOULD be persistent but MAY reset to `0` if persistence is not implemented. |
+| `last_transfer_to_gen_ts` / `last_retransfer_to_util_ts` SHOULD be persistent but MAY reset to `0` if persistence is not implemented. |
 | `ats_pi_uptime_s` resets to `0` and counts from boot. |
 | GenWatch detects an undetected reboot by observing `uptime_s` going backwards and logs an `ATS_PI_REBOOT` info-severity event. |
 
@@ -378,7 +378,7 @@ A shared **golden test sequence** is RECOMMENDED:
 | 0 | Boot ATS-Pi; both sources healthy; load on Normal | `position=0, normal_avail=1, emergency_avail=1, engine_start_calling=0` |
 | 30 | Open utility breaker | `position=0` (still — gen not started yet), `normal_avail=0`, `engine_start_calling=1` |
 | 35 | (Wait for H-100 to start engine; ATS transfers) | `position=2` (transferring) for ~1 s, then `position=1`, `last_transfer_to_gen_ts=<now>` |
-| 600 | Close utility breaker | `normal_avail=1`. After ATS retransfer delay: `position=2`, then `position=0`, `last_retransfer_to_utility_ts=<now>`. `engine_start_calling` goes to `0` after retransfer. |
+| 600 | Close utility breaker | `normal_avail=1`. After ATS retransfer delay: `position=2`, then `position=0`, `last_retransfer_to_util_ts=<now>`. `engine_start_calling` goes to `0` after retransfer. |
 
 Both projects MUST run this sequence (with mocks) before each ICD-affecting release.
 
@@ -444,7 +444,7 @@ t=600.0  R 0x0000-0x0005: position=1 norm=1 emerg=1 startcall=1 mode=0 fault=0  
 ... (ATS retransfer time delay, typically 5-30 min — ATS-side setting)
 t=900.0  R 0x0000-0x0005: position=2 norm=1 emerg=1 startcall=0 mode=0 fault=0   ← retransferring
 t=901.5  R 0x0000-0x0005: position=0 norm=1 emerg=1 startcall=0 mode=0 fault=0   ← back on utility
-         R 0x0010-0x0017: last_retransfer_to_utility_ts=<wallclock at t=900.0>
+         R 0x0010-0x0017: last_retransfer_to_util_ts=<wallclock at t=900.0>
 ... (H-100 enters cool-down on its own — ATS no longer commanding start)
 ```
 

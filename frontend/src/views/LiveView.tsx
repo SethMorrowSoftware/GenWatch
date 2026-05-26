@@ -10,6 +10,13 @@ interface Props {
   status: StatusBody;
   history: Reading[];
   operator: string;
+  // True when the live link is stale: WebSocket down OR no push received
+  // within ~3 prime intervals. Plumbed in from App so ControlsPanel can
+  // block remote commands — issuing Stop based on a frozen "running"
+  // reading after the engine has actually quit would be a real-world
+  // safety regression. The same flag drives the red STALE DATA badge
+  // in the topbar so the two signals stay in sync.
+  stale: boolean;
 }
 
 const STATE_LABEL: Record<EngineState, string> = {
@@ -63,7 +70,7 @@ const STATE_BADGE: Record<EngineState, string> = {
   unknown: "—",
 };
 
-export function LiveView({ status, history, operator }: Props) {
+export function LiveView({ status, history, operator, stale }: Props) {
   const [confirmCmd, setConfirmCmd] = useState<"start" | "stop" | "exercise" | "transfer" | null>(null);
 
   const reading = status.reading;
@@ -98,6 +105,7 @@ export function LiveView({ status, history, operator }: Props) {
         <ControlsPanel
           state={status.state}
           panelMode={status.panel.mode}
+          stale={stale}
           onCommand={setConfirmCmd}
         />
       </div>
@@ -650,66 +658,93 @@ function EngineMetric({ label, value, unit, sparkPoints, color, warnRange, numer
 }
 
 // ─── Controls panel ──────────────────────────────────────────────────────
-function ControlsPanel({ state, panelMode, onCommand }: {
+function ControlsPanel({ state, panelMode, stale, onCommand }: {
   state: EngineState;
   panelMode: "auto" | "manual" | "off" | "unknown";
+  stale: boolean;
   onCommand: (cmd: "start" | "stop" | "exercise" | "transfer") => void;
 }) {
-  // The H-100 only honors remote start/stop/exercise/transfer writes
-  // when the front-panel key switch is in AUTO. MANUAL/OFF locally
-  // locks out the controller's remote-command path, so an enabled UI
-  // button on a non-AUTO panel would just produce a silent no-op at
-  // the unit. The backend rejects with 409 either way; this just keeps
-  // the UI honest. "unknown" means the prime poll hasn't decoded
-  // input_status_1 yet (cold start) or the operator's panel_mode_bits
-  // YAML rules don't match their firmware — safer to gate.
+  // Two gates, both required before any remote command is offered:
+  //
+  // 1. Live-link freshness (`linkOk`). When the WebSocket is down or the
+  //    server has gone silent for ~3 prime intervals (same signal as the
+  //    red STALE DATA badge in the topbar), the engine state shown here
+  //    is no longer trustworthy. Issuing Stop based on a frozen
+  //    "running" reading after the engine has actually quit would be a
+  //    real-world safety regression — the backend's state-validity
+  //    guard is the backstop, but we should never present an enabled
+  //    button whose precondition we can't currently verify.
+  //
+  // 2. Panel key switch (`panelOk`). The H-100 only honors remote
+  //    start/stop/exercise/transfer writes when the front-panel key
+  //    switch is in AUTO. MANUAL/OFF locally locks out the controller's
+  //    remote-command path, so an enabled UI button on a non-AUTO
+  //    panel would just produce a silent no-op at the unit. "unknown"
+  //    means the prime poll hasn't decoded input_status_1 yet (cold
+  //    start) or the operator's panel_mode_bits YAML rules don't match
+  //    their firmware — safer to gate.
+  const linkOk = !stale;
   const panelOk = panelMode === "auto";
-  const canStart = panelOk && state === "stopped";
-  const canStop = panelOk && (state === "running" || state === "exercising" || state === "cranking");
-  const canExercise = panelOk && state === "stopped";
-  const canTransfer = panelOk && state === "running";
+  const canStart = linkOk && panelOk && state === "stopped";
+  const canStop = linkOk && panelOk && (state === "running" || state === "exercising" || state === "cranking");
+  const canExercise = linkOk && panelOk && state === "stopped";
+  const canTransfer = linkOk && panelOk && state === "running";
 
+  // Stale takes precedence in the operator-facing hint — it's the more
+  // urgent thing to know. Panel mode is something the operator can fix
+  // at the unit; a stale link means we may not even be talking to the
+  // unit right now and the next push could land any second.
+  const staleHint = stale
+    ? "Live link is stale — values shown may be out of date. Commands are blocked until the link recovers."
+    : null;
   const panelHint =
     panelMode === "auto"           ? null :
     panelMode === "manual"         ? "Panel key switch is MANUAL — set to AUTO at the unit to enable remote commands." :
     panelMode === "off"            ? "Panel key switch is OFF — engine is locked out. Set to AUTO at the unit." :
     /* unknown */                    "Panel key-switch position is unknown — waiting for prime poll or verify panel_mode_bits in h100.yaml.";
+  const hint = staleHint ?? panelHint;
 
   return (
     <Card title="Controls" sub="Operator · two-step confirm">
       <div className="ctl-stack">
         <button className="ctl-btn" data-tone="start" disabled={!canStart} onClick={() => onCommand("start")}
-                title={panelHint ?? undefined}>
+                title={hint ?? undefined}>
           <span className="icon"><Icon name="play" size={18} /></span>
           <span><div className="lbl">Remote Start</div><div className="desc">Crank engine · load stays on utility</div></span>
           <span className="kbd">⌘S</span>
         </button>
         <button className="ctl-btn" data-tone="stop" disabled={!canStop} onClick={() => onCommand("stop")}
-                title={panelHint ?? undefined}>
+                title={hint ?? undefined}>
           <span className="icon"><Icon name="stop" size={16} /></span>
           <span><div className="lbl">Remote Stop</div><div className="desc">Retransfer to utility · cool-down · stop</div></span>
           <span className="kbd">⌘.</span>
         </button>
         <button className="ctl-btn" data-tone="exer" disabled={!canExercise} onClick={() => onCommand("exercise")}
-                title={panelHint ?? undefined}>
+                title={hint ?? undefined}>
           <span className="icon"><Icon name="activity" size={18} /></span>
           <span><div className="lbl">Quiet-Test</div><div className="desc">Run unloaded · 30 min default</div></span>
           <span className="kbd">⌘E</span>
         </button>
         <button className="ctl-btn" data-tone="xfer" disabled={!canTransfer} onClick={() => onCommand("transfer")}
-                title={panelHint ?? undefined}>
+                title={hint ?? undefined}>
           <span className="icon"><Icon name="switch_" size={20} /></span>
           <span><div className="lbl">Transfer to Gen</div><div className="desc">HTS-1 → Generator (move load)</div></span>
           <span className="kbd">⌘T</span>
         </button>
       </div>
-      {panelHint && (
-        <div style={{ marginTop: 14, padding: "10px 14px", background: "color-mix(in oklch, var(--amber) 12%, var(--panel-2))",
-                      borderRadius: 10, border: "1px solid color-mix(in oklch, var(--amber) 30%, var(--border))",
+      {hint && (
+        <div style={{ marginTop: 14, padding: "10px 14px",
+                      background: stale
+                        ? "color-mix(in oklch, var(--red) 12%, var(--panel-2))"
+                        : "color-mix(in oklch, var(--amber) 12%, var(--panel-2))",
+                      borderRadius: 10,
+                      border: stale
+                        ? "1px solid color-mix(in oklch, var(--red) 30%, var(--border))"
+                        : "1px solid color-mix(in oklch, var(--amber) 30%, var(--border))",
                       fontSize: 12, color: "var(--text-2)", display: "flex", gap: 10, alignItems: "flex-start",
                       fontWeight: 500 }}>
-          <Icon name="lock" size={14} />
-          <div>{panelHint}</div>
+          <Icon name={stale ? "wifi-off" : "lock"} size={14} />
+          <div>{hint}</div>
         </div>
       )}
       <div style={{ marginTop: 16, padding: "12px 14px", background: "var(--panel-2)", borderRadius: 10,

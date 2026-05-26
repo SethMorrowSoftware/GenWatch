@@ -60,6 +60,17 @@ LOAD_ON_CURRENT_THRESHOLD = 5.0
 LOAD_OFF_KW_THRESHOLD = 1.0         # < 1 kW AND < 2 A → "utility"
 LOAD_OFF_CURRENT_THRESHOLD = 2.0
 
+# How many *consecutive* prime polls must show a load-source disagreement
+# between the ATS-Pi reading and the H-100 electrical output before we
+# raise the ATS_LOADSOURCE_DISAGREE warning alarm. At the default
+# prime cadence (1.5 s) this is ~4.5 s — long enough to ride through a
+# legitimate utility↔generator transfer window where the ATS position
+# and the H-100 kW/A briefly disagree by design, short enough that a
+# real stuck-aux-contact failure surfaces before an operator could act
+# on the wrong loadSource.
+LOADSOURCE_DISAGREE_DEBOUNCE_POLLS = 3
+LOADSOURCE_DISAGREE_ALARM_CODE = "ATS_LOADSOURCE_DISAGREE"
+
 
 @dataclass
 class StateSnapshot:
@@ -127,6 +138,16 @@ class StateMachine:
         # that goes set in 'running' and then clears while the engine
         # is 'cooling' would leak as a stale row in the DB.
         self._raised_this_session: set[str] = set()
+        # ATS-vs-H-100 load-source disagreement detector state.
+        # ``_count`` increments on every poll that observes a
+        # disagreement and resets on an agreeing poll; the alarm is
+        # only raised once ``count >= LOADSOURCE_DISAGREE_DEBOUNCE_POLLS``
+        # to ride through normal transfer transients.
+        # ``_raised`` mirrors db state so we know whether to emit a
+        # clear event when the condition resolves (or when the ATS-Pi
+        # loses authority and the comparison becomes meaningless).
+        self._loadsource_disagree_count: int = 0
+        self._loadsource_disagree_raised: bool = False
 
     def apply_regmap(self, new_regmap: RegisterMap) -> None:
         """Swap in a freshly-loaded register map (POST /api/registers/reload).
@@ -434,9 +455,180 @@ class StateMachine:
                     old_source, new_load_source,
                 )
 
+        # Cross-check ATS-reported position against H-100 electrical
+        # output. Catches the "stuck ATS aux contact" failure that's
+        # silent from either side alone — ATS says utility while the
+        # generator is delivering 200 kW, or ATS says generator while
+        # the engine output is essentially zero.
+        self._check_loadsource_disagreement(reading.values, emitted)
+
+        # Layer the derived disagreement alarm onto active_alarms. The
+        # H-100 alarm pipeline above overwrote this set with only the
+        # bit-derived codes; we re-add the derived code if currently
+        # raised so the UI's active-alarms widget shows it across polls,
+        # and ensure it's evicted on clear.
+        if self._loadsource_disagree_raised:
+            self.snap.active_alarms = self.snap.active_alarms | {LOADSOURCE_DISAGREE_ALARM_CODE}
+        else:
+            self.snap.active_alarms = self.snap.active_alarms - {LOADSOURCE_DISAGREE_ALARM_CODE}
+
         self.snap.comms = comms
         self.snap.last_reading = reading
         return emitted
+
+    # ─── Load-source disagreement (ATS vs H-100 cross-check) ──────────
+
+    def _check_loadsource_disagreement(
+        self, values: dict, emitted: list[dict[str, Any]]
+    ) -> None:
+        """Compare the ATS-Pi-reported position against the H-100's own
+        electrical output and surface a persistent mismatch as a
+        warn-severity alarm.
+
+        Only runs when the ATS-Pi is authoritative — there's no
+        cross-check to perform when we're already deriving loadSource
+        from H-100 telemetry alone (the values would tautologically
+        agree). Only meaningful while the engine could plausibly be
+        carrying load (states ``running`` / ``alarm``); other states
+        clear the alarm because the comparison can't be evaluated.
+
+        Hysteresis matches ``_derive_load_source_from_telemetry`` —
+        same LOAD_ON / LOAD_OFF thresholds — so we never raise an
+        alarm at a kW/A level we'd otherwise classify as load-on-gen
+        ourselves. Debounce avoids false positives during the normal
+        transfer window where ATS position changes a poll or two before
+        the kW reading catches up.
+        """
+        # Authority gate. When ATS is not authoritative the loadSource
+        # we display IS the H-100-derived value; a "disagreement"
+        # against itself is undefined, and any alarm previously raised
+        # is no longer evaluable — clear it.
+        if self.ats is None or not self.ats.is_authoritative():
+            if self._loadsource_disagree_raised:
+                self._emit_disagree_clear(
+                    "ATS-Pi no longer authoritative", emitted
+                )
+            self._loadsource_disagree_count = 0
+            return
+
+        # Engine state gate. Only `running` and `alarm` are states in
+        # which the generator could be delivering load. `cranking` and
+        # `cooling` are transient (load is on utility by design);
+        # `exercising` is by design unloaded; `stopped` is trivially
+        # zero output.
+        if self.snap.engine_state not in ("running", "alarm"):
+            if self._loadsource_disagree_raised:
+                self._emit_disagree_clear(
+                    f"engine state is {self.snap.engine_state}", emitted
+                )
+            self._loadsource_disagree_count = 0
+            return
+
+        ats_pos = self.ats.snap.position
+        # 'transferring' is a few-hundred-ms intermediate while the ATS
+        # is between contacts — no comparison is meaningful. 'unknown'
+        # means the ATS-Pi itself can't tell. Hold the counter steady.
+        if ats_pos not in ("utility", "generator"):
+            return
+
+        current = values.get("avg_current")
+        kw = values.get("total_kw")
+        if current is None or kw is None:
+            # No electrical telemetry yet (first base poll hasn't
+            # landed). Hold counter steady rather than reset — we don't
+            # want a slow base tier to wipe out accumulated evidence
+            # from previous polls.
+            return
+
+        current_val = float(current)
+        kw_val = float(kw)
+
+        disagreement_msg: str | None = None
+        if (
+            ats_pos == "utility"
+            and current_val >= LOAD_ON_CURRENT_THRESHOLD
+            and kw_val >= LOAD_ON_KW_THRESHOLD
+        ):
+            disagreement_msg = (
+                f"ATS reports UTILITY but H-100 is delivering "
+                f"{kw_val:.1f} kW / {current_val:.0f} A. "
+                "Likely a stuck ATS aux contact or miswired position sense."
+            )
+        elif (
+            ats_pos == "generator"
+            and current_val < LOAD_OFF_CURRENT_THRESHOLD
+            and kw_val < LOAD_OFF_KW_THRESHOLD
+        ):
+            disagreement_msg = (
+                f"ATS reports GENERATOR but H-100 output is "
+                f"{kw_val:.1f} kW / {current_val:.1f} A. "
+                "Likely a stuck ATS aux contact, or load was shed but "
+                "the ATS never retransferred."
+            )
+
+        if disagreement_msg is not None:
+            self._loadsource_disagree_count += 1
+            if (
+                self._loadsource_disagree_count >= LOADSOURCE_DISAGREE_DEBOUNCE_POLLS
+                and not self._loadsource_disagree_raised
+            ):
+                self._emit_disagree_raise(disagreement_msg, emitted)
+        else:
+            # Agreement on this poll — clear any prior raise and reset
+            # the debounce counter.
+            if self._loadsource_disagree_raised:
+                self._emit_disagree_clear(
+                    "ATS and H-100 now agree on load source", emitted
+                )
+            self._loadsource_disagree_count = 0
+
+    def _emit_disagree_raise(
+        self, message: str, emitted: list[dict[str, Any]]
+    ) -> None:
+        """Raise the disagreement alarm: DB row + event-log row + bus event."""
+        raised = self.db.raise_alarm(
+            LOADSOURCE_DISAGREE_ALARM_CODE, message, "warn", 0
+        )
+        self._loadsource_disagree_raised = True
+        if raised:
+            self.db.write_event(
+                severity="warn",
+                type_="ALARM",
+                message=f"Alarm raised — {message}",
+                meta=f"code {LOADSOURCE_DISAGREE_ALARM_CODE}",
+            )
+            emitted.append({
+                "type": "alarm",
+                "code": LOADSOURCE_DISAGREE_ALARM_CODE,
+                "desc": message,
+                "severity": "warn",
+                "ts": time.time(),
+            })
+            log.warning("Load-source disagreement raised: %s", message)
+        # active_alarms set membership is synced at the end of update()
+        # so it survives the H-100 alarm pipeline's overwrite each poll.
+
+    def _emit_disagree_clear(
+        self, reason: str, emitted: list[dict[str, Any]]
+    ) -> None:
+        """Clear the disagreement alarm: DB row + event-log row + bus event."""
+        cleared = self.db.clear_alarm(LOADSOURCE_DISAGREE_ALARM_CODE)
+        self._loadsource_disagree_raised = False
+        if cleared:
+            self.db.write_event(
+                severity="ok",
+                type_="ALARM",
+                message=f"Alarm cleared — load-source disagreement ({reason})",
+                meta=f"code {LOADSOURCE_DISAGREE_ALARM_CODE}",
+            )
+            emitted.append({
+                "type": "alarm-cleared",
+                "code": LOADSOURCE_DISAGREE_ALARM_CODE,
+                "desc": f"load-source disagreement cleared ({reason})",
+                "ts": time.time(),
+            })
+            log.info("Load-source disagreement cleared (%s)", reason)
+        # active_alarms set membership is synced at the end of update().
 
 
 class EventBus:

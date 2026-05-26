@@ -238,7 +238,7 @@ function Shell({ auth, view, setView, theme, onToggleTheme, onLogout }: {
         )}
         {tickedStatus && (
           <div className="view" key={view}>
-            {view === "live" && <LiveView status={tickedStatus} history={live.history} operator={auth.operator ?? "operator"} />}
+            {view === "live" && <LiveView status={tickedStatus} history={live.history} operator={auth.operator ?? "operator"} stale={stale} />}
             {view === "history" && <HistoryView />}
             {view === "events" && <EventsView />}
             {view === "settings" && <SettingsView />}

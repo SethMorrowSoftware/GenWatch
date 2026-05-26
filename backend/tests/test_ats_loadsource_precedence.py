@@ -322,3 +322,249 @@ async def test_load_source_event_still_emitted_when_ats_not_authoritative(
     assert len(load_source_calls) == 1
     bus_load_source = [e for e in emitted if e.get("type") == "load-source"]
     assert len(bus_load_source) == 1
+
+
+# ─── Load-source disagreement cross-check (audit C3) ─────────────────────
+
+
+def _disagree_count(fake_db) -> int:
+    """How many ATS_LOADSOURCE_DISAGREE raises did we see in the mock DB?"""
+    return sum(
+        1 for c in fake_db.raise_alarm.call_args_list
+        if c.args and c.args[0] == "ATS_LOADSOURCE_DISAGREE"
+    )
+
+
+def _disagree_clear_count(fake_db) -> int:
+    return sum(
+        1 for c in fake_db.clear_alarm.call_args_list
+        if c.args and c.args[0] == "ATS_LOADSOURCE_DISAGREE"
+    )
+
+
+async def _seed_authoritative_ats(
+    ats_regmap, fake_db, bus, ats_store, position: str
+):
+    """Build an AtsService that's authoritative + reporting `position`."""
+    ats = AtsService(ats_regmap, fake_db, bus)
+    ats_store.set_position(position)
+    await ats.on_poll("base", ats_store.as_reading("base"), _healthy())
+    assert ats.is_authoritative()
+    assert ats.snap.position == position
+    return ats
+
+
+async def test_disagree_ats_utility_h100_loaded_raises_after_debounce(
+    h100_regmap, ats_regmap, fake_db, bus, ats_store,
+):
+    """ATS aux contact stuck on utility while the generator is actually
+    carrying 150 kW — the classic stuck-contact failure that's invisible
+    from either side alone. Must raise ATS_LOADSOURCE_DISAGREE after the
+    debounce window."""
+    ats = await _seed_authoritative_ats(ats_regmap, fake_db, bus, ats_store, "utility")
+    sm = StateMachine(h100_regmap, fake_db, bus, ats_service=ats)
+
+    fake_db.raise_alarm.reset_mock()
+    loaded = Reading(values=_h100_values("running", current=200, kw=150))
+
+    # Polls 1 and 2: counting, no alarm yet
+    sm.update(loaded, _healthy())
+    sm.update(loaded, _healthy())
+    assert _disagree_count(fake_db) == 0, (
+        "alarm raised too early — debounce must require ≥3 consecutive polls"
+    )
+    assert "ATS_LOADSOURCE_DISAGREE" not in sm.snap.active_alarms
+
+    # Poll 3: threshold reached, alarm fires
+    emitted = sm.update(loaded, _healthy())
+    assert _disagree_count(fake_db) == 1
+    assert "ATS_LOADSOURCE_DISAGREE" in sm.snap.active_alarms
+    bus_alarms = [
+        e for e in emitted
+        if e.get("type") == "alarm" and e.get("code") == "ATS_LOADSOURCE_DISAGREE"
+    ]
+    assert len(bus_alarms) == 1, "should emit a single bus alarm on raise"
+    assert bus_alarms[0]["severity"] == "warn"
+    assert "UTILITY" in bus_alarms[0]["desc"]
+    assert "150" in bus_alarms[0]["desc"]  # kW shown in the description
+
+
+async def test_disagree_persists_in_active_alarms_across_polls(
+    h100_regmap, ats_regmap, fake_db, bus, ats_store,
+):
+    """After raise, subsequent polls (with the disagreement still active)
+    must keep the code in active_alarms — the H-100 alarm pipeline
+    overwrites that set every poll based on H-100 bits, so the derived
+    code has to be re-layered."""
+    ats = await _seed_authoritative_ats(ats_regmap, fake_db, bus, ats_store, "utility")
+    sm = StateMachine(h100_regmap, fake_db, bus, ats_service=ats)
+    loaded = Reading(values=_h100_values("running", current=200, kw=150))
+
+    for _ in range(3):
+        sm.update(loaded, _healthy())
+    assert "ATS_LOADSOURCE_DISAGREE" in sm.snap.active_alarms
+
+    # 5 more polls — disagreement still active, alarm should not be
+    # re-raised but membership in active_alarms must persist.
+    fake_db.raise_alarm.reset_mock()
+    for _ in range(5):
+        sm.update(loaded, _healthy())
+        assert "ATS_LOADSOURCE_DISAGREE" in sm.snap.active_alarms
+    assert _disagree_count(fake_db) == 0, "alarm must be raise-once until cleared"
+
+
+async def test_disagree_ats_generator_h100_zero_output_raises(
+    h100_regmap, ats_regmap, fake_db, bus, ats_store,
+):
+    """Reverse direction: ATS reports load on generator but the H-100
+    isn't producing any output (engine running unloaded after a load
+    was shed but ATS never retransferred). Also a real failure mode."""
+    ats = await _seed_authoritative_ats(
+        ats_regmap, fake_db, bus, ats_store, "generator"
+    )
+    sm = StateMachine(h100_regmap, fake_db, bus, ats_service=ats)
+
+    fake_db.raise_alarm.reset_mock()
+    no_output = Reading(values=_h100_values("running", current=0.0, kw=0.0))
+    for _ in range(3):
+        sm.update(no_output, _healthy())
+    assert _disagree_count(fake_db) == 1
+    bus_msg = fake_db.raise_alarm.call_args.args[1]
+    assert "GENERATOR" in bus_msg
+
+
+async def test_disagree_clears_when_signals_agree(
+    h100_regmap, ats_regmap, fake_db, bus, ats_store,
+):
+    """Once raised, the alarm must clear (and emit alarm-cleared) when
+    the next poll observes agreement — either because the ATS contact
+    came unstuck or the actual load shifted."""
+    ats = await _seed_authoritative_ats(
+        ats_regmap, fake_db, bus, ats_store, "utility"
+    )
+    sm = StateMachine(h100_regmap, fake_db, bus, ats_service=ats)
+    loaded = Reading(values=_h100_values("running", current=200, kw=150))
+
+    for _ in range(3):
+        sm.update(loaded, _healthy())
+    assert "ATS_LOADSOURCE_DISAGREE" in sm.snap.active_alarms
+
+    # ATS contact comes unstuck — now reports generator. Same H-100
+    # reading is now consistent.
+    fake_db.clear_alarm.reset_mock()
+    ats_store.set_position("generator")
+    await ats.on_poll("prime", ats_store.as_reading("prime"), _healthy())
+    emitted = sm.update(loaded, _healthy())
+
+    assert _disagree_clear_count(fake_db) == 1
+    assert "ATS_LOADSOURCE_DISAGREE" not in sm.snap.active_alarms
+    cleared = [
+        e for e in emitted
+        if e.get("type") == "alarm-cleared" and e.get("code") == "ATS_LOADSOURCE_DISAGREE"
+    ]
+    assert len(cleared) == 1
+
+
+async def test_disagree_does_not_raise_for_transient_mismatch(
+    h100_regmap, ats_regmap, fake_db, bus, ats_store,
+):
+    """Two polls of disagreement followed by an agreeing poll resets the
+    debounce counter — normal transfer windows can briefly disagree by
+    design and must not trigger a spurious alarm."""
+    ats = await _seed_authoritative_ats(
+        ats_regmap, fake_db, bus, ats_store, "utility"
+    )
+    sm = StateMachine(h100_regmap, fake_db, bus, ats_service=ats)
+    loaded = Reading(values=_h100_values("running", current=200, kw=150))
+    no_load = Reading(values=_h100_values("running", current=0.0, kw=0.0))
+
+    fake_db.raise_alarm.reset_mock()
+    # Two disagreement polls
+    sm.update(loaded, _healthy())
+    sm.update(loaded, _healthy())
+    # Then an agreement (ATS=utility + H-100 no output)
+    sm.update(no_load, _healthy())
+    # Now back to disagreement, but counter has been reset
+    sm.update(loaded, _healthy())
+    sm.update(loaded, _healthy())
+    assert _disagree_count(fake_db) == 0, (
+        "agreement poll between disagreements must reset the debounce counter"
+    )
+    # Third consecutive disagreement after reset triggers the alarm
+    sm.update(loaded, _healthy())
+    assert _disagree_count(fake_db) == 1
+
+
+async def test_disagree_clears_when_ats_loses_authority(
+    h100_regmap, ats_regmap, fake_db, bus, ats_store,
+):
+    """Comms dropping mid-disagreement should clear the alarm — we no
+    longer have the signal to evaluate the condition, and the
+    loadSource has fallen back to H-100 inference anyway."""
+    ats = await _seed_authoritative_ats(
+        ats_regmap, fake_db, bus, ats_store, "utility"
+    )
+    sm = StateMachine(h100_regmap, fake_db, bus, ats_service=ats)
+    loaded = Reading(values=_h100_values("running", current=200, kw=150))
+    for _ in range(3):
+        sm.update(loaded, _healthy())
+    assert "ATS_LOADSOURCE_DISAGREE" in sm.snap.active_alarms
+
+    # ATS comms drop — authority lost
+    await ats.on_poll("prime", ats_store.as_reading("prime"), _lost())
+    assert not ats.is_authoritative()
+
+    fake_db.clear_alarm.reset_mock()
+    sm.update(loaded, _healthy())
+    assert _disagree_clear_count(fake_db) == 1
+    assert "ATS_LOADSOURCE_DISAGREE" not in sm.snap.active_alarms
+
+
+async def test_disagree_skips_when_engine_not_running(
+    h100_regmap, ats_regmap, fake_db, bus, ats_store,
+):
+    """Engine stopped → no comparison is meaningful (the H-100 output
+    must be zero by physics). Alarm must not fire even if the ATS
+    reports something nonsensical."""
+    ats = await _seed_authoritative_ats(
+        ats_regmap, fake_db, bus, ats_store, "generator"
+    )
+    sm = StateMachine(h100_regmap, fake_db, bus, ats_service=ats)
+    stopped = Reading(values=_h100_values("stopped"))
+
+    fake_db.raise_alarm.reset_mock()
+    for _ in range(5):
+        sm.update(stopped, _healthy())
+    assert _disagree_count(fake_db) == 0
+
+
+async def test_disagree_skips_when_ats_transferring(
+    h100_regmap, ats_regmap, fake_db, bus, ats_store,
+):
+    """ATS reports `transferring` — a sub-2-second intermediate state
+    where the H-100 might still be carrying load even though the contact
+    is mid-switch. Must not raise an alarm during this window."""
+    ats = await _seed_authoritative_ats(
+        ats_regmap, fake_db, bus, ats_store, "transferring"
+    )
+    sm = StateMachine(h100_regmap, fake_db, bus, ats_service=ats)
+    loaded = Reading(values=_h100_values("running", current=200, kw=150))
+
+    fake_db.raise_alarm.reset_mock()
+    for _ in range(5):
+        sm.update(loaded, _healthy())
+    assert _disagree_count(fake_db) == 0
+
+
+async def test_disagree_skips_when_no_ats_service(
+    h100_regmap, fake_db, bus,
+):
+    """Sites without an ATS-Pi don't have the comparison surface — the
+    check must be a complete no-op (backward-compat with single-link
+    H-100-only deployments)."""
+    sm = StateMachine(h100_regmap, fake_db, bus, ats_service=None)
+    loaded = Reading(values=_h100_values("running", current=200, kw=150))
+    fake_db.raise_alarm.reset_mock()
+    for _ in range(5):
+        sm.update(loaded, _healthy())
+    assert _disagree_count(fake_db) == 0

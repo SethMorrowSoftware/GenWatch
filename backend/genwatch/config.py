@@ -84,6 +84,52 @@ class AuthConfig(BaseModel):
     jwt_secret: str = ""  # filled at install-time
     session_hours: int = 12
 
+    # ── Session-cookie hardening ──────────────────────────────────────
+    # cookie_secure controls the `Secure` attribute on the JWT cookie:
+    #   None  (default) — auto-detect from the request. When the user
+    #                     agent reached us over HTTPS (directly, or via
+    #                     a reverse proxy that set X-Forwarded-Proto),
+    #                     the cookie is issued Secure. On plain-HTTP
+    #                     LAN deployments it is not. This is the right
+    #                     default for the documented topologies
+    #                     (Tailscale, Caddy, plain LAN) — operators
+    #                     behind TLS get hardening for free, plain-HTTP
+    #                     operators keep working.
+    #   True             — always Secure. Use behind a reverse proxy
+    #                     that terminates TLS but uvicorn doesn't see
+    #                     it as HTTPS (uncommon — only needed if you've
+    #                     disabled proxy-header handling).
+    #   False            — never Secure. Only for local dev over plain
+    #                     HTTP where the auto-detect would also pick
+    #                     False; setting it explicitly silences any
+    #                     future warning we add.
+    cookie_secure: bool | None = None
+    # cookie_samesite — defaults to 'strict' for CSRF defense in depth.
+    # The two-step confirm-token flow already mitigates classical CSRF
+    # against /api/control/*, but strict closes the door on any future
+    # endpoint that forgets the token. UX impact: clicking a link from
+    # Slack / email into GenWatch will show the login page (cookie not
+    # sent on cross-site nav) — one extra login click, no breakage.
+    # Use 'lax' only if you have a workflow that relies on cross-site
+    # navigation carrying the session. 'none' requires cookie_secure
+    # and is rarely useful for this product.
+    cookie_samesite: Literal["strict", "lax", "none"] = "strict"
+
+    @field_validator("cookie_samesite")
+    @classmethod
+    def _samesite_requires_secure(cls, v: str, info) -> str:
+        # SameSite=None requires Secure per the browser spec; rejecting
+        # this combo at config-load time turns a silent browser-side
+        # "cookie discarded" into a startup error operators can fix.
+        if v == "none":
+            cs = info.data.get("cookie_secure")
+            if cs is False:
+                raise ValueError(
+                    "auth.cookie_samesite='none' requires auth.cookie_secure=true "
+                    "(browser refuses to store SameSite=None cookies without Secure)"
+                )
+        return v
+
 
 class AtsConfig(BaseModel):
     """ATS-Pi companion device (see docs/integrations/ats-pi-icd.md).

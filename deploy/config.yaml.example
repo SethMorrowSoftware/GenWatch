@@ -86,6 +86,27 @@ auth:
   jwt_secret: "REPLACE_ME"
   operator_name: operator
   session_hours: 12
+  # ── Session-cookie hardening ───────────────────────────────────────
+  # Leave both at their defaults unless you have a specific reason. The
+  # defaults are safe for the three documented deployment topologies
+  # (plain LAN, Caddy, Tailscale).
+  #
+  # cookie_secure:
+  #   unset (null) → auto-detect from the request. HTTPS in front (Caddy
+  #                  /Tailscale terminating TLS on the same host) gives
+  #                  Secure for free; plain-HTTP LAN stays non-Secure.
+  #   true          → force Secure on every response. Use behind an HTTPS
+  #                  reverse proxy that doesn't forward X-Forwarded-Proto.
+  #   false         → never Secure. Only for local dev.
+  # cookie_secure: null
+  #
+  # cookie_samesite — strict | lax | none.
+  #   'strict' (default) blocks the JWT from being sent on cross-site
+  #   navigations, defense-in-depth against CSRF on top of the two-step
+  #   confirm tokens. UX cost: clicking a link from Slack/email into
+  #   GenWatch shows the login page once (cookie not sent on the initial
+  #   cross-site nav) and the operator logs in normally.
+  # cookie_samesite: strict
 
 # ─── Slack alerts ─────────────────────────────────────────────────────────
 # Forwards alarms, alarm-clears, operator commands, and (optionally)
