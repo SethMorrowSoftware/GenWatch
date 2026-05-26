@@ -21,6 +21,11 @@ export function EventsView() {
   const [filters, setFilters] = useState<Record<Severity, boolean>>({ alarm: true, warn: true, info: true, ok: true });
   const [typeFilter, setTypeFilter] = useState("ALL");
   const [loading, setLoading] = useState(true);
+  // Set when the latest refresh failed. Cleared on the next success.
+  // Industrial-safety norm: a blank feed must never look the same as
+  // a healthy feed; an empty result is "no events," an unreachable
+  // backend is a different thing and the operator needs to know.
+  const [fetchError, setFetchError] = useState<string | null>(null);
 
   const refresh = async () => {
     setLoading(true);
@@ -33,6 +38,12 @@ export function EventsView() {
       setEvents(e.events);
       setActiveAlarms(a.alarms);
       setCodes(c.codes);
+      setFetchError(null);
+    } catch (err: any) {
+      // Preserve the previously-loaded data so the operator still has
+      // something to look at; just surface that what they're seeing
+      // is no longer fresh.
+      setFetchError(err?.message ?? "Failed to load events");
     } finally {
       setLoading(false);
     }
@@ -62,6 +73,20 @@ export function EventsView() {
         </div>
       </div>
 
+      {fetchError && (
+        <div
+          className="alarm-strip"
+          style={{
+            background: "color-mix(in oklch, var(--red) 12%, var(--panel-2))",
+            borderColor: "color-mix(in oklch, var(--red) 35%, var(--border))",
+          }}
+        >
+          <span className="led" />
+          <strong>Events feed unavailable</strong>
+          <span>{fetchError} — showing last successful load. Retrying every 8s.</span>
+        </div>
+      )}
+
       {activeAlarms.map((a) => (
         <div key={a.code} className="alarm-strip">
           <span className="led" />
@@ -74,7 +99,16 @@ export function EventsView() {
               try {
                 await api.ackAlarm(a.code);
                 refresh();
-              } catch { /* ignore */ }
+              } catch (err: any) {
+                // Surface ack failures (Modbus write failed, role
+                // changed, etc.) so the operator doesn't think they
+                // dismissed an alarm they actually didn't.
+                setFetchError(
+                  err?.body?.detail?.message ??
+                  err?.message ??
+                  "Failed to acknowledge alarm"
+                );
+              }
             }}
           >
             Acknowledge
