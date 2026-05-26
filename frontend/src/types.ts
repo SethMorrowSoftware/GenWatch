@@ -85,6 +85,9 @@ export interface StatusBody {
     ratingKw: number;
     engine: string;
     tankGal: number;
+    // 'diesel' | 'gaseous' | 'unknown' — drives UI gating (hide O₂ on
+    // diesel, etc.). Optional for forward-compat with older backends.
+    fuelType?: "diesel" | "gaseous" | "unknown";
   };
   exercise: {
     enabled: boolean;

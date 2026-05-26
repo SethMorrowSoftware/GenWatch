@@ -578,10 +578,17 @@ class MockModbusClient:
         if name == "frequency":
             # Scale 0.1: 600 → 60.0 Hz
             return int((60.0 + wob * 0.05) * 10) if running else 0
+        # Scale loaded-running synthetic output to the site's nameplate
+        # rating so dev with a 350 kW config doesn't show 142 kW (which
+        # would be 41 % load and look misleading). At 480 V 3-φ pf 0.95,
+        # full-load amps ≈ rating_kw × 1.27.
+        rated_kw = max(1, self.regmap.site.rating_kw)
+        loaded_kw = int(rated_kw * 0.71)              # ~71% loaded
+        loaded_amps = int(rated_kw * 0.90)            # ~71% of full-load amps
         if name == "total_kw":
             if self._state == "exercising":
                 return max(0, int(6 + wob * 3))
-            return max(0, int((142 if running else 0) + wob * 4))
+            return max(0, int((loaded_kw if running else 0) + wob * 4))
         if name == "power_factor":
             # Scale 0.01: 95 → 0.95
             return 95 if running else 0
@@ -594,16 +601,16 @@ class MockModbusClient:
         if name == "avg_voltage":
             return int(480 + wob * 1.0) if running else 0
         if name == "gen_current_a":
-            base = 8 if self._state == "exercising" else (172 if running else 0)
+            base = 8 if self._state == "exercising" else (loaded_amps if running else 0)
             return max(0, int(base + wob * 3))
         if name == "gen_current_b":
-            base = 7 if self._state == "exercising" else (168 if running else 0)
+            base = 7 if self._state == "exercising" else (loaded_amps - 4 if running else 0)
             return max(0, int(base + wob * 3))
         if name == "gen_current_c":
-            base = 9 if self._state == "exercising" else (176 if running else 0)
+            base = 9 if self._state == "exercising" else (loaded_amps + 4 if running else 0)
             return max(0, int(base + wob * 3))
         if name == "avg_current":
-            base = 8 if self._state == "exercising" else (172 if running else 0)
+            base = 8 if self._state == "exercising" else (loaded_amps if running else 0)
             return max(0, int(base + wob * 3))
         if name == "run_hours":
             # static-ish counter that ticks while running

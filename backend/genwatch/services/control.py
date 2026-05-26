@@ -1,7 +1,7 @@
 """Two-step confirm-token control flow.
 
-Why two-step: a single click that physically affects a 200 kW generator
-is dangerous. The operator must:
+Why two-step: a single click that physically affects an industrial
+generator is dangerous. The operator must:
   1. POST /api/control/confirm  -> server issues a short-lived token.
   2. POST /api/control/<verb>    with {confirm_token: <token>} within 30s.
 

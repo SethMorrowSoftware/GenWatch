@@ -50,9 +50,15 @@
 site:
   id: SITE-23
   name: "Generac H-100"
-  rating_kw: 200
-  engine: "Cummins QSB7-G5"
-  tank_gal: 220
+  rating_kw: 350
+  engine: "Cummins QSB7-G5"   # verify — QSB7 is unusual above ~300 kW; confirm engine name on the dataplate
+  tank_gal: 680
+  # Fuel type drives a few UI decisions:
+  #   - 'diesel'   hides the O₂ sensor card (diesels have no O₂ probe — the
+  #                  H-100 register reads 0 always on diesel installs)
+  #   - 'gaseous'  shows O₂ + AFR-related fields (NG/LP engines)
+  #   - 'unknown'  shows everything (legacy behaviour)
+  fuel_type: diesel
   exercise:
     enabled: true
     day: sun        # mon|tue|wed|thu|fri|sat|sun

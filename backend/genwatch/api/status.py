@@ -110,6 +110,7 @@ async def status(request: Request) -> dict:
             "ratingKw": regmap.site.rating_kw,
             "engine": regmap.site.engine,
             "tankGal": regmap.site.tank_gal,
+            "fuelType": regmap.site.fuel_type,
         },
         "exercise": {
             "enabled": regmap.site.exercise_enabled,
