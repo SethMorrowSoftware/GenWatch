@@ -99,6 +99,19 @@ class StateMachine:
         self.db = db
         self.bus = bus
         self.snap = StateSnapshot()
+        # Per-alarm-code count of how many *consecutive* polls have seen
+        # the bit set. Drives the ``min_poll_count`` debounce filter.
+        # Reset (entry deleted) the first time the bit reads low.
+        self._alarm_poll_counts: dict[str, int] = {}
+        # Alarm codes that we have called ``db.raise_alarm`` on during
+        # this session. Tracked separately from ``snap.active_alarms``
+        # because state-conditional suppression can hide an alarm from
+        # the UI while the underlying H-100 bit is still asserting — we
+        # still need to fire a clear event (and call ``db.clear_alarm``)
+        # when the bit eventually goes low. Without this set, a bit
+        # that goes set in 'running' and then clears while the engine
+        # is 'cooling' would leak as a stale row in the DB.
+        self._raised_this_session: set[str] = set()
 
     def apply_regmap(self, new_regmap: RegisterMap) -> None:
         """Swap in a freshly-loaded register map (POST /api/registers/reload).
@@ -232,16 +245,48 @@ class StateMachine:
             )
             log.info("Engine state transition: %s -> %s", old, new_state)
 
-        # Alarms — diff the active set against last poll.
-        active_now = self.regmap.derive_active_alarms(reading.values)
-        active_now_codes = {ab.code for ab in active_now}
-        prev_codes = self.snap.active_alarms
+        # Alarms — with two filters layered on top of the raw bits:
+        #   1. ``min_poll_count`` debounce — the bit must stay set for
+        #      N consecutive polls before we surface the alarm. Catches
+        #      transient firmware flickers (e.g. a fuel-high blip while
+        #      the day tank refills after an exercise).
+        #   2. ``suppress_in_states`` state filter — the alarm is hidden
+        #      from the UI / Slack while the engine is in a state where
+        #      the underlying signal isn't meaningful (e.g. phase
+        #      rotation during cool-down, when the AVR is dropping out).
+        # Both filters preserve correctness: a real persistent alarm
+        # still fires once the debounce elapses, and a state-suppressed
+        # alarm still gets cleared in the DB when its bit goes low so
+        # nothing leaks as a stale row.
+        raw_active = self.regmap.derive_active_alarms(reading.values)
+        raw_active_codes = {ab.code for ab in raw_active}
 
-        # New alarms
-        for ab in active_now:
-            if ab.code in prev_codes:
+        # Maintain per-code debounce counters off the raw bits, not the
+        # filtered set — state suppression shouldn't reset the counter.
+        for ab in raw_active:
+            self._alarm_poll_counts[ab.code] = self._alarm_poll_counts.get(ab.code, 0) + 1
+        for code in list(self._alarm_poll_counts):
+            if code not in raw_active_codes:
+                del self._alarm_poll_counts[code]
+
+        effective_active = [
+            ab for ab in raw_active
+            if self._alarm_poll_counts.get(ab.code, 0) >= ab.min_poll_count
+            and self.snap.engine_state not in ab.suppress_in_states
+        ]
+        effective_codes = {ab.code for ab in effective_active}
+        prev_displayed_codes = self.snap.active_alarms
+
+        # Raise: alarms that are newly visible in the effective set.
+        for ab in effective_active:
+            if ab.code in prev_displayed_codes:
                 continue
             raised = self.db.raise_alarm(ab.code, ab.desc, ab.severity, ab.mask)
+            # Track that we've seen this alarm during the session even
+            # if the DB already had a row for it (return value False) —
+            # we still want to fire the clear when the bit eventually
+            # goes low.
+            self._raised_this_session.add(ab.code)
             if raised:
                 self.db.write_event(
                     severity=ab.severity,
@@ -258,12 +303,18 @@ class StateMachine:
                 })
                 log.warning("Alarm raised: %s %s", ab.code, ab.desc)
 
-        # Cleared alarms
-        cleared_codes = prev_codes - active_now_codes
-        for code in cleared_codes:
+        # Clear: only when the underlying BIT goes low, not just when
+        # the alarm leaves the displayed set because of state
+        # suppression. This is the bit that distinguishes "alarm hidden
+        # because we entered cool-down" (don't fire clear event) from
+        # "alarm actually resolved" (fire clear event + clear DB row).
+        for code in list(self._raised_this_session):
+            if code in raw_active_codes:
+                continue
             ab = next((x for x in self.regmap.alarm_bits if x.code == code), None)
             desc = ab.desc if ab else code
             cleared = self.db.clear_alarm(code)
+            self._raised_this_session.discard(code)
             if cleared:
                 self.db.write_event(
                     severity="ok",
@@ -279,7 +330,9 @@ class StateMachine:
                 })
                 log.info("Alarm cleared: %s", code)
 
-        self.snap.active_alarms = active_now_codes
+        # Display set drives the UI's Active Alarms widget and is also
+        # what the previous-tick diff uses for raise detection above.
+        self.snap.active_alarms = effective_codes
 
         # Comms transition logging + event
         if comms.state != self.snap.comms.state:
