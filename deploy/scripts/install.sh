@@ -280,7 +280,7 @@ if (( NEEDS_PASSWORD )); then
   echo
   echo "  Generate a bcrypt hash and paste into the config:"
   echo
-  echo "    sudo genwatch hash 'your-strong-password'"
+  echo "    sudo genwatch hash                  # prompts for the password (no echo)"
   echo "    sudo nano $ETC_DIR/config.yaml      # paste into admin_password_hash"
   echo "    sudo systemctl restart genwatch"
   echo
