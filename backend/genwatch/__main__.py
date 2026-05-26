@@ -238,10 +238,24 @@ def _doctor(args: list[str]) -> int:
                   f"{settings.serial.bytesize}{settings.serial.parity}{settings.serial.stopbits}")
         except Exception as e:  # noqa: BLE001
             print(f"  Serial:   CANNOT OPEN {dev} — {e}")
+            # The old check was buggy on two fronts: g.gr_mem contains
+            # usernames (strings), so `os.getuid() in g.gr_mem` compared
+            # int↔str and was always False; and the `or g.gr_name ==
+            # "dialout"` clause made the comprehension unconditionally
+            # include the dialout group, making in_dialout=True on every
+            # Debian system. Net effect: the "Likely cause: not in
+            # dialout" hint never surfaced when it was actually the
+            # cause. Use the dialout group's member list directly.
             try:
                 import grp
-                in_dialout = "dialout" in [g.gr_name for g in grp.getgrall() if os.getuid() in g.gr_mem or g.gr_name == "dialout"]
-            except Exception:  # noqa: BLE001
+                import pwd
+                me = pwd.getpwuid(os.getuid()).pw_name
+                dialout_members = grp.getgrnam("dialout").gr_mem
+                in_dialout = me in (dialout_members or [])
+            except (KeyError, Exception):  # noqa: BLE001
+                # KeyError if the dialout group doesn't exist on this
+                # system (very unusual on Debian/Pi). Any other failure
+                # → assume not in group so we still surface the hint.
                 in_dialout = False
             if not in_dialout:
                 print("            Likely cause: user is not in the 'dialout' group.")

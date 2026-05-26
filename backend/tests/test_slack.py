@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 
 import httpx
@@ -227,6 +228,112 @@ async def test_worker_does_not_retry_on_slack_error(tmp_path, monkeypatch, caplo
     finally:
         await n.stop()
     assert len(attempts) == 1, "should not retry on slack-side error"
+
+
+async def test_alarm_dedupe_suppresses_repeats_inside_window(tmp_path, monkeypatch):
+    """A flapping alarm (raise → clear → raise → clear within a few
+    seconds) should fire Slack only once per direction per dedupe
+    window. Otherwise a chattery alarm bit can exhaust the 200-slot
+    queue and push real alerts off the floor."""
+    db = Database(tmp_path / "t.sqlite")
+    cfg = SlackConfig(
+        enabled=True, channel="#x", bot_token="xoxb-test",
+        alert_on_alarm=True, alert_on_alarm_cleared=True,
+    )
+    n = SlackNotifier(cfg, db)
+
+    posted: list[dict] = []
+    monkeypatch.setattr(
+        slack_mod, "_post_slack",
+        lambda t, p, to: (posted.append(p) or (True, "ok"))[1],
+    )
+    await n.start()
+    try:
+        # Same code raised 3 times in rapid succession — only the
+        # first should land in Slack.
+        await n.alert_alarm("LOW_OIL", "Low Oil", "alarm", ts=0)
+        await n.alert_alarm("LOW_OIL", "Low Oil", "alarm", ts=0)
+        await n.alert_alarm("LOW_OIL", "Low Oil", "alarm", ts=0)
+        # A different code is NOT deduped against LOW_OIL.
+        await n.alert_alarm("HIGH_TEMP", "High Temp", "alarm", ts=0)
+        # And cleared events live in their own key — same code,
+        # different kind, no dedupe collision.
+        await n.alert_alarm_cleared("LOW_OIL", "Low Oil", ts=0)
+        await n.alert_alarm_cleared("LOW_OIL", "Low Oil", ts=0)  # deduped
+        for _ in range(40):
+            if len(posted) >= 3:
+                break
+            await asyncio.sleep(0.05)
+    finally:
+        await n.stop()
+    # Expect: 1 LOW_OIL raise + 1 HIGH_TEMP raise + 1 LOW_OIL clear = 3
+    assert len(posted) == 3, [p["text"] for p in posted]
+    texts = " ".join(p["text"] for p in posted)
+    # Two LOW_OIL events (one raise, one clear) — distinguished by kind.
+    assert texts.count("LOW_OIL") == 2
+    assert "HIGH_TEMP" in texts
+
+
+async def test_alarm_dedupe_window_expires(tmp_path, monkeypatch):
+    """After DEDUPE_WINDOW_S elapses, a repeat alarm fires again."""
+    import time as time_mod
+    db = Database(tmp_path / "t.sqlite")
+    cfg = SlackConfig(enabled=True, channel="#x", bot_token="xoxb-test", alert_on_alarm=True)
+    n = SlackNotifier(cfg, db)
+    n.DEDUPE_WINDOW_S = 0.05  # very short for the test
+
+    posted: list[dict] = []
+    monkeypatch.setattr(
+        slack_mod, "_post_slack",
+        lambda t, p, to: (posted.append(p) or (True, "ok"))[1],
+    )
+    await n.start()
+    try:
+        await n.alert_alarm("LOW_OIL", "Low Oil", "alarm", ts=0)
+        # Inside the window — dropped
+        await n.alert_alarm("LOW_OIL", "Low Oil", "alarm", ts=0)
+        # Wait past the window — next call fires again
+        await asyncio.sleep(0.1)
+        await n.alert_alarm("LOW_OIL", "Low Oil", "alarm", ts=0)
+        for _ in range(40):
+            if len(posted) >= 2:
+                break
+            await asyncio.sleep(0.05)
+    finally:
+        await n.stop()
+    assert len(posted) == 2
+
+
+async def test_worker_abandons_messages_past_max_age(tmp_path, monkeypatch):
+    """Per-message wall-clock deadline: a sustained Slack outage stops
+    producing retry tasks for stale messages so newer (more urgent)
+    alerts can still reach the channel when comms recover."""
+    db = Database(tmp_path / "t.sqlite")
+    cfg = SlackConfig(enabled=True, channel="#x", bot_token="xoxb-test")
+    n = SlackNotifier(cfg, db)
+    n.BACKOFF_S = (0.01, 0.01, 0.01)
+    n.MAX_ATTEMPTS = 10  # lots of retries available
+    n.MAX_AGE_S = 0.05   # but the deadline is shorter
+
+    attempts = []
+
+    def fake_post(token, payload, timeout):
+        attempts.append(time.time())
+        return False, "url_error"  # transport error → triggers retry path
+
+    monkeypatch.setattr(slack_mod, "_post_slack", fake_post)
+    await n.start()
+    try:
+        await n.alert_command("start", "op", "ok", ts=0)
+        # Wait for the worker to give up. Total time bounded by
+        # MAX_AGE_S + a few backoffs of slack.
+        await asyncio.sleep(0.4)
+    finally:
+        await n.stop()
+    # Without MAX_AGE_S we'd see MAX_ATTEMPTS attempts (10). With the
+    # deadline the worker abandons partway through. We just need to
+    # see fewer than MAX_ATTEMPTS to prove the deadline fired.
+    assert 0 < len(attempts) < 10, f"expected early abandon, got {len(attempts)} attempts"
 
 
 async def test_worker_retries_on_transport_error(tmp_path, monkeypatch):
