@@ -137,6 +137,16 @@ export function useLiveData(): LiveState {
               // the message predates the field so older backends still
               // work.
               panel: msg.panel ?? s.panel,
+              // Load source — preserve previous if backend predates
+              // the field. When present we also derive the legacy
+              // hts.transferredToGen flag here so the ATS card stays
+              // in sync without a redundant round-trip.
+              loadSource: msg.loadSource ?? s.loadSource,
+              timeInLoadSource: msg.timeInLoadSource ?? s.timeInLoadSource,
+              hts:
+                msg.loadSource !== undefined
+                  ? { ...s.hts, transferredToGen: msg.loadSource === "generator" }
+                  : s.hts,
               serverTs: msg.ts,
             };
             history = [s.reading, ...history].slice(0, HISTORY_SIZE);
@@ -145,6 +155,20 @@ export function useLiveData(): LiveState {
           }
           case "transition": {
             s = { ...s, state: msg.to, stateStartedAt: msg.ts, timeInState: 0 };
+            break;
+          }
+          case "load-source": {
+            // Immediate UI response to a utility↔generator transition,
+            // independent of the next snapshot tick. Also keep the
+            // legacy hts.transferredToGen flag in lockstep so the ATS
+            // diagram flips instantly.
+            s = {
+              ...s,
+              loadSource: msg.to,
+              loadSourceStartedAt: msg.ts,
+              timeInLoadSource: 0,
+              hts: { ...s.hts, transferredToGen: msg.to === "generator" },
+            };
             break;
           }
           case "alarm": {

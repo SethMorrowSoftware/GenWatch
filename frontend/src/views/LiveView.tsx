@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api/client";
 import { Card, EmptyState, Icon, LiveTick, Pill, Sparkline, fmt, formatTimeInState } from "../components/primitives";
-import type { ActiveAlarm, EngineState, EventRow, Reading, StatusBody } from "../types";
+import type { ActiveAlarm, EngineState, EventRow, LoadSource, Reading, StatusBody } from "../types";
 import { ConfirmModal } from "./ConfirmModal";
 
 interface Props {
@@ -21,15 +21,28 @@ const STATE_LABEL: Record<EngineState, string> = {
   alarm: "Alarm",
   unknown: "Unknown",
 };
+// Sub-line under the state title. For `running` the meaning depends on
+// whether the ATS has actually transferred load — running-unloaded is
+// the warm-up window before transfer (or a forced test); running-with-
+// load is the backup-power case. stateSubFor() picks the right one.
 const STATE_SUB: Record<EngineState, string> = {
   stopped: "AUTO · Ready",
   cranking: "Engine start in progress",
-  running: "On load · Utility lost",
+  running: "On load · Backup power",       // overridden when loadSource = utility
   exercising: "Quiet-Test · No load",
   cooling: "Engine cool-down",
   alarm: "Shutdown · Operator action required",
   unknown: "—",
 };
+function stateSubFor(state: EngineState, loadSource: LoadSource | undefined): string {
+  if (state === "running" && loadSource === "utility") {
+    return "Running unloaded · Pre-transfer warm-up";
+  }
+  if (state === "cooling") {
+    return "Engine cool-down · Load on utility";
+  }
+  return STATE_SUB[state];
+}
 const STATE_BADGE: Record<EngineState, string> = {
   stopped: "STOPPED",
   cranking: "CRANKING",
@@ -125,9 +138,9 @@ function StatusHero({ status, history }: { status: StatusBody; history: Reading[
           </div>
           <div className="state-title">{STATE_LABEL[state]}</div>
           <div className="state-sub">
-            <strong>{STATE_SUB[state]}</strong>
+            <strong>{stateSubFor(state, status.loadSource)}</strong>
             <span className="dot-sep" />
-            <span>HTS-1 on {status.hts.transferredToGen ? "GENERATOR" : "UTILITY"}</span>
+            <span>HTS-1 on {status.loadSource === "generator" ? "GENERATOR" : status.loadSource === "unknown" ? "—" : "UTILITY"}</span>
           </div>
         </div>
         <div className="hero-load">
@@ -220,7 +233,11 @@ function LoadRing({ pct, kw, ratingKw }: { pct: number; kw: number | null; ratin
 
 // ─── ATS card (separate from hero) ───────────────────────────────────────
 function AtsCard({ status }: { status: StatusBody }) {
-  const onGen = status.hts.transferredToGen;
+  // Drive the diagram from the load-source classifier rather than the
+  // legacy boolean — this keeps the visualization accurate during
+  // quiet-test exercises (engine running, load still on utility) and
+  // during the pre-transfer warm-up window.
+  const onGen = status.loadSource === "generator";
   const r = status.reading;
   const loadPct = r.kw != null ? Math.round((r.kw / Math.max(1, status.site.ratingKw)) * 100) : 0;
   return (

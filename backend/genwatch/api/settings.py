@@ -51,6 +51,7 @@ async def get_config(request: Request) -> dict:
             "alertOnStateChange": s.slack.alert_on_state_change,
             "alertOnCommand": s.slack.alert_on_command,
             "alertOnCommsLost": s.slack.alert_on_comms_lost,
+            "alertOnLoadSourceChange": s.slack.alert_on_load_source_change,
         },
         "wsPushMs": s.ws_push_ms,
     }
@@ -68,6 +69,7 @@ class SlackUpdate(BaseModel):
     alert_on_state_change: bool | None = None
     alert_on_command: bool | None = None
     alert_on_comms_lost: bool | None = None
+    alert_on_load_source_change: bool | None = None
 
 
 class ConfigUpdate(BaseModel):
@@ -94,6 +96,7 @@ _SLACK_HOTRELOAD_FIELDS = {
     "alert_on_state_change",
     "alert_on_command",
     "alert_on_comms_lost",
+    "alert_on_load_source_change",
 }
 
 

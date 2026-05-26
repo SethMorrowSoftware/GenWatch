@@ -578,6 +578,9 @@ function SlackSection({
       <SlackToggle label="Modbus comms"
         desc="Comms lost / recovered"
         value={v.alertOnCommsLost} onChange={(b) => set({ alert_on_comms_lost: b })} />
+      <SlackToggle label="Load source"
+        desc="Utility ↔ generator transitions (outage / restoration)"
+        value={v.alertOnLoadSourceChange} onChange={(b) => set({ alert_on_load_source_change: b })} />
       <SlackToggle label="Engine state transitions"
         desc="Every stopped/cranking/running/cooling change — chatty"
         value={v.alertOnStateChange} onChange={(b) => set({ alert_on_state_change: b })} />
