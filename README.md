@@ -6,7 +6,7 @@ A single-pane operator console: live engine state, electrical output, two-step-c
 
 > **Note on naming.** The product was previously called *GenWatch*. The internal Python package, systemd unit, CLI, and on-disk paths (`/etc/genwatch/`, `genwatch.service`, the `genwatch` CLI) keep those identifiers so existing deployments don't break. Only the operator-facing copy was rebranded.
 
-> **Reliability summary.** Hardware watchdog on pid 1 (Pi reboots on kernel hang); software watchdog on the polling loop driven by a monotonic prime-poll heartbeat (service restarts on a deadlocked read); TCP keepalive on the Modbus socket (dead Lantronix detected in ~60 s); SQLite WAL with `synchronous=FULL` (audit/alarm rows survive a power cut); graceful degradation when the link is down (UI stays reachable, comms shown as LOST, reconnect in the background); panel-mode gate on every remote command (server rejects with 409 unless the H-100 key switch is in AUTO); batch-read fan-out preserves last-good values when a single register fails (no sentinel zeros that could trip an alarm comparator); register-map hot-reload propagates to the live poller without a service restart; login rate-limited; audit log on every control command. Test coverage under `backend/tests/` (71 tests).
+> **Reliability summary.** Hardware watchdog on pid 1 (Pi reboots on kernel hang); software watchdog on the polling loop driven by a monotonic prime-poll heartbeat (service restarts on a deadlocked read); TCP keepalive on the Modbus socket (dead Lantronix detected in ~60 s); SQLite WAL with `synchronous=FULL` (audit/alarm rows survive a power cut); graceful degradation when the link is down (UI stays reachable, comms shown as LOST, reconnect in the background); panel-mode gate on every remote command (server rejects with 409 unless the H-100 key switch is in AUTO); batch-read fan-out preserves last-good values when a single register fails (no sentinel zeros that could trip an alarm comparator), with per-register TTL so a stale value can't masquerade as fresh forever; register-map hot-reload propagates to the live poller without a service restart; confirm-token gate on every state-changing endpoint including alarm-ack; CSRF middleware on every mutating `/api/*` request; SQLite writes offloaded from the event loop so a checkpoint can't stall the next poll; Modbus client lock released between retry attempts so an operator command can pre-empt a degraded-link retry chain; Slack notifier dedupes flapping alarms within a 60 s window and abandons stale retries past 5 min; supply chain pinned with `package-lock.json` + hash-locked `requirements.lock` and `npm ci --ignore-scripts` on every install; login rate-limited; audit log on every control command. Test coverage under `backend/tests/` (201 tests).
 
 ---
 
@@ -166,14 +166,14 @@ sudo deploy/scripts/install.sh
 
 The installer is idempotent — safe to re-run for upgrades. It:
 
-1. Verifies you're root, on Bookworm, on a Pi.
+1. Verifies you're root, on Bookworm or Trixie, on a Pi. Unsupported distros now error out (override with `GENWATCH_ALLOW_UNSUPPORTED_OS=1`); pre-Bookworm systemd silently rejects directives in the hwwatchdog drop-in, which previously failed quietly.
 2. Installs apt deps: `python3-venv`, `build-essential`, `nodejs` (>= 18), `npm`, `rsync`.
 3. Creates the `genwatch` system user.
-4. Builds the React/TypeScript frontend (`vite build` — ~10 s on Pi 5).
-5. Creates the Python venv at `/opt/genwatch/venv` and installs backend deps.
+4. Builds the React/TypeScript frontend with `npm ci --ignore-scripts` (refuses to drift from the committed `package-lock.json`; blocks postinstall scripts from running under root) followed by `vite build` — ~10 s on Pi 5.
+5. Creates the Python venv at `/opt/genwatch/venv` and installs backend deps from `backend/requirements.lock` with `pip install --require-hashes` (every wheel verified against the committed sha256). Falls back to `requirements.txt` with a warning for older clones that predate the lockfile.
 6. Copies the backend package to `/opt/genwatch/genwatch/`.
 7. Copies the built frontend to `/usr/share/genwatch/ui/`.
-8. Provisions `/etc/genwatch/config.yaml` with a random `jwt_secret`.
+8. Provisions `/etc/genwatch/config.yaml` with a random `jwt_secret` (256 bits from CPython's CSPRNG) and `0640 genwatch:genwatch` perms.
 9. Installs the hardware-watchdog drop-in (`/etc/systemd/system.conf.d/10-genwatch-hwwatchdog.conf`) and re-execs pid 1 so the Pi's BCM2712 watchdog starts being petted. A kernel hang from this point on will hard-reset the Pi within ~15 s.
 10. Installs the systemd unit, runs `genwatch doctor` for a pre-flight report, and starts the service (after the admin password is set).
 
@@ -323,7 +323,7 @@ All commands are Modbus writes against the H-100:
 
 - **Start / Stop / Transfer** — FC16 multi-register write to `0x019C` (`START_BITS`). Start = `[0x0080, 0x0000, 0x0000]`, stop = `[0x0000, 0x0000, 0x0000]`, transfer = `[0x0080, 0x0000, 0x0080]`.
 - **Quiet-Test** — writes `0x0001` to `0x022B` (`QUIETTEST_STATUS`); the same register reads back the test's running status.
-- **Acknowledge Alarm** — writes `0x0001` to `0x012E` (`ALARM_ACK`).
+- **Acknowledge Alarm** — writes `0x0001` to `0x012E` (`ALARM_ACK`). Requires a fresh confirm token (same gate as start/stop) so a misclick on an active shutdown alarm can't silently re-enable a remote-start path. The frontend chains `confirm → ack` transparently for the operator.
 
 Every command is audit-logged with the operator, timestamp, action, the actual register + word values written, and the result (`ok` / `denied` / `failed`). Login attempts additionally record the source IP. See [§8.4](#84-built-in-defenses).
 
@@ -454,14 +454,18 @@ Restricts the monitor's port to your LAN ranges.
 
 ### 8.4 Built-in defenses
 
+- **Authentication required on every `/api/*` endpoint** except `/api/health` (and the auth endpoints themselves). The trusted-LAN deployment model no longer leaves telemetry, events, alarms, and config readable to anonymous LAN clients. `/api/health` stays open for external uptime monitoring but only returns `{ok, mock}` to anon callers — version, comms state, and DB size require a session.
+- **CSRF middleware** rejects any POST/PUT/DELETE/PATCH to `/api/*` whose `Origin` (or `Referer`) header isn't the request's own host or an entry in `cors_origins`. Defense in depth on top of `SameSite=Strict` so a misconfigured `cookie_samesite: lax` doesn't open a CSRF hole. Non-browser clients (curl, ansible) without `Origin`/`Referer` pass through — CSRF requires a victim browser.
 - **Login rate-limiter** — 5 attempts then 1 attempt per 3 minutes per source IP. State resets on service restart. *(Note: behind a reverse proxy the limiter sees the proxy's IP — restricts the limiter to a single global bucket. Use Tailscale or `ufw` for proxied deploys.)*
-- **JWT secret rotation** — invalidate all sessions by regenerating: `sudo genwatch gensecret` → paste into `config.yaml` `jwt_secret:` → `sudo systemctl restart genwatch`. An empty `jwt_secret` makes the service generate an ephemeral one at startup (warning logged); set it explicitly so sessions survive restarts.
+- **JWT secret refuses-to-boot when empty in production.** `sudo genwatch gensecret` → paste into `config.yaml` `jwt_secret:` → `sudo systemctl restart genwatch` rotates all sessions. Previously an empty secret silently generated an ephemeral one and logged a warning; that hid genuine config corruption under `Restart=always`. Mock mode (`GENWATCH_MOCK=true`) preserves the ephemeral fallback for dev / CI.
 - **Audit log** — `/var/lib/genwatch/db.sqlite` table `audit` records every login attempt (with source IP), every confirm-token issue/consume/evict, and every control command (with operator, action, register, word values, and result `ok`/`denied`/`failed`). SQLite `synchronous=FULL` means a power cut after a command can't lose the audit row.
-- **Server-side state validity** — every control command re-checks `engine_state` server-side; clicking "Start" while running returns HTTP 409 `invalid_state` and audit-logs the denial.
+- **Server-side state validity** — every control command re-checks `engine_state` server-side *inside* the control lock (so two concurrent requests can't both pass the gate against a stale snapshot). Clicking "Start" while running returns HTTP 409 `invalid_state` and audit-logs the denial.
 - **Panel-mode gate** — every remote command re-checks the H-100 front-panel key-switch position; rejects with HTTP 409 `panel_mode_locked` unless the panel is in AUTO. Stops a stolen session (or a misclicked button) from quietly no-op'ing at the unit. See [§7 Panel key-switch gating](#panel-key-switch-gating).
-- **Confirm-token discipline** — 8-char hex tokens (`secrets.token_hex(4)`), 30 s TTL, single-use (`pop`-on-consume), operator-bound (issuer must match consumer). Replay returns 400 `token_invalid`.
-- **Session cookie hardening** — `HttpOnly` (no JS access), `SameSite=Strict` by default (no cross-site CSRF on top of the confirm-token gate), `Path=/`. The `Secure` flag is added automatically when the request reached the service over HTTPS (a Caddy / `tailscale serve` deployment terminating TLS gets it for free); override via `auth.cookie_secure: true|false` and `auth.cookie_samesite: strict|lax|none` if your topology needs it. SameSite=None is rejected at config load unless paired with Secure.
-- **Hardened systemd unit** — `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectKernelTunables`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, narrow `DeviceAllow` list (covers FTDI/CH340/CP210x USB-serial chips + the Pi 5 on-board UART for the legacy serial fallback), `MemoryMax=512M`, `TasksMax=128`.
+- **Confirm-token discipline** — 8-char hex tokens (`secrets.token_hex(4)`), 30 s TTL, single-use (`pop`-on-consume), operator-bound (issuer must match consumer), required on start / stop / exercise / transfer AND on alarm-ack. Replay returns 400 `token_invalid`.
+- **WebSocket hardening** — `/ws/live` validates `Origin` against the same allowlist as the CSRF middleware before accepting (browser-initiated cross-origin connects rejected), re-validates the session JWT every 60 s inside the message loop (an expired or secret-rotated token can't keep streaming live data through a long-lived socket), and logs a deprecation warning when the legacy `?token=` query parameter is used.
+- **Session cookie hardening** — `HttpOnly` (no JS access), `SameSite=Strict` by default, `Path=/`. The `Secure` flag is added automatically when the request reached the service over HTTPS (a Caddy / `tailscale serve` deployment terminating TLS gets it for free); override via `auth.cookie_secure: true|false` and `auth.cookie_samesite: strict|lax|none` if your topology needs it. SameSite=None is rejected at config load unless paired with Secure.
+- **Hardened systemd unit** — `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectKernel*`, `ProtectClock`, `ProtectHostname`, `ProtectProc=invisible`, `ProcSubset=pid`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, empty `CapabilityBoundingSet` / `AmbientCapabilities`, `UMask=0027`, `SystemCallFilter=@system-service` with `~@mount @swap @reboot @raw-io @cpu-emulation @obsolete` negation, `OOMScoreAdjust=-200`, narrow `DeviceAllow` list (covers FTDI/CH340/CP210x USB-serial chips + the Pi 5 on-board UART for the legacy serial fallback), `MemoryMax=512M`, `TasksMax=128`.
+- **Supply-chain pinning** — `package-lock.json` and `backend/requirements.lock` (with sha256 hashes for every transitive) are both committed. `install.sh` uses `npm ci --ignore-scripts` (refuses to drift, blocks postinstall scripts from running under root) and `pip install --require-hashes` (refuses a wheel whose sha256 doesn't match a typosquat / compromised mirror).
 
 ---
 
@@ -481,12 +485,24 @@ sudo genwatch doctor
 It will:
 
 - Reinstall apt deps (no-op if current).
-- Reinstall the venv deps (only changes if `requirements.txt` moved).
-- Rebuild the frontend (only if sources are newer than the dist).
+- Reinstall the venv deps from `backend/requirements.lock` with `--require-hashes` (only changes if the lock moved; refuses to install if a transitive sha256 fails to verify).
+- Rebuild the frontend with `npm ci --ignore-scripts` (only if sources are newer than the dist).
 - Sync the backend package to `/opt/genwatch/genwatch/`.
 - Keep your `/etc/genwatch/config.yaml` and `/var/lib/genwatch/db.sqlite` untouched.
 
 The journal will show `Poller register-map reloaded: prime N→N batches, base N→N batches` if the upgrade includes a YAML edit — the first restart picks it up at boot.
+
+### Bumping a Python dep (lockfile regen)
+
+`requirements.lock` is authoritative on install. If you bump a version in `backend/requirements.txt`, regenerate the lock alongside it:
+
+```bash
+pip install pip-tools                                          # one-time
+pip-compile --generate-hashes \
+    --output-file=backend/requirements.lock backend/requirements.txt
+```
+
+Commit both files together. Skipping this step means `install.sh` either keeps installing the old version (lockfile wins) or errors out on a hash mismatch — both safe failures, neither what you wanted.
 
 ### Register-map edits without a restart
 
@@ -508,7 +524,23 @@ curl -b cookies.txt -X POST http://localhost:8000/api/registers/reload
 
 ### Backups + schema
 
-Keep a dated backup of `/etc/genwatch/config.yaml` before major upgrades. The SQLite schema is forward-compatible (`CREATE TABLE IF NOT EXISTS` everywhere) — an upgrade never destroys data.
+Keep a dated backup of `/etc/genwatch/config.yaml` before major upgrades — it contains the `jwt_secret`, the `admin_password_hash`, and (if configured) the Slack `bot_token`.
+
+The SQLite database at `/var/lib/genwatch/db.sqlite` carries the audit log + history. Lose it and you lose forensic records of every operator command — back it up before SD-card rotations:
+
+```bash
+# Online backup — SQLite WAL handles this safely while the service runs
+sudo -u genwatch sqlite3 /var/lib/genwatch/db.sqlite \
+    ".backup /var/lib/genwatch/db.backup-$(date +%F).sqlite"
+
+# Restore (service must be stopped)
+sudo systemctl stop genwatch
+sudo cp /path/to/db.backup-YYYY-MM-DD.sqlite /var/lib/genwatch/db.sqlite
+sudo chown genwatch:genwatch /var/lib/genwatch/db.sqlite
+sudo systemctl start genwatch
+```
+
+The SQLite schema is forward-compatible (`CREATE TABLE IF NOT EXISTS` everywhere) — an upgrade never destroys data.
 
 ---
 
@@ -557,6 +589,22 @@ The H-100 front-panel key switch is not in AUTO. Set the panel to AUTO at the un
 
 If a single Modbus read fails inside a coalesced batch, the poller falls back to single-register reads. Registers whose single-read fallback ALSO fails are *skipped* — the previous value is kept rather than overwritten with `0`. So a coolant temp displayed as 188 °F will simply stay at 188 °F until the next successful read, rather than briefly flicker to 0 °F and trip an alarm comparator. The journal shows `skipping decode of <name> @0x<addr> — fan-out read failed` at debug level. If the freeze persists, run `sudo genwatch doctor` and look at the bridge.
 
+### Symptom: Service exits with `auth.jwt_secret is unset in production mode`
+
+The config has `jwt_secret: ""` (or the key is missing). Production refuses to generate an ephemeral secret because that would silently invalidate every operator session on each restart while masking the underlying config problem. Generate a real one:
+
+```bash
+sudo genwatch gensecret                      # prints hex on stdout
+sudo nano /etc/genwatch/config.yaml          # paste into auth.jwt_secret
+sudo systemctl restart genwatch
+```
+
+For dev / CI, set `GENWATCH_MOCK=true` to re-enable the ephemeral fallback.
+
+### Symptom: Install fails with `Unsupported OS tag`
+
+`install.sh` errors on anything older than Bookworm because pre-243 systemd silently rejects `RebootWatchdogSec` in the hwwatchdog drop-in, leaving shutdown unprotected. If you have a good reason to run on an older distro: `sudo GENWATCH_ALLOW_UNSUPPORTED_OS=1 deploy/scripts/install.sh` — accept that the hwwatchdog may not configure correctly.
+
 ### Symptom: Service restart-looping
 
 ```bash
@@ -603,43 +651,58 @@ Pi 5 needs a true 5 V / 5 A supply. Cheap USB-C chargers brown out under USB per
 │ Raspberry Pi 5  ·  systemd unit: genwatch.service               │
 │                                                                  │
 │  FastAPI + uvicorn (single worker — Modbus is single-master)   │
+│   ├─ CSRF middleware on every mutating /api/* request           │
 │   ├─ /api/auth        login, logout, /me                        │
-│   ├─ /api/status      full live snapshot                        │
-│   ├─ /api/telemetry   time-series (SQLite-backed)               │
-│   ├─ /api/events      event/alarm log                           │
+│   ├─ /api/status      full live snapshot   (auth required)      │
+│   ├─ /api/telemetry   time-series          (auth required)      │
+│   ├─ /api/events      event/alarm log      (auth required)      │
 │   ├─ /api/control     confirm-token-gated start/stop/etc.       │
+│   ├─ /api/alarms/*/ack confirm-token-gated alarm acknowledge    │
 │   ├─ /api/config      read/write /etc/genwatch/config.yaml      │
-│   └─ /api/registers   read/reload register map                  │
+│   ├─ /api/registers   read/reload register map                  │
+│   └─ /api/health      anonymous liveness probe (trimmed payload)│
 │                                                                  │
-│  Two-tier Modbus poller:                                         │
+│  Two-tier Modbus poller (with per-register TTL on last-good):   │
 │   • prime (1.5 s): output_status_1..8 bitfields, key switch,    │
 │                    quiet-test status, alarm count                │
 │   • base  (15 s):  RPM, V, A, Hz, kW, oil P/T, coolant, batt…   │
 │  Engine state + active alarms derived from the bitfield bits.    │
 │  Coalesces contiguous registers into a single Modbus read.       │
-│  Falls back to single-register reads if a batch fails.           │
+│  Falls back to single-register reads if a batch fails. Values    │
+│  evicted from `reading.values` past 3× their tier cadence so a   │
+│  stuck-stale read can't masquerade as fresh to alarm comparators.│
+│  Client lock released between retry attempts so a queued control │
+│  write can pre-empt a degraded-link retry chain.                 │
 │                                                                  │
 │  State machine + control service:                                │
 │   • semantic engine state (stopped/cranking/running/…)           │
 │   • panel-mode tracking (AUTO/MANUAL/OFF) — gates remote writes  │
 │   • two-step confirm tokens (8-char hex, 30 s TTL, single-use)   │
-│   • server-side state-validity guards (409 invalid_state)        │
+│   • server-side state-validity guards (409 invalid_state) —      │
+│       re-checked INSIDE the lock after token consume             │
 │   • server-side panel-mode guard      (409 panel_mode_locked)    │
 │   • audit log on every command                                   │
 │                                                                  │
-│  Storage (SQLite WAL, synchronous=FULL):                         │
+│  Storage (SQLite WAL, synchronous=FULL — writes off event loop): │
 │   • telemetry / telemetry_1m / telemetry_1h                      │
 │   • events / alarms_active / audit / kv                          │
 │   • retention task aggregates and prunes every 5 min             │
-└─────────────────────────────┬───────────────────────────────────┘
-                              │ Modbus RTU over TCP (raw-TCP tunnel)
-                              │ 9600 8N1, slave 100
-                              v
-                       ┌──────────────┐
-                       │ Network      │  Lantronix / Moxa / Digi /
-                       │ serial bridge│  ser2net — listening on a TCP
-                       └──────┬───────┘  port (typically 10001)
-                              │ RS-232 (9600 8N1)
+│                                                                  │
+│  Slack notifier (per-(code,kind) dedupe within 60 s, retries    │
+│  abandoned past 5 min so a sustained outage can't backlog).     │
+└─────────────────────────────┬─────────────────┬─────────────────┘
+                              │                  │ Modbus TCP (MBAP)
+                              │ RTU over TCP     │ default 5020
+                              │ 9600 8N1 slave 100│
+                              v                  v
+                       ┌──────────────┐   ┌──────────────────┐
+                       │ Network      │   │ ATS-Pi companion │  optional
+                       │ serial bridge│   │ (separate Pi +   │  ats.enabled
+                       │ Lantronix /  │   │  ADAM-6060) —    │  in config
+                       │ Moxa / ser2net│  │  ASCO transfer   │  Phase 1+2
+                       └──────┬───────┘   │  switch sensing  │  shipped;
+                              │           └──────────────────┘  Phase 3
+                              │ RS-232 (9600 8N1)               pending
                               v
                        ┌──────────────┐
                        │ H-100        │  Generac H-100 controller
@@ -650,17 +713,22 @@ Pi 5 needs a true 5 V / 5 A supply. Cheap USB-C chargers brown out under USB per
 ### Reliability features
 
 - **Hardware watchdog on pid 1** — drop-in at `/etc/systemd/system.conf.d/10-genwatch-hwwatchdog.conf` sets `RuntimeWatchdogSec=15s`. systemd pets the Pi's BCM2712 watchdog via `/dev/watchdog`; a kernel hang, USB controller wedge, or thermal panic hard-resets the Pi within ~15 s.
-- **Software watchdog driven by a poll heartbeat** — `Type=notify` unit with `WatchdogSec=60s`. The app only pings `sd_notify(WATCHDOG=1)` while a *prime* Modbus poll has completed within the last ~6 × prime cadence. A deadlocked poll task (pymodbus stuck on a bad socket) lets systemd SIGKILL and restart. Uses a monotonic clock so NTP/DST jumps can't fool the timing.
+- **Software watchdog driven by a poll heartbeat** — `Type=notify` unit with `WatchdogSec=60s`. The app only pings `sd_notify(WATCHDOG=1)` while a *prime* Modbus poll has completed within the last ~6 × prime cadence. A deadlocked poll task (pymodbus stuck on a bad socket) lets systemd SIGKILL and restart. Uses a monotonic clock so NTP/DST jumps can't fool the timing. Cold-start grace capped at 5 minutes measured from actual service start (not from after poller setup completes).
 - **TCP keepalive on the Modbus socket** — `SO_KEEPALIVE` + Linux `TCP_KEEPIDLE=30` / `KEEPINTVL=10` / `KEEPCNT=3`. The kernel drops a wedged socket (Lantronix reboot, NAT idle timeout, switch flap with no FIN/RST) within ~60 s instead of waiting for application read timeouts to exhaust.
 - **Graceful degradation when the link is down** — a Modbus connect failure at startup no longer hard-exits. The service stays up with comms shown as `LOST` in the UI; the poller reconnects in the background. Stops systemd restart-thrash from burning the SD card during outages.
-- **Batch-read fan-out, no sentinel zeros** — a failing block read falls back to single-register reads so one bad address can't blank out an entire telemetry tier. Registers whose fan-out *also* fails are skipped (the previous value is kept) rather than overwritten with `0` — a 0 °F on a coolant-temp register could otherwise trip an out-of-range alarm comparator on a transient bus error.
-- **Register-map hot-reload** — `POST /api/registers/reload` re-derives the prime/base batch tables under a lock and swaps them into the live poller, state machine, and control service. Operators can fix a bit position or scale and apply it without dropping a poll. Verified by `POST /api/registers/verify` (static + live read probe).
-- **SQLite WAL with `synchronous=FULL`** — fsyncs the WAL on every commit, so a power cut on the Pi can't lose freshly committed alarm / audit / event rows.
-- **Frontend stale-data indicator** — a red **STALE DATA** badge appears when the WebSocket is down or no live push has arrived in ~3 poll intervals, so operators don't act on frozen numbers. WebSocket reconnects with exponential backoff (cap 30 s).
+- **Batch-read fan-out, no sentinel zeros, per-register TTL** — a failing block read falls back to single-register reads so one bad address can't blank out an entire telemetry tier. Registers whose fan-out *also* fails are skipped (the previous value is kept) rather than overwritten with `0`. Each successful decode stamps a monotonic timestamp; values older than 3× their tier cadence are dropped from `reading.values` so a stuck-stale read can't masquerade as fresh forever (alarm comparators see `None` and degrade gracefully rather than evaluating against a phantom value).
+- **Modbus client lock released between retry attempts** — a failing read no longer holds the wire lock across its backoff sleeps. A queued control write can pre-empt the retry chain, dropping worst-case Stop-command latency under degraded comms from ~5.8 s to one timeout (~1.7 s).
+- **Register-map hot-reload** — `POST /api/registers/reload` re-derives the prime/base batch tables under a lock and swaps them into the live poller, state machine, and control service. The state machine snapshots its regmap reference at the top of each `update()` call so a reload landing mid-update can't produce torn derivations. Verified by `POST /api/registers/verify` (static + live read probe).
+- **SQLite WAL with `synchronous=FULL`, writes off the event loop** — telemetry writes run in a worker thread via `anyio.to_thread.run_sync` so a 100+ ms checkpoint can't stall WS pushes, the watchdog ticker, or the next poll cycle.
+- **Frontend stale-data indicator** — a red **STALE DATA** badge appears when the WebSocket is down or no live push has arrived in ~3 poll intervals, so operators don't act on frozen numbers. WebSocket reconnects with exponential backoff (cap 30 s). Confirm-modal countdown anchored to the operator's wall clock + server-provided TTL so client/server clock drift can't produce "valid -30 s" or infinite refresh loops.
+- **Panel-mode freshness gate (FE)** — control buttons require `panel` to be in a *recent* WS snapshot, not just the boot seed. Defense against a backend that drops the field while keeping the WS alive.
 - **Per-poll timeouts and retries** on every Modbus read; configurable in `config.yaml` (`modbus_tcp.timeout_s`, `modbus.retries`, `modbus.backoff_s`).
 - **Comms watchdog** — declares LOST after no successful prime poll for 3× the prime cadence; emits a `comms` event over the WebSocket so the badge transitions live.
-- **Two-step confirm tokens** — 8-char hex, 30 s TTL, single-use (`pop`-on-consume), operator-bound. Every issue / consume / expiry / mismatch is audit-logged.
-- **Server-side state validity + panel-mode gate** — every remote command re-checks `engine_state` (rejects 409 `invalid_state` for impossible transitions) and the H-100 panel key-switch position (rejects 409 `panel_mode_locked` unless AUTO).
+- **Two-step confirm tokens on every state-changing endpoint** — 8-char hex, 30 s TTL, single-use (`pop`-on-consume), operator-bound. Required on start / stop / exercise / transfer AND on alarm-ack. Every issue / consume / expiry / mismatch is audit-logged.
+- **Server-side state validity + panel-mode gate (in-lock)** — every remote command re-checks `engine_state` and panel key-switch position *inside* the control lock, after token consume, before the Modbus write. Two concurrent control requests can't both observe a stale snapshot and both fire.
+- **WebSocket Origin allowlist + periodic re-validation** — `/ws/live` validates `Origin` before `accept()` and re-decodes the session JWT every 60 s inside the message loop, so an expired or secret-rotated token can't keep a long-lived socket streaming.
+- **ATS-Pi cross-check (when companion is enabled)** — raises `ATS_LOADSOURCE_DISAGREE` when the ATS-Pi position contradicts the H-100 electrical output for ≥3 consecutive polls. The `ats=generator + zero-output` arm is gated on `normal_available == False` so the normal ASCO retransfer-delay window doesn't trip a false positive on every utility-restore cycle.
+- **Slack dedupe + retry deadline** — per-(code, raised/cleared) suppression within a 60 s window so a flapping alarm bit can't exhaust the 200-slot queue. Per-message wall-clock deadline (5 min) so a sustained Slack outage doesn't backlog stale events past the point newer alerts can get through.
 - **Login rate-limiter** — token-bucket per source IP, 5 burst then 1 per 3 min. Returns `429` with `Retry-After`.
 - **Retention** — raw telemetry pruned at 7 d, 1-min rollup at 90 d, info / ok events at 30 d. Alarms, warns, and the audit log are never auto-pruned.
 
@@ -742,9 +810,12 @@ cd GenWatch
 # Backend
 cd backend
 python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-# Optional (recommended for local checks):
-# .venv/bin/pip install -r requirements-dev.txt
+# Prefer the lockfile for reproducible installs:
+.venv/bin/pip install --require-hashes -r requirements.lock
+# Or requirements.txt during a dep bump (then regenerate the lock — see §9):
+# .venv/bin/pip install -r requirements.txt
+# Dev-only tools (pytest etc.):
+.venv/bin/pip install -r requirements-dev.txt
 GENWATCH_MOCK=true \
 GENWATCH_AUTH__JWT_SECRET=$(.venv/bin/python -m genwatch gensecret) \
 GENWATCH_AUTH__ADMIN_PASSWORD_HASH=$(.venv/bin/python -m genwatch hash dev) \
@@ -753,8 +824,8 @@ GENWATCH_AUTH__ADMIN_PASSWORD_HASH=$(.venv/bin/python -m genwatch hash dev) \
 
 # Frontend (separate terminal)
 cd frontend
-npm install
-npm run dev      # → http://127.0.0.1:5173 (proxies /api + /ws to :8000)
+npm ci                    # honor package-lock.json — same as production install
+npm run dev               # → http://127.0.0.1:5173 (proxies /api + /ws to :8000)
 
 # Log in with password "dev"
 ```
@@ -769,12 +840,17 @@ cd backend
 .venv/bin/python -m pytest tests/ -v
 ```
 
-71 tests across four files:
+201 tests across nine files:
 
 - `test_registers.py` — YAML loader, decoder for every `RegType`, batch coalescing, address-overlap + bad-FC validation.
-- `test_endtoend.py` — boots the app with the mock client, drives the full operator flow (login → confirm → start → state-validity rejection → panel-mode-locked rejection), and verifies `/api/registers/reload` propagates to the live poller / state machine / control service.
-- `test_hardening.py` — rate-limiter math, events retention, `sd_notify` parsing, transport selection, TCP keepalive socket options, poller heartbeat stamping, batch-fallback behavior, fan-out-failure preserves last-good value, `panel` CLI command output (text + JSON).
-- `test_slack.py` — block builder, gating flags, dispatch worker, retry-on-transport-error vs no-retry-on-Slack-error, token sanitization (never echoed to audit), hot-reload from `PUT /api/config`.
+- `test_state_machine.py` — engine-state derivation, alarm-bit debounce, panel-mode decode.
+- `test_alarm_filtering.py` — `min_poll_count` debounce + `suppress_in_states` filter behavior across raise/clear edge cases.
+- `test_endtoend.py` — boots the app with the mock client, drives the full operator flow (login → confirm → start → state-validity rejection → panel-mode-locked rejection), verifies confirm-token on alarm-ack, CSRF blocks cross-origin POSTs, and that `/api/registers/reload` propagates to the live poller / state machine / control service.
+- `test_hardening.py` — rate-limiter math, events retention, `sd_notify` parsing, transport selection, TCP keepalive socket options, poller heartbeat stamping, batch-fallback behavior, fan-out-failure preserves last-good value, per-tier TTL evicts stale values, Modbus client lock released between retry attempts, JWT-secret refuses-to-boot in production, `panel` CLI command output (text + JSON), `genwatch hash` stdin-prompt behavior.
+- `test_slack.py` — block builder, gating flags, dispatch worker, retry-on-transport-error vs no-retry-on-Slack-error, dedupe window suppresses flap, retry deadline abandons stale messages, token sanitization (never echoed to audit), hot-reload from `PUT /api/config`.
+- `test_ats_service.py` — ATS-Pi snapshot decode, authoritative-gate, ICD §5.4 minor-version semantics, reboot detection.
+- `test_ats_loadsource_precedence.py` — load-source derivation precedence (ATS-Pi authoritative vs H-100 fallback), `ATS_LOADSOURCE_DISAGREE` debounce + gating on `normal_available`, handover across comms-lost / comms-recovered windows.
+- `test_ats_icd_alignment.py` — pins ICD doc ↔ YAML ↔ mock alignment so a register addition can't silently drift one of them.
 
 ### Layout
 
@@ -802,38 +878,56 @@ deploy/
   scripts/install.sh                      Idempotent installer
   config.yaml.example                     Annotated config template
 
-design_handoff_genwatch/                  Original design spec (reference)
+design_handoff_genwatch/                  Original design spec — keep as
+                                          reference for design tokens
+                                          (colors, type, spacing) and
+                                          screen-layout decisions when
+                                          touching the UI. The CSS itself
+                                          lives at frontend/src/styles/
+                                          genwatch.css.
+
+docs/integrations/                        Wire contracts + integration plans
+  asco-series-300.md                      DIY Modbus I/O island for sites
+                                          without an ATS-Pi (Path B).
+  ats-pi-icd.md                           ATS-Pi ↔ GenWatch wire contract.
+                                          Companion repo reads this.
+  ats-pi-plan.md                          Phased integration plan
+                                          (Phase 1+2 shipped, Phase 3
+                                          pending companion write-side).
+  ats-pi-companion-starter/               Starter handed to the companion
+                                          repo team — runnable mock,
+                                          hardened systemd unit, ICD test.
 ```
 
 ### API contract
 
-The auth column reflects the *current* implementation. Read endpoints are **public** under the trusted-LAN deployment model — anyone with network access to port 8000 can read telemetry, events, and the sanitized config without logging in. Write endpoints (control, config edits, alarm-ack, register reload) require a session cookie. Deploying outside a trusted LAN means putting the monitor behind Tailscale, Caddy, or a firewall ACL per [§8](#8-security-recommendations).
+Every `/api/*` endpoint requires authentication except `/api/health` (a deliberately-anonymous liveness probe for external uptime monitoring — returns only `{ok, mock}` to anon callers) and the auth endpoints themselves. Mutating endpoints additionally require the request's `Origin`/`Referer` to match the host (or `cors_origins` allowlist) — the CSRF middleware rejects with 403 `csrf_blocked` otherwise. Deploying outside a trusted LAN still wants Tailscale / Caddy / firewall ACLs per [§8](#8-security-recommendations) — auth + CSRF are defense in depth, not a substitute for network isolation.
 
 | Method | Path                                          | Auth   | Notes                                                       |
 |--------|-----------------------------------------------|--------|-------------------------------------------------------------|
-| GET    | `/api/health`                                 | public | Liveness; returns comms state, uptime, mock flag, version   |
+| GET    | `/api/health`                                 | public | Anon callers see `{ok, mock}` only. Authed callers get comms state, uptime, version, DB size. |
 | POST   | `/api/auth/login`                             | public | `{ password }` → session cookie (rate-limited per IP)       |
 | POST   | `/api/auth/logout`                            | public | Clear cookie                                                |
 | GET    | `/api/auth/me`                                | public | Identity (200 with `{authenticated: false}` when anonymous) |
-| GET    | `/api/status`                                 | public | Full live snapshot (engine, comms, reading, panel, alarms)  |
-| GET    | `/api/telemetry`                              | public | `?metric=&from=&to=&max_points=` (server-side decimation)   |
-| GET    | `/api/telemetry/columns`                      | public | Available telemetry metric names                            |
-| GET    | `/api/columns`                                | public | Register-name → DB column mapping                           |
-| GET    | `/api/events`                                 | public | `?limit=&severity=alarm,warn&type=&from=&to=`               |
-| GET    | `/api/alarms?active=true`                     | public | Currently-active alarms                                     |
-| POST   | `/api/alarms/{code}/ack`                      | op+    | Operator clears an alarm (writes `0x0001` → `0x012E`)       |
-| GET    | `/api/alarm-codes`                            | public | Static alarm-code reference table from the YAML             |
+| GET    | `/api/status`                                 | op+    | Full live snapshot (engine, comms, reading, panel, alarms, ATS) |
+| GET    | `/api/telemetry`                              | op+    | `?metric=&from=&to=&max_points=` (server-side decimation)   |
+| GET    | `/api/telemetry/columns`                      | op+    | Available telemetry metric names                            |
+| GET    | `/api/columns`                                | op+    | Register-name → DB column mapping                           |
+| GET    | `/api/events`                                 | op+    | `?limit=&severity=alarm,warn&type=&from=&to=`               |
+| GET    | `/api/alarms?active=true`                     | op+    | Currently-active alarms                                     |
+| POST   | `/api/alarms/{code}/ack`                      | op+    | Body `{ confirm_token }`; writes `0x0001` → `0x012E`        |
+| GET    | `/api/alarm-codes`                            | op+    | Static alarm-code reference table from the YAML             |
 | GET    | `/api/control/confirm`                        | op+    | Issue 8-char hex confirm token (30 s TTL, single-use)       |
 | POST   | `/api/control/{start,stop,exercise,transfer}` | op+    | Body `{ confirm_token }`; 409 on invalid state or panel ≠ AUTO |
-| GET    | `/api/config`                                 | public | Effective config (bot_token + jwt_secret never returned)    |
+| GET    | `/api/config`                                 | op+    | Effective config (bot_token + jwt_secret never returned)    |
 | PUT    | `/api/config`                                 | admin  | Update on-disk config; Slack hot-reloads, others need restart |
 | POST   | `/api/slack/test`                             | admin  | Send a synchronous test message; returns `{ok, detail}`     |
-| GET    | `/api/registers`                              | public | Current register map + last-read values for each            |
+| GET    | `/api/registers`                              | op+    | Current register map + last-read values for each            |
 | POST   | `/api/registers/reload`                       | admin  | Re-parse YAML, propagate to live poller + state + control   |
 | GET    | `/api/registers/verify`                       | admin  | Static + live read verification (skipped in mock mode)      |
-| WS     | `/ws/live`                                    | cookie | Pushes `hello` / `snapshot` / `transition` / `alarm` / `alarm-cleared` / `comms` / `ping` |
+| WS     | `/ws/live`                                    | cookie | Cookie auth + Origin allowlist + 60 s periodic re-validation. Pushes `hello` / `snapshot` / `transition` / `alarm` / `alarm-cleared` / `comms` / ATS events / `ping`. |
 
-Roles: **viewer** (read), **operator** (read + control), **admin** (everything including config edits). The default `operator_name` (`auth.operator_name` in config) is the only configured account; the role attached at login is `admin` for the operator account by default — viewer/operator are reserved for future multi-user expansion.
+Roles: **viewer**, **operator**, **admin** — `require_operator` admits `{operator, admin}`, `require_admin` admits `{admin}`. Today only one login exists (the `admin_password_hash` account, issued `role="admin"`), so both gates pass for every authenticated user. The distinction is forward-compat scaffolding for a future second password; pick the gate that documents intent (admin for secret-handling, operator for operational reads/writes) rather than treating `require_admin` as a real privilege boundary until the split lands.
 
 All errors return JSON `{ detail: { code, message } }` with appropriate HTTP status. Common error codes:
 
@@ -844,6 +938,7 @@ All errors return JSON `{ detail: { code, message } }` with appropriate HTTP sta
 | 401    | `unauthorized`        | No / invalid session cookie                                      |
 | 403    | `forbidden`           | Role insufficient for the action                                 |
 | 403    | `token_mismatch`      | Confirm token was issued to a different operator                 |
+| 403    | `csrf_blocked`        | Mutating request whose `Origin`/`Referer` is not in the allowlist |
 | 409    | `invalid_state`       | Control verb not valid for current engine state (e.g. start while running) |
 | 409    | `panel_mode_locked`   | Panel key switch is MANUAL / OFF / unknown — remote writes blocked |
 | 429    | `rate_limited`        | Too many login attempts; `Retry-After` header gives the wait    |
