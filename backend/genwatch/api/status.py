@@ -85,6 +85,47 @@ async def status(request: Request) -> dict:
         "quietTestStatusRaw": r.get("quiettest_status"),
     }
 
+    # ATS-Pi companion device — present when ats.enabled is true. Shape
+    # mirrors AtsSnapshot via services/ats.py. When disabled, we return
+    # a minimal {"enabled": false} block so the frontend can branch on
+    # the field's presence without crashing.
+    ats_service = getattr(request.app.state, "ats_service", None)
+    if ats_service is None:
+        ats_block: dict = {"enabled": False}
+    else:
+        s = ats_service.snap
+        ats_block = {
+            "enabled": True,
+            "position": s.position,
+            "normalAvailable": s.normal_available,
+            "emergencyAvailable": s.emergency_available,
+            "engineStartCalling": s.engine_start_calling,
+            "atsMode": s.ats_mode,
+            "faultCodes": sorted(s.fault_codes),
+            "lastTransferToGenTs": s.last_transfer_to_gen_ts,
+            "lastRetransferToUtilTs": s.last_retransfer_to_util_ts,
+            "transferCount24h": s.transfer_count_24h,
+            "transferCountLifetime": s.transfer_count_lifetime,
+            "icdVersion": list(s.icd_version),
+            "atsPiFw": list(s.ats_pi_fw),
+            "atsPiUnitId": s.ats_pi_unit_id,
+            "atsPiUptimeS": s.ats_pi_uptime_s,
+            "cmdTestActive": s.cmd_test_active,
+            "cmdInhibitActive": s.cmd_inhibit_active,
+            "cmdForceTransferActive": s.cmd_force_transfer_active,
+            "cmdBypassDelayActive": s.cmd_bypass_delay_active,
+            "comms": {
+                "state": s.comms.state,
+                "successPct": s.comms.success_pct,
+                "lastGoodAt": s.comms.last_good_at,
+                "rateMs": s.comms.rate_ms,
+            },
+            # The single most important derived field: is this service
+            # currently the source of truth for the operator-visible
+            # loadSource? The UI uses this to annotate provenance.
+            "authoritative": ats_service.is_authoritative(),
+        }
+
     out = {
         "state": snap.engine_state,
         "alarmRaw": snap.alarm_raw,
@@ -136,6 +177,7 @@ async def status(request: Request) -> dict:
             } if last_alarm else None
         ),
         "panel": panel,
+        "ats": ats_block,
         "serverTs": time.time(),
     }
     return out

@@ -37,6 +37,7 @@ from .modbus.client import MockModbusClient, ModbusClient, SerialModbusClient, T
 from .modbus.poller import Poller
 from .modbus.registers import load_register_map
 from .services import notify
+from .services.ats import AtsService
 from .services.control import ControlService
 from .services.ratelimit import RateLimiter
 from .services.retention import RetentionService
@@ -134,8 +135,55 @@ async def lifespan(app: FastAPI):
         )
 
     bus = EventBus()
-    state_machine = StateMachine(regmap, db, bus)
     slack = SlackNotifier(settings.slack, db, site_name=regmap.site.name)
+
+    # ─── ATS-Pi companion (optional, see docs/integrations/ats-pi-icd.md) ──
+    # Constructed BEFORE the StateMachine so the latter can hold a
+    # reference to the ATS service for loadSource precedence. The ATS
+    # poller is independent — its failure does not affect generator
+    # monitoring (and vice versa).
+    ats_service: AtsService | None = None
+    ats_client: ModbusClient | None = None
+    ats_poller: Poller | None = None
+    if settings.ats.enabled:
+        ats_reg_path = Path(settings.ats.register_file)
+        if not ats_reg_path.is_absolute():
+            pkg_local = Path(__file__).parent / ats_reg_path
+            if pkg_local.exists():
+                ats_reg_path = pkg_local
+        log.info("Loading ATS register map from %s", ats_reg_path)
+        ats_regmap = load_register_map(ats_reg_path)
+        ats_client = TcpRtuModbusClient(
+            host=settings.ats.host,
+            port=settings.ats.port,
+            framer=settings.ats.framer,
+            timeout_s=settings.ats.timeout_s,
+            connect_timeout_s=settings.ats.connect_timeout_s,
+            slave=settings.ats.slave,
+            retries=ats_regmap.retries,
+            backoff_s=ats_regmap.backoff_s,
+        )
+        ats_connected = await ats_client.connect()
+        if not ats_connected:
+            log.error(
+                "ATS-Pi connect to %s:%d failed at startup. The ATS poller "
+                "will keep retrying in the background; loadSource will fall "
+                "back to the H-100-derived value until the link comes up.",
+                settings.ats.host, settings.ats.port,
+            )
+        ats_service = AtsService(
+            ats_regmap, db, bus, slack=slack,
+            expected_unit_id=settings.ats.expected_unit_id,
+        )
+        ats_poller = Poller(ats_client, ats_regmap, ats_service.on_poll)
+        log.info(
+            "ATS-Pi integration enabled — %s:%d slave=%d",
+            settings.ats.host, settings.ats.port, settings.ats.slave,
+        )
+    else:
+        log.info("ATS-Pi integration disabled (ats.enabled=false)")
+
+    state_machine = StateMachine(regmap, db, bus, ats_service=ats_service)
     control_service = ControlService(regmap, client, db, state_machine, slack=slack)
 
     # WebSocket snapshot push cadence. Defaults to the prime-poll interval
@@ -236,6 +284,10 @@ async def lifespan(app: FastAPI):
     app.state.login_limiter = login_limiter
     app.state.version = __version__
     app.state.started_at = time.time()
+    # ATS-Pi companion — None when ats.enabled is false.
+    app.state.ats_service = ats_service
+    app.state.ats_client = ats_client
+    app.state.ats_poller = ats_poller
 
     if settings.mock:
         boot_mode = "mock"
@@ -246,6 +298,8 @@ async def lifespan(app: FastAPI):
     db.write_event("info", "BOOT", f"Castle Generator Monitor v{__version__} starting", boot_mode)
     await slack.start()
     await poller.start()
+    if ats_poller is not None:
+        await ats_poller.start()
     await retention.start()
 
     # Signal systemd that we're ready, then start a watchdog ping task.
@@ -304,6 +358,13 @@ async def lifespan(app: FastAPI):
                 await watchdog_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+        # ATS-Pi stops BEFORE the H-100 — independent stack, finish
+        # in opposite-of-startup order so any in-flight ATS event
+        # publishing completes before the bus tears down.
+        if ats_poller is not None:
+            await ats_poller.stop()
+        if ats_client is not None:
+            await ats_client.close()
         await poller.stop()
         await retention.stop()
         await slack.stop()

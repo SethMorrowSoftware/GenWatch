@@ -116,3 +116,27 @@ slack:
 # WebSocket push cadence (ms). Leave at prime_poll_ms unless the UI
 # feels sluggish.
 ws_push_ms: 1500
+
+# ─── ATS-Pi companion device (optional) ──────────────────────────────────
+# When `enabled: true`, GenWatch polls a second Modbus TCP device on the
+# LAN — the "ATS-Pi" — that physically observes the ASCO Series 300
+# transfer switch. Its `position` register becomes the authoritative
+# loadSource for the UI (more accurate than the H-100-derived value).
+# When disabled or unreachable, GenWatch silently falls back to the
+# H-100-electrical loadSource derivation; no operator-visible change
+# other than a "(via gen telemetry)" provenance subscript in the UI.
+#
+# See:
+#   docs/integrations/ats-pi-icd.md      — wire contract
+#   docs/integrations/ats-pi-plan.md     — phased integration plan
+ats:
+  enabled: false
+  host: 192.168.1.250
+  port: 502
+  framer: socket            # Modbus/TCP (MBAP). 'rtu' only for RTU-over-TCP.
+  slave: 1
+  register_file: registers/ats_pi.yaml
+  # Optional sanity check — when set, GenWatch refuses to treat the
+  # ATS-Pi as authoritative unless its reported ats_pi_unit_id matches.
+  # Prevents wrong-site comms in a future multi-site deployment.
+  expected_unit_id: 23

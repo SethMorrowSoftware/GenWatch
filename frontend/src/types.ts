@@ -9,10 +9,15 @@ export type EngineState =
   | "alarm"
   | "unknown";
 
-// Which source is currently supplying the load. Inferred from engine
-// state + output kW/current — see backend services/state.py. Until the
-// first base-tier poll completes after boot, this defaults to 'utility'.
-export type LoadSource = "utility" | "generator" | "unknown";
+// Which source is currently supplying the load. Determined by either
+//   1. The ATS-Pi companion device's direct position contacts, when
+//      configured and healthy (docs/integrations/ats-pi-icd.md §10), or
+//   2. GenWatch's H-100-electrical inference (services/state.py) as
+//      the fallback when the ATS-Pi is absent or unreachable.
+// 'transferring' is only produced by the ATS-Pi path — it represents
+// the sub-second window during a load transfer when the switch
+// contacts have opened from one source but not yet closed on the other.
+export type LoadSource = "utility" | "generator" | "transferring" | "unknown";
 
 export type CommsState = "healthy" | "degraded" | "lost";
 

@@ -27,9 +27,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from typing import TYPE_CHECKING
+
 from ..db import Database
 from ..modbus.poller import CommsHealth, Reading
 from ..modbus.registers import RegisterMap
+
+if TYPE_CHECKING:
+    from .ats import AtsService
 
 log = logging.getLogger("genwatch.state")
 
@@ -94,10 +99,20 @@ class StateSnapshot:
 class StateMachine:
     """Maintains the snapshot, raises/clears alarms, emits events."""
 
-    def __init__(self, regmap: RegisterMap, db: Database, bus: "EventBus"):
+    def __init__(
+        self,
+        regmap: RegisterMap,
+        db: Database,
+        bus: "EventBus",
+        ats_service: "AtsService | None" = None,
+    ):
         self.regmap = regmap
         self.db = db
         self.bus = bus
+        # Optional ATS-Pi companion service. When present and reporting
+        # healthy comms, its `position` is used as the authoritative
+        # loadSource instead of the H-100-derived value (ICD §10).
+        self.ats = ats_service
         self.snap = StateSnapshot()
         # Per-alarm-code count of how many *consecutive* polls have seen
         # the bit set. Drives the ``min_poll_count`` debounce filter.
@@ -126,6 +141,26 @@ class StateMachine:
         self.regmap = new_regmap
 
     def _derive_load_source(self, values: dict, engine_state: str, prev: str) -> str:
+        """Dispatcher: prefer the ATS-Pi's direct position reading when
+        available, otherwise fall back to the H-100 electrical inference.
+
+        Per ICD §10 the ATS-Pi reads the switch's actual position
+        contacts, which is ground truth — better than any inference.
+        We only fall back when ATS-Pi is unreachable, hasn't completed
+        its first base poll (so we can't verify its ICD version), or
+        reports `position == "unknown"` itself.
+
+        The fallback (`_derive_load_source_from_telemetry`) is the
+        original H-100-only logic; it is unchanged and remains covered
+        by the existing test_state_machine.py suite.
+        """
+        if self.ats is not None and self.ats.is_authoritative():
+            pos = self.ats.snap.position
+            if pos != "unknown":
+                return pos
+        return self._derive_load_source_from_telemetry(values, engine_state, prev)
+
+    def _derive_load_source_from_telemetry(self, values: dict, engine_state: str, prev: str) -> str:
         """Infer whether the active load is supplied by utility or generator.
 
         The H-100 doesn't expose ATS position directly. We combine two
