@@ -59,12 +59,26 @@ class ControlDef:
 
 @dataclass(frozen=True)
 class AlarmBit:
-    """One alarm bit inside a bitfield register."""
+    """One alarm bit inside a bitfield register.
+
+    Optional filtering fields:
+      - ``suppress_in_states`` — engine-state names in which this alarm
+        should be silenced. Useful for alarms that are known firmware
+        artifacts in transitional states (e.g. phase-rotation alarms
+        during cool-down, when the AVR is dropping out and the H-100's
+        phase detector sees the spin-down as a fault). Empty tuple =
+        never silenced by state.
+      - ``min_poll_count`` — how many consecutive prime polls the bit
+        must remain set before the alarm is raised. Debounces transient
+        bits (default 1 = raise immediately).
+    """
     register: str
     mask: int
     code: str
     desc: str
     severity: Literal["alarm", "warn"] = "alarm"
+    suppress_in_states: tuple[str, ...] = ()
+    min_poll_count: int = 1
 
 
 @dataclass(frozen=True)
@@ -193,6 +207,41 @@ def _coerce_addr(v) -> int:
 
 def _coerce_mask(v) -> int:
     return _coerce_addr(v)
+
+
+def _load_alarm_bit(a: dict) -> AlarmBit:
+    """Parse a single alarm_bits YAML entry, including the optional
+    suppress_in_states / min_poll_count filtering knobs.
+
+    Values are normalized:
+      - suppress_in_states accepts a list, tuple, or single string;
+        every entry is lowercased and stripped of whitespace.
+      - min_poll_count is floored at 1 (0 or negative would mean the
+        bit fires on the prior poll's value, which is nonsensical).
+    """
+    suppress = a.get("suppress_in_states") or ()
+    if isinstance(suppress, (str, bytes)):
+        suppress = (suppress,)
+    suppress = tuple(
+        str(s).strip().lower()
+        for s in suppress
+        if str(s).strip()
+    )
+    try:
+        min_polls = int(a.get("min_poll_count", 1))
+    except (TypeError, ValueError):
+        min_polls = 1
+    if min_polls < 1:
+        min_polls = 1
+    return AlarmBit(
+        register=str(a["register"]),
+        mask=_coerce_mask(a["mask"]),
+        code=str(a["code"]),
+        desc=str(a.get("desc", "")),
+        severity=str(a.get("severity", "alarm")),
+        suppress_in_states=suppress,
+        min_poll_count=min_polls,
+    )
 
 
 def _coerce_range(v):
@@ -324,16 +373,7 @@ def load_register_map(path: Path | str) -> RegisterMap:
         for r in (data.get("engine_state_bits") or [])
     ]
 
-    alarm_bits = [
-        AlarmBit(
-            register=str(a["register"]),
-            mask=_coerce_mask(a["mask"]),
-            code=str(a["code"]),
-            desc=str(a.get("desc", "")),
-            severity=str(a.get("severity", "alarm")),
-        )
-        for a in (data.get("alarm_bits") or [])
-    ]
+    alarm_bits = [_load_alarm_bit(a) for a in (data.get("alarm_bits") or [])]
 
     panel_mode_bits = [
         PanelModeRule(

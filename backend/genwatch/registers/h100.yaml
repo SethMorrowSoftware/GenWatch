@@ -30,6 +30,23 @@
 #   tier   : prime | base. Prime polls fast (state/alarm bits),
 #            base polls slow (telemetry).
 #
+# ALARM FILTERING (optional per-alarm knobs)
+# ------------------------------------------
+# Each entry in `alarm_bits` accepts two optional fields:
+#   - suppress_in_states: [list of engine_state names]
+#       The alarm is hidden from the UI / Slack / event log while the
+#       engine is in any of these states. Useful for H-100 firmware
+#       artifacts that fire in transitional states where the underlying
+#       signal isn't meaningful (e.g. phase-rotation alarms during
+#       cool-down). The alarm is still cleared correctly in the DB if
+#       its underlying bit goes low while suppressed.
+#   - min_poll_count: <int>
+#       Debounce — the bit must remain set for this many consecutive
+#       prime polls (1.5 s each by default) before the alarm is raised.
+#       Catches transient flickers like day-tank refill overshoot after
+#       an exercise. Default 1 = fire immediately.
+# Both default to no filtering when omitted.
+#
 # STATE AND ALARMS ARE BITFIELDS, NOT ENUMS
 # -----------------------------------------
 # The H-100 does *not* expose engine state as a single integer enum.
@@ -137,9 +154,14 @@ alarm_bits:
   # output_status_3 (0x0084) — coolant level / fuel / throttle
   - { register: output_status_3, mask: 0x8000, code: "COOLANT_LEVEL_LOW_WARN",   desc: "Coolant Level Low Warning", severity: warn }
   - { register: output_status_3, mask: 0x4000, code: "COOLANT_LEVEL_FAULT",  desc: "Coolant Level Sensor Fault",    severity: warn  }
-  - { register: output_status_3, mask: 0x2000, code: "FUEL_LEVEL_HIGH_ALARM", desc: "Fuel Level High Alarm",        severity: alarm }
+  # Fuel-high alarms are debounced to ~30 s of sustained signal because
+  # day-tank refill transients and thermal expansion after an exercise
+  # can briefly push the level past the H-100's high threshold without
+  # representing a real overfill condition. A genuine overfill stays
+  # asserted well past 20 polls (~30 s at 1.5 s prime cadence).
+  - { register: output_status_3, mask: 0x2000, code: "FUEL_LEVEL_HIGH_ALARM", desc: "Fuel Level High Alarm",        severity: alarm, min_poll_count: 20 }
   - { register: output_status_3, mask: 0x1000, code: "FUEL_LEVEL_LOW_ALARM",  desc: "Fuel Level Low Alarm",         severity: alarm }
-  - { register: output_status_3, mask: 0x0800, code: "FUEL_LEVEL_HIGH_WARN",  desc: "Fuel Level High Warning",      severity: warn  }
+  - { register: output_status_3, mask: 0x0800, code: "FUEL_LEVEL_HIGH_WARN",  desc: "Fuel Level High Warning",      severity: warn,  min_poll_count: 20 }
   - { register: output_status_3, mask: 0x0400, code: "FUEL_LEVEL_LOW_WARN",   desc: "Fuel Level Low Warning",       severity: warn  }
   - { register: output_status_3, mask: 0x0200, code: "FUEL_LEVEL_FAULT",      desc: "Fuel Level Sensor Fault",      severity: warn  }
   - { register: output_status_3, mask: 0x0008, code: "THROTTLE_HIGH_ALARM",   desc: "Throttle Position High Alarm", severity: alarm }
@@ -164,8 +186,15 @@ alarm_bits:
   # output_status_7 (0x0088) — operational
   - { register: output_status_7, mask: 0x0800, code: "NEEDS_SERVICE",         desc: "Needs Service",                severity: warn  }
   - { register: output_status_7, mask: 0x0400, code: "SHUTDOWN",              desc: "Shutdown",                     severity: alarm }
-  - { register: output_status_7, mask: 0x0200, code: "VOLT_PHASE_ROTATION",   desc: "Check Voltage Phase Rotation", severity: warn  }
-  - { register: output_status_7, mask: 0x0100, code: "CURR_PHASE_ROTATION",   desc: "Check Current Phase Rotation", severity: warn  }
+  # Phase-rotation "alarms" are informational notices (note the
+  # description begins with "Check..."). The H-100's phase detector
+  # needs stable AC to evaluate rotation, which it does not have
+  # during cranking (no output yet), cool-down (AVR spinning down),
+  # or stopped (no signal). Bits frequently latch falsely in those
+  # states. Suppress them there, and debounce 3 polls (~4.5 s) so a
+  # brief transient inside `running` doesn't fire either.
+  - { register: output_status_7, mask: 0x0200, code: "VOLT_PHASE_ROTATION",   desc: "Check Voltage Phase Rotation", severity: warn, suppress_in_states: [cooling, cranking, stopped], min_poll_count: 3 }
+  - { register: output_status_7, mask: 0x0100, code: "CURR_PHASE_ROTATION",   desc: "Check Current Phase Rotation", severity: warn, suppress_in_states: [cooling, cranking, stopped], min_poll_count: 3 }
   # output_status_8 (0x0089)
   - { register: output_status_8, mask: 0x0200, code: "RPM_MISSING",           desc: "RPM Signal Missing",           severity: alarm }
 
