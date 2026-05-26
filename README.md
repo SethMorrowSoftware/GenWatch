@@ -46,7 +46,7 @@ cd GenWatch
 sudo ./deploy/scripts/install.sh
 
 # 3. Set the admin password and point at the bridge
-sudo genwatch hash 'pick-a-strong-password'   # prints a bcrypt hash
+sudo genwatch hash                            # interactive prompt → bcrypt hash
 sudo nano /etc/genwatch/config.yaml           # paste the hash, set modbus_tcp.host
 
 # 4. Start it and verify
@@ -209,10 +209,12 @@ If you see `Modbus: NO RESPONSE`, jump to [§10 Troubleshooting](#10-troubleshoo
 ### 5.1 Set the admin password and the bridge target
 
 ```bash
-sudo genwatch hash 'pick-a-strong-password'
+sudo genwatch hash                            # prompts for the password (no echo)
 # → $2b$12$XJZ... (paste this whole line)
 sudo nano /etc/genwatch/config.yaml
 ```
+
+Running `genwatch hash <password>` with the password as an argv arg still works for scripted provisioning, but it leaks the plaintext into `~/.bash_history` and is briefly visible in `ps aux` — the interactive form above is the recommended path.
 
 Two things in the editor:
 
@@ -338,7 +340,7 @@ All exposed via the `genwatch` wrapper installed by the installer. Run any with 
 
 ```bash
 genwatch serve                       # run the service (used by systemd)
-genwatch hash <password>             # bcrypt-hash a password for config
+genwatch hash [<password>]           # bcrypt-hash a password for config (prompts if omitted)
 genwatch gensecret                   # generate a JWT signing secret (hex)
 genwatch doctor [--config PATH]      # pre-flight diagnostics: config, DB, register map,
                                      #   bridge reachability, live Modbus probe

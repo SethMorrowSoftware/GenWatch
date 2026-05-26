@@ -38,11 +38,58 @@ def main() -> int:
         return 0
 
     if cmd == "hash":
-        if len(args) < 2:
-            print("usage: genwatch hash <password>", file=sys.stderr)
-            return 2
         from .services.auth import hash_password
-        print(hash_password(args[1]))
+        # Two modes:
+        #
+        # 1. Interactive (recommended) — `genwatch hash` with no argv.
+        #    Reads the password from stdin via getpass with no echo, so
+        #    the plaintext never lands in ~/.bash_history, never appears
+        #    in `ps aux`, and isn't captured by SSH session recorders
+        #    that snapshot argv on exec. Re-prompts on mismatch.
+        #
+        # 2. Argv (legacy/scripting) — `genwatch hash <password>`. The
+        #    plaintext IS visible in shell history and (briefly) to
+        #    `ps`. We keep this path for non-interactive provisioning
+        #    (Ansible, cloud-init, install.sh-driven hand-offs) but
+        #    print a stderr warning so an interactive operator who
+        #    didn't know about the safer form sees it.
+        if len(args) >= 2:
+            print(
+                "warning: passing the password on the command line exposes "
+                "it via shell history and `ps aux`. Run `genwatch hash` "
+                "with no argument to be prompted instead.",
+                file=sys.stderr,
+            )
+            print(hash_password(args[1]))
+            return 0
+        # Interactive prompt. Refuse to run when stdin isn't a TTY —
+        # otherwise piping a password in defeats the point (`echo pw |
+        # genwatch hash` would still leak via the calling shell's
+        # history). Operators who really want non-interactive hashing
+        # should use the argv form with the warning.
+        import getpass
+        if not sys.stdin.isatty():
+            print(
+                "error: `genwatch hash` with no argument requires an "
+                "interactive terminal. For non-interactive use, pass "
+                "the password as an argument (less secure — see the "
+                "warning that prints in that mode).",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            pw1 = getpass.getpass("New password: ")
+            pw2 = getpass.getpass("Confirm password: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\naborted", file=sys.stderr)
+            return 130
+        if pw1 != pw2:
+            print("error: passwords do not match", file=sys.stderr)
+            return 1
+        if not pw1:
+            print("error: password cannot be empty", file=sys.stderr)
+            return 1
+        print(hash_password(pw1))
         return 0
 
     if cmd == "gensecret":

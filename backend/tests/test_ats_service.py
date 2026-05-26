@@ -27,7 +27,12 @@ import pytest
 
 from genwatch.modbus.poller import CommsHealth
 from genwatch.modbus.registers import load_register_map
-from genwatch.services.ats import EXPECTED_ICD_MAJOR, AtsService, AtsSnapshot
+from genwatch.services.ats import (
+    EXPECTED_ICD_MAJOR,
+    EXPECTED_ICD_MINOR,
+    AtsService,
+    AtsSnapshot,
+)
 from genwatch.services.state import EventBus
 
 from tests.fixtures.mock_ats_pi import MockAtsPiStore
@@ -153,6 +158,108 @@ async def test_not_authoritative_on_icd_major_mismatch(regmap, fake_db, bus, sto
     store.icd_major = 2  # imagine a future v2 ATS-Pi
     await ats.on_poll("base", store.as_reading("base"), healthy())
     assert ats.is_authoritative() is False
+
+
+# ─── ICD §5.4 version semantics (audit H3) ──────────────────────────────
+
+
+def _icd_events(fake_db) -> list:
+    """All ATS_ICD_VERSION events written to the DB so far."""
+    return [
+        c.kwargs for c in fake_db.write_event.call_args_list
+        if c.kwargs.get("type_") == "ATS_ICD_VERSION"
+    ]
+
+
+async def test_icd_exact_match_emits_no_event(regmap, fake_db, bus, store):
+    """The happy path stays quiet in the events feed — operators don't
+    need a row for "things are normal." Log only."""
+    ats = AtsService(regmap, fake_db, bus)
+    store.icd_major = EXPECTED_ICD_MAJOR
+    store.icd_minor = EXPECTED_ICD_MINOR
+    await ats.on_poll("base", store.as_reading("base"), healthy())
+    assert _icd_events(fake_db) == []
+
+
+async def test_icd_minor_ahead_emits_info_event_and_stays_authoritative(
+    regmap, fake_db, bus, store,
+):
+    """A future-minor ATS-Pi is forward-compatible per the wire
+    contract — register addresses/types we read are unchanged. Emit
+    an info event so operators see the version skew in the feed, but
+    keep is_authoritative() True.
+    """
+    ats = AtsService(regmap, fake_db, bus)
+    store.icd_major = EXPECTED_ICD_MAJOR
+    store.icd_minor = EXPECTED_ICD_MINOR + 5
+    await ats.on_poll("base", store.as_reading("base"), healthy())
+
+    assert ats.is_authoritative() is True
+    events = _icd_events(fake_db)
+    assert len(events) == 1
+    assert events[0]["severity"] == "info"
+    msg = events[0]["message"]
+    assert "Minor-ahead" in msg or "minor-ahead" in msg, msg
+
+
+async def test_icd_minor_behind_emits_warn_event_and_stays_authoritative(
+    regmap, fake_db, bus, store,
+):
+    """An older ATS-Pi is missing registers we expect (they read as 0
+    per the RESERVED rule). The contract still works at the wire
+    level so we stay authoritative, but operators need a loud warning
+    that some UI fields will be missing.
+    """
+    ats = AtsService(regmap, fake_db, bus)
+    # Bump the expectation to 5 so v1.0 from the store is "behind"
+    import genwatch.services.ats as ats_mod
+    original = ats_mod.EXPECTED_ICD_MINOR
+    ats_mod.EXPECTED_ICD_MINOR = original + 5
+    try:
+        store.icd_major = EXPECTED_ICD_MAJOR
+        store.icd_minor = original  # v1.0 vs expected v1.5
+        await ats.on_poll("base", store.as_reading("base"), healthy())
+
+        assert ats.is_authoritative() is True
+        events = _icd_events(fake_db)
+        assert len(events) == 1
+        assert events[0]["severity"] == "warn"
+        assert "Minor-behind" in events[0]["message"] or "minor-behind" in events[0]["message"]
+    finally:
+        ats_mod.EXPECTED_ICD_MINOR = original
+
+
+async def test_icd_major_mismatch_emits_warn_event(regmap, fake_db, bus, store):
+    """The existing major-mismatch path now also writes to the events
+    feed, not just journalctl — operators looking at the events page
+    should be able to spot a contract break without SSHing in."""
+    ats = AtsService(regmap, fake_db, bus)
+    store.icd_major = EXPECTED_ICD_MAJOR + 1  # future-major
+    await ats.on_poll("base", store.as_reading("base"), healthy())
+
+    events = _icd_events(fake_db)
+    assert len(events) == 1
+    assert events[0]["severity"] == "warn"
+    assert "Major mismatch" in events[0]["message"]
+
+
+async def test_icd_version_validated_only_once_per_session(
+    regmap, fake_db, bus, store,
+):
+    """The `_icd_version_validated` flag guards against spamming the
+    events feed every base poll. After the first poll observes the
+    skew, subsequent polls should not re-emit."""
+    ats = AtsService(regmap, fake_db, bus)
+    store.icd_major = EXPECTED_ICD_MAJOR
+    store.icd_minor = EXPECTED_ICD_MINOR + 5  # ahead
+    await ats.on_poll("base", store.as_reading("base"), healthy())
+    await ats.on_poll("base", store.as_reading("base"), healthy())
+    await ats.on_poll("base", store.as_reading("base"), healthy())
+
+    events = _icd_events(fake_db)
+    assert len(events) == 1, (
+        f"expected exactly 1 ICD-version event, got {len(events)}"
+    )
 
 
 async def test_not_authoritative_when_unit_id_mismatch(regmap, fake_db, bus, store):

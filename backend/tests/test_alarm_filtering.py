@@ -408,3 +408,80 @@ def test_no_clear_event_for_alarm_that_never_raised(sm, fake_db):
         if c.args and c.args[0] == "VOLT_PHASE_ROTATION"
     ]
     assert pr_clear_calls == []
+
+
+# ─── Regmap reload resets debounce counters (audit H4) ───────────────────
+
+
+def test_apply_regmap_clears_alarm_debounce_counters(sm, regmap):
+    """Hot-reloading the register map must reset per-alarm debounce
+    counters. Scenario: operator accumulates two polls of a 3-poll
+    debounce, then hot-reloads YAML to fix a different rule. The
+    NEXT poll after reload must start counting from zero, not from
+    two — otherwise a one-poll bit flicker fires the alarm
+    immediately, bypassing the debounce that exists specifically to
+    suppress transients.
+    """
+    # Two polls with the phase-rotation bit set (debounce is 3).
+    for _ in range(2):
+        sm.update(
+            Reading(values=_values_for("running", output_status_7=0x0200)),
+            _comms(),
+        )
+    assert sm._alarm_poll_counts.get("VOLT_PHASE_ROTATION") == 2
+    assert "VOLT_PHASE_ROTATION" not in sm.snap.active_alarms
+
+    # Hot-reload (same YAML for simplicity — the point is the side
+    # effect of apply_regmap, not the new content).
+    sm.apply_regmap(regmap)
+    assert sm._alarm_poll_counts == {}, (
+        "apply_regmap must clear debounce counters so a transient bit "
+        "doesn't fire instantly after reload"
+    )
+
+    # One more poll of the same bit. With reset counters this becomes
+    # poll 1 of 3, so the alarm must not yet be in active_alarms.
+    sm.update(
+        Reading(values=_values_for("running", output_status_7=0x0200)),
+        _comms(),
+    )
+    assert sm._alarm_poll_counts.get("VOLT_PHASE_ROTATION") == 1
+    assert "VOLT_PHASE_ROTATION" not in sm.snap.active_alarms
+
+
+def test_apply_regmap_preserves_raised_this_session(sm, regmap, fake_db):
+    """``_raised_this_session`` tracks codes we've called raise_alarm()
+    on so the bit-goes-low cleanup can call clear_alarm(). Wiping it
+    on reload would orphan ``alarms_active`` rows raised before the
+    reload — nothing would ever clear them when the bit eventually
+    goes low.
+    """
+    # Raise an alarm (3 polls → past debounce → raised)
+    for _ in range(3):
+        sm.update(
+            Reading(values=_values_for("running", output_status_7=0x0200)),
+            _comms(),
+        )
+    assert "VOLT_PHASE_ROTATION" in sm._raised_this_session
+    assert "VOLT_PHASE_ROTATION" in sm.snap.active_alarms
+
+    # Hot-reload.
+    sm.apply_regmap(regmap)
+    # The session set must survive so a future bit-low transition can
+    # still clear the DB row.
+    assert "VOLT_PHASE_ROTATION" in sm._raised_this_session
+
+    # Verify the clear actually fires when the bit goes low after reload.
+    fake_db.clear_alarm.reset_mock()
+    sm.update(
+        Reading(values=_values_for("running", output_status_7=0)),
+        _comms(),
+    )
+    clear_calls = [
+        c.args[0] for c in fake_db.clear_alarm.call_args_list
+        if c.args
+    ]
+    assert "VOLT_PHASE_ROTATION" in clear_calls, (
+        "raised-before-reload alarm was not cleared when its bit went low"
+    )
+    assert "VOLT_PHASE_ROTATION" not in sm._raised_this_session

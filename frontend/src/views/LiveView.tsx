@@ -421,6 +421,22 @@ function AtsCard({ status }: { status: StatusBody }) {
             {ats.faultCodes.map((c) => (
               <Pill key={c} tone="warn">{c.replace(/^ATS_PI_/, "")}</Pill>
             ))}
+            {/* Set commissioning-day expectations: the ATS-Pi ICD §6
+                command set (Test / Inhibit / Force Transfer / Bypass
+                Delay) is wired in the register map and read-back, but
+                Phase 1 ships GenWatch's consumer read-only. Operators
+                expecting a "Test transfer" button on this card need
+                to know it's intentional, not a broken/missing UI. */}
+            <span
+              title={
+                "Phase 1 of the ATS-Pi integration is read-only. Test, "
+                + "Inhibit, Force Transfer and Bypass Delay commands "
+                + "(ICD §6) ship in Phase 3."
+              }
+              style={{ display: "inline-flex" }}
+            >
+              <Pill tone="info">Read-only · commands in Phase 3</Pill>
+            </span>
           </div>
         )}
 
@@ -832,14 +848,22 @@ function FuelMaintCard({ reading: r, status }: { reading: Reading; status: Statu
 // ─── Events feed ─────────────────────────────────────────────────────────
 function EventsFeed({ limit = 6 }: { limit?: number }) {
   const [events, setEvents] = useState<EventRow[]>([]);
+  // Track the last fetch's success/failure so a broken /api/events
+  // endpoint doesn't look the same as "no events." Previously this
+  // caught + ignored the error, leaving the operator with a clean
+  // empty-state card that misrepresented the real situation.
+  const [fetchError, setFetchError] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
       try {
         const r = await api.events({ limit });
-        if (!cancelled) setEvents(r.events);
-      } catch {
-        // ignore — events are optional on the live view
+        if (cancelled) return;
+        setEvents(r.events);
+        setFetchError(null);
+      } catch (err: any) {
+        if (cancelled) return;
+        setFetchError(err?.message ?? "Failed to load events");
       }
     };
     load();
@@ -847,19 +871,52 @@ function EventsFeed({ limit = 6 }: { limit?: number }) {
     return () => { cancelled = true; clearInterval(t); };
   }, [limit]);
 
+  // Error banner above whatever content we have. We KEEP showing the
+  // last-known events (if any) so the operator isn't blind during a
+  // transient backend hiccup; the banner just tells them what they're
+  // seeing is no longer fresh.
+  const errorBanner = fetchError && (
+    <div
+      style={{
+        margin: "0 0 10px",
+        padding: "8px 12px",
+        background: "color-mix(in oklch, var(--red) 12%, var(--panel-2))",
+        border: "1px solid color-mix(in oklch, var(--red) 30%, var(--border))",
+        borderRadius: 8,
+        fontSize: 12,
+        color: "var(--text-2)",
+        display: "flex",
+        gap: 8,
+        alignItems: "center",
+      }}
+    >
+      <Icon name="wifi-off" size={13} />
+      <span>
+        <strong style={{ color: "var(--red)" }}>Events feed unavailable</strong>
+        {" — "}{fetchError}. Retrying every 5 s.
+      </span>
+    </div>
+  );
+
   if (!events.length) {
     return (
       <Card title="Recent Events" flush>
+        {errorBanner}
         <EmptyState
           icon="inbox"
-          title="No events yet"
-          desc="Operator commands, alarms and state transitions will appear here as they happen."
+          title={fetchError ? "Events temporarily unavailable" : "No events yet"}
+          desc={
+            fetchError
+              ? "Showing nothing because nothing has been loaded yet. The page will retry automatically."
+              : "Operator commands, alarms and state transitions will appear here as they happen."
+          }
         />
       </Card>
     );
   }
   return (
     <Card title="Recent Events" flush>
+      {errorBanner}
       <div>
         {events.map((e) => (
           <div key={e.id} className="ev-row" data-sev={e.severity}>

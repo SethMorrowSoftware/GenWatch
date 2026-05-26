@@ -196,6 +196,115 @@ def test_watchdog_grace_default_is_five_minutes():
     assert notify.WATCHDOG_COLD_START_GRACE_S == 300.0
 
 
+# ─── `genwatch hash` CLI: stdin prompt (audit H2) ─────────────────────────
+
+
+def test_hash_command_prompts_when_no_argv(monkeypatch, capsys):
+    """No password on argv → prompt via getpass twice (with confirm)
+    and emit a bcrypt hash. The plaintext must never appear in
+    stdout/stderr (which would defeat the entire purpose) — only the
+    hash."""
+    import getpass
+
+    from genwatch.__main__ import main
+    from genwatch.services.auth import verify_password
+
+    prompts: list[str] = []
+
+    def fake_getpass(prompt: str = "") -> str:
+        prompts.append(prompt)
+        return "correcthorsebatterystaple"
+
+    monkeypatch.setattr(getpass, "getpass", fake_getpass)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.argv", ["genwatch", "hash"])
+
+    rc = main()
+    out = capsys.readouterr()
+
+    assert rc == 0
+    assert len(prompts) == 2, "must prompt twice (entry + confirm)"
+    assert "Confirm" in prompts[1] or "confirm" in prompts[1].lower()
+    # Plaintext must not leak into either stream
+    assert "correcthorsebatterystaple" not in out.out
+    assert "correcthorsebatterystaple" not in out.err
+    # The hash that was printed must verify against the typed password
+    hashed = out.out.strip()
+    assert hashed.startswith("$2"), f"expected bcrypt hash, got {hashed!r}"
+    assert verify_password("correcthorsebatterystaple", hashed)
+
+
+def test_hash_command_rejects_mismatched_confirmation(monkeypatch, capsys):
+    """Defense against a typo in the prompt — confirm must match
+    entry. Empty match also rejected to avoid quietly hashing the
+    empty string."""
+    import getpass
+
+    from genwatch.__main__ import main
+
+    answers = iter(["typoed-pw", "different-pw"])
+    monkeypatch.setattr(getpass, "getpass", lambda prompt="": next(answers))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.argv", ["genwatch", "hash"])
+
+    rc = main()
+    out = capsys.readouterr()
+    assert rc == 1
+    assert "do not match" in out.err
+    # No hash printed on mismatch
+    assert "$2" not in out.out
+
+
+def test_hash_command_rejects_empty_password(monkeypatch, capsys):
+    import getpass
+
+    from genwatch.__main__ import main
+
+    monkeypatch.setattr(getpass, "getpass", lambda prompt="": "")
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.argv", ["genwatch", "hash"])
+
+    rc = main()
+    out = capsys.readouterr()
+    assert rc == 1
+    assert "empty" in out.err
+
+
+def test_hash_command_refuses_non_tty_without_argv(monkeypatch, capsys):
+    """Piping a password into stdin (`echo pw | genwatch hash`) defeats
+    the whole point — the plaintext just moves from argv to the calling
+    shell's history. Refuse this case and point operators at the argv
+    form (with its warning) for non-interactive use."""
+    from genwatch.__main__ import main
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("sys.argv", ["genwatch", "hash"])
+
+    rc = main()
+    out = capsys.readouterr()
+    assert rc == 2
+    assert "interactive terminal" in out.err
+    assert "$2" not in out.out
+
+
+def test_hash_command_argv_path_works_but_warns(monkeypatch, capsys):
+    """The legacy argv path must still work (install scripts depend on
+    it), but it must emit a stderr warning so an operator who didn't
+    know about the safer form learns about it."""
+    from genwatch.__main__ import main
+    from genwatch.services.auth import verify_password
+
+    monkeypatch.setattr("sys.argv", ["genwatch", "hash", "my-password"])
+    rc = main()
+    out = capsys.readouterr()
+    assert rc == 0
+    # Warning printed to stderr
+    assert "shell history" in out.err or "ps aux" in out.err
+    # But the hash IS produced
+    hashed = out.out.strip()
+    assert verify_password("my-password", hashed)
+
+
 # ─── No silent mock fallback ──────────────────────────────────────────────
 
 
