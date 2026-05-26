@@ -42,6 +42,9 @@ async def _login(c: httpx.AsyncClient) -> None:
 
 
 async def test_status_returns_live_snapshot(client):
+    # /api/status requires auth — external monitoring should hit
+    # /api/health, the operator UI logs in before reading status.
+    await _login(client)
     r = await client.get("/api/status")
     assert r.status_code == 200
     body = r.json()
@@ -51,12 +54,48 @@ async def test_status_returns_live_snapshot(client):
     assert body["comms"]["state"] in {"healthy", "degraded", "lost"}
 
 
-async def test_health_endpoint(client):
+async def test_status_requires_auth(client):
+    # Without a session cookie, /api/status (and the other read
+    # endpoints) must 401. Closes Auth H1 from the audit — these
+    # endpoints used to leak live telemetry and operator-attributed
+    # event history to any LAN client.
+    r = await client.get("/api/status")
+    assert r.status_code == 401
+    r = await client.get("/api/events")
+    assert r.status_code == 401
+    r = await client.get("/api/alarms")
+    assert r.status_code == 401
+    r = await client.get("/api/config")
+    assert r.status_code == 401
+    r = await client.get("/api/telemetry?metric=kw")
+    assert r.status_code == 401
+
+
+async def test_health_endpoint_anon_is_minimal(client):
+    # Anon callers get only {ok, mock} — enough for external uptime
+    # monitoring without leaking version, DB size, comms state, etc.
     r = await client.get("/api/health")
     assert r.status_code == 200
     body = r.json()
     assert body["ok"] is True
     assert body["mock"] is True
+    # The richer fields are hidden from anon callers.
+    assert "version" not in body
+    assert "dbBytes" not in body
+    assert "comms" not in body
+
+
+async def test_health_endpoint_authed_returns_full_payload(client):
+    await _login(client)
+    r = await client.get("/api/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["mock"] is True
+    # Authed callers get the full status fields.
+    assert "version" in body
+    assert "dbBytes" in body
+    assert "comms" in body
 
 
 async def test_login_required_for_control(client):
@@ -136,6 +175,40 @@ async def test_control_rejected_when_panel_not_auto(client, app_env):
             detail = r.json()["detail"]
             assert detail["code"] == "panel_mode_locked"
             assert "MANUAL" in detail["message"]
+
+
+async def test_csrf_blocks_cross_origin_post(client):
+    """A POST carrying an Origin header from a foreign domain must be
+    rejected 403 with csrf_blocked, regardless of whether the cookie
+    is present. Defense-in-depth against SameSite=Lax footguns and
+    misconfigured cors_origins. Non-browser clients (no Origin /
+    Referer) are unaffected — the rest of the test suite proves that
+    by continuing to pass without setting these headers."""
+    await _login(client)
+    r = await client.post(
+        "/api/control/confirm",
+        headers={"Origin": "https://evil.example.com"},
+    )
+    # Wait — /api/control/confirm is GET, not POST. Use a real POST.
+    r = await client.post(
+        "/api/alarms/COMMON_ALARM/ack",
+        json={"confirm_token": "anything"},
+        headers={"Origin": "https://evil.example.com"},
+    )
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"]["code"] == "csrf_blocked"
+
+
+async def test_csrf_allows_same_origin_post(client):
+    """Same-origin POSTs (Origin matches Host on http://test from the
+    httpx ASGI transport) must pass through the CSRF middleware."""
+    await _login(client)
+    # The httpx ASGITransport uses base_url=http://test, so Host=test.
+    r = await client.post(
+        "/api/auth/logout",
+        headers={"Origin": "http://test"},
+    )
+    assert r.status_code == 200, r.text
 
 
 async def test_alarm_ack_requires_confirm_token(client, app_env):

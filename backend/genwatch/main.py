@@ -67,14 +67,26 @@ async def lifespan(app: FastAPI):
 
     settings = cfgmod.load(os.environ.get("GENWATCH_CONFIG_PATH"))
     if not settings.auth.jwt_secret:
-        # Generate an ephemeral secret so the service still runs without
-        # config. The actual value is never logged — anyone with read
-        # access to the journal would otherwise be able to mint tokens
-        # until the next restart.
+        # Mock mode (dev / CI) generates an ephemeral secret to keep
+        # the test runner unblocked. Production refuses to start —
+        # silently minting an ephemeral secret under `Restart=always`
+        # produces a unit that's "up" but logs every operator out on
+        # each restart, masking the real problem (config corrupted /
+        # secret never set). The fix is to set jwt_secret in
+        # /etc/genwatch/config.yaml and restart; the installer
+        # generates one automatically (see deploy/scripts/install.sh).
+        if not settings.mock:
+            raise RuntimeError(
+                "auth.jwt_secret is unset in production mode. Set it in "
+                "/etc/genwatch/config.yaml (the installer generates one "
+                "automatically). Refusing to start with an ephemeral "
+                "secret because every restart would invalidate sessions "
+                "and the underlying misconfiguration would go unnoticed."
+            )
         settings = settings.model_copy(
             update={"auth": settings.auth.model_copy(update={"jwt_secret": secrets.token_hex(32)})}
         )
-        log.warning("auth.jwt_secret was empty — generated an ephemeral one (tokens won't survive restart). Set it in config.yaml for persistence.")
+        log.warning("auth.jwt_secret was empty — generated an ephemeral one for mock mode (tokens won't survive restart).")
 
     # Locate register file
     reg_path = Path(settings.modbus.register_file)
@@ -503,6 +515,70 @@ def create_app() -> FastAPI:
             allow_methods=["*"],
             allow_headers=["*"],
         )
+
+    # CSRF defense-in-depth on state-changing requests. Cookie SameSite
+    # is the primary defense, but it's operator-configurable down to
+    # 'lax' (and even Strict has known browser quirks for top-level
+    # navigations). This middleware adds a hard Origin/Referer check on
+    # any non-safe method hitting /api/*, requiring the header to match
+    # the request's own host or an entry in cors_origins. Browser-
+    # initiated cross-site requests carry the attacker's Origin and are
+    # rejected here regardless of cookie policy.
+    #
+    # Safe methods (GET/HEAD/OPTIONS) are bypassed because they don't
+    # mutate state. The /api/auth/login endpoint IS state-changing
+    # (sets a cookie) and is gated by this — that's fine because the
+    # legitimate browser request carries the same-origin Origin.
+    #
+    # Non-browser clients (curl, ansible) typically omit Origin and
+    # Referer entirely; in that case we accept — same model as the WS
+    # Origin check. The threat here is a malicious page running in a
+    # browser, not a server-side script with full network credentials.
+    SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+    @app.middleware("http")
+    async def csrf_origin_check(request: Request, call_next):
+        if request.method in SAFE_METHODS:
+            return await call_next(request)
+        path = request.url.path
+        if not path.startswith("/api/"):
+            return await call_next(request)
+        origin = request.headers.get("origin")
+        referer = request.headers.get("referer")
+        if not origin and not referer:
+            # No browser context — non-browser client. Cookie + token
+            # auth alone is sufficient; CSRF requires a victim browser.
+            return await call_next(request)
+        host = request.headers.get("host", "")
+        same_origin_ok = {
+            f"http://{host}",
+            f"https://{host}",
+        }
+        # Resolve cors_origins from app.state.settings if lifespan has
+        # run, otherwise the env/file-loaded copy used to build the
+        # CORS middleware above.
+        live_cors = getattr(request.app.state, "settings", None)
+        if live_cors is not None:
+            allowlist = set(same_origin_ok) | set(live_cors.cors_origins or [])
+        else:
+            allowlist = set(same_origin_ok) | set(cors_list)
+        candidate = origin
+        if not candidate and referer:
+            # Referer is a full URL; strip to scheme+host[:port].
+            from urllib.parse import urlparse
+            parsed = urlparse(referer)
+            if parsed.scheme and parsed.netloc:
+                candidate = f"{parsed.scheme}://{parsed.netloc}"
+        if candidate not in allowlist:
+            log.warning(
+                "csrf: rejecting %s %s — origin/referer %r not in allowlist",
+                request.method, path, candidate,
+            )
+            return JSONResponse(
+                {"detail": {"code": "csrf_blocked", "message": "request origin not allowed"}},
+                status_code=403,
+            )
+        return await call_next(request)
 
     app.include_router(status_routes.router)
     app.include_router(telemetry_routes.router)

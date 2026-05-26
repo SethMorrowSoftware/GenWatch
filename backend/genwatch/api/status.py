@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import time
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 
 from ..db import COLUMN_MAP
+from .deps import Principal, get_principal, require_operator
 
 
 def reading_to_ui(values: dict) -> dict:
@@ -43,7 +44,7 @@ router = APIRouter(prefix="/api", tags=["status"])
 
 
 @router.get("/status")
-async def status(request: Request) -> dict:
+async def status(request: Request, p: Principal = Depends(require_operator)) -> dict:
     st = request.app.state
     sm = st.state_machine
     snap = sm.snap
@@ -185,7 +186,25 @@ async def status(request: Request) -> dict:
 
 @router.get("/health")
 async def health(request: Request) -> dict:
+    """Lightweight health probe.
+
+    Intentionally anonymous: external monitoring (Uptime Kuma, Tailscale
+    healthcheck, etc.) commonly hits this without a session. Unauthed
+    callers get only {ok, mock} — enough to confirm the service is
+    breathing without leaking version / DB size / comms state to
+    network scanners. Authed callers get the full status block.
+    """
     st = request.app.state
+    # Best-effort auth probe: don't raise if no/expired cookie — just
+    # return the minimal payload. We can't use Depends(require_operator)
+    # because that 401s on miss, which would defeat the anonymous probe.
+    try:
+        get_principal(request)
+        authed = True
+    except Exception:  # noqa: BLE001
+        authed = False
+    if not authed:
+        return {"ok": True, "mock": st.settings.mock}
     db_bytes = st.db.disk_usage_bytes()
     return {
         "ok": True,
@@ -199,7 +218,7 @@ async def health(request: Request) -> dict:
 
 
 @router.get("/columns")
-async def columns() -> dict:
+async def columns(p: Principal = Depends(require_operator)) -> dict:
     """Expose the telemetry column map so the frontend can render any
     metric without hard-coding the names."""
     return {"columns": COLUMN_MAP}

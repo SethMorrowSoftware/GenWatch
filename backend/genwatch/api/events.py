@@ -22,6 +22,7 @@ async def events(
     type: str | None = Query(None),
     from_ts: float | None = Query(None, alias="from"),
     to_ts: float | None = Query(None, alias="to"),
+    p: Principal = Depends(require_operator),
 ) -> dict:
     db = request.app.state.db
     sevs = severity.split(",") if severity else None
@@ -36,7 +37,11 @@ async def events(
 
 
 @router.get("/alarms")
-async def alarms(request: Request, active: bool = Query(True)) -> dict:
+async def alarms(
+    request: Request,
+    active: bool = Query(True),
+    p: Principal = Depends(require_operator),
+) -> dict:
     db = request.app.state.db
     if not active:
         # historical alarms are in the events table with type=ALARM
@@ -46,7 +51,10 @@ async def alarms(request: Request, active: bool = Query(True)) -> dict:
 
 
 @router.get("/alarm-codes")
-async def alarm_codes(request: Request) -> dict:
+async def alarm_codes(
+    request: Request,
+    p: Principal = Depends(require_operator),
+) -> dict:
     regmap = request.app.state.regmap
     return {
         "codes": [
