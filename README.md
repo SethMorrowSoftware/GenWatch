@@ -414,7 +414,7 @@ wdctl                                   # shows SoC watchdog status
 
 ## 8. Security recommendations
 
-Castle Generator Monitor is designed for a **trusted LAN** deployment. By default it listens on `0.0.0.0:8000` over plain HTTP; cookies are not `Secure`. This is appropriate for a Pi sitting in the same building as the generator on a private network. Do not expose port 8000 to the public internet without adding one of the following:
+Castle Generator Monitor is designed for a **trusted LAN** deployment. By default it listens on `0.0.0.0:8000` over plain HTTP and issues the session cookie with `HttpOnly` + `SameSite=Strict`; the `Secure` flag is added automatically when the request reached us over HTTPS (Caddy or `tailscale serve` in front of the monitor). This is appropriate for a Pi sitting in the same building as the generator on a private network. Do not expose port 8000 to the public internet without adding one of the following:
 
 ### 8.1 Use Tailscale for remote access
 
@@ -437,7 +437,7 @@ EOF
 sudo systemctl restart caddy
 ```
 
-Caddy will auto-fetch a Let's Encrypt cert if the hostname resolves publicly. Then change the cookie to `secure=True` in `backend/genwatch/api/auth.py`.
+Caddy will auto-fetch a Let's Encrypt cert if the hostname resolves publicly. Once TLS is in front, the session cookie is automatically issued with the `Secure` attribute — no edit to the service required (uvicorn honors `X-Forwarded-Proto` from localhost upstreams and the cookie logic resolves `Secure` from the request scheme). If your reverse proxy doesn't forward `X-Forwarded-Proto`, set `auth.cookie_secure: true` in `/etc/genwatch/config.yaml`.
 
 ### 8.3 Firewall
 
@@ -458,6 +458,7 @@ Restricts the monitor's port to your LAN ranges.
 - **Server-side state validity** — every control command re-checks `engine_state` server-side; clicking "Start" while running returns HTTP 409 `invalid_state` and audit-logs the denial.
 - **Panel-mode gate** — every remote command re-checks the H-100 front-panel key-switch position; rejects with HTTP 409 `panel_mode_locked` unless the panel is in AUTO. Stops a stolen session (or a misclicked button) from quietly no-op'ing at the unit. See [§7 Panel key-switch gating](#panel-key-switch-gating).
 - **Confirm-token discipline** — 8-char hex tokens (`secrets.token_hex(4)`), 30 s TTL, single-use (`pop`-on-consume), operator-bound (issuer must match consumer). Replay returns 400 `token_invalid`.
+- **Session cookie hardening** — `HttpOnly` (no JS access), `SameSite=Strict` by default (no cross-site CSRF on top of the confirm-token gate), `Path=/`. The `Secure` flag is added automatically when the request reached the service over HTTPS (a Caddy / `tailscale serve` deployment terminating TLS gets it for free); override via `auth.cookie_secure: true|false` and `auth.cookie_samesite: strict|lax|none` if your topology needs it. SameSite=None is rejected at config load unless paired with Secure.
 - **Hardened systemd unit** — `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectKernelTunables`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, narrow `DeviceAllow` list (covers FTDI/CH340/CP210x USB-serial chips + the Pi 5 on-board UART for the legacy serial fallback), `MemoryMax=512M`, `TasksMax=128`.
 
 ---

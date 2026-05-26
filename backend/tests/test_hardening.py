@@ -468,6 +468,133 @@ def test_panel_command_json_output_is_parseable(monkeypatch, tmp_path, capsys):
     assert isinstance(doc["active_alarms"], list)
 
 
+# ─── Session-cookie hardening ─────────────────────────────────────────────
+
+
+def _parse_set_cookie(header: str) -> dict[str, str]:
+    """Tiny Set-Cookie attribute parser — good enough for these tests.
+
+    Returns a dict of lower-cased attribute names. Boolean flags map to
+    the empty string. The cookie name/value lives under the 'name' /
+    'value' keys.
+    """
+    parts = [p.strip() for p in header.split(";")]
+    name, _, value = parts[0].partition("=")
+    out = {"name": name, "value": value}
+    for p in parts[1:]:
+        if "=" in p:
+            k, _, v = p.partition("=")
+            out[k.strip().lower()] = v.strip()
+        else:
+            out[p.lower()] = ""
+    return out
+
+
+async def test_login_cookie_defaults_are_strict_samesite_and_httponly(client):
+    """Default: SameSite=strict, HttpOnly, no Secure on plain HTTP."""
+    r = await client.post("/api/auth/login", json={"password": "test"})
+    assert r.status_code == 200
+    sc = r.headers.get("set-cookie", "")
+    attrs = _parse_set_cookie(sc)
+    assert attrs["name"] == "genwatch_session"
+    assert attrs["value"], "cookie value must be present"
+    assert "httponly" in attrs, "missing HttpOnly attribute"
+    assert attrs.get("samesite", "").lower() == "strict", attrs
+    assert "secure" not in attrs, "HTTP request must not get Secure cookie by default"
+    assert attrs.get("path") == "/"
+
+
+async def test_login_cookie_auto_secure_on_https_request(app_env):
+    """Auto-detect: an HTTPS-scheme request gets Secure for free."""
+    app = create_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="https://test") as c:
+        async with app.router.lifespan_context(app):
+            await asyncio.sleep(0.1)
+            r = await c.post("/api/auth/login", json={"password": "test"})
+    assert r.status_code == 200
+    sc = r.headers.get("set-cookie", "")
+    attrs = _parse_set_cookie(sc)
+    assert "secure" in attrs, f"HTTPS request must get Secure; got {sc!r}"
+    assert attrs.get("samesite", "").lower() == "strict"
+
+
+async def test_cookie_secure_explicit_true_forces_secure_even_on_http(monkeypatch, tmp_path):
+    """Config override: cookie_secure=true forces Secure on every response."""
+    monkeypatch.setenv("GENWATCH_MOCK", "true")
+    monkeypatch.setenv("GENWATCH_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("GENWATCH_AUTH__ADMIN_PASSWORD_HASH", hash_password("test"))
+    monkeypatch.setenv("GENWATCH_AUTH__JWT_SECRET", "x" * 64)
+    monkeypatch.setenv("GENWATCH_AUTH__COOKIE_SECURE", "true")
+
+    app = create_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        async with app.router.lifespan_context(app):
+            await asyncio.sleep(0.1)
+            r = await c.post("/api/auth/login", json={"password": "test"})
+    assert r.status_code == 200
+    attrs = _parse_set_cookie(r.headers.get("set-cookie", ""))
+    assert "secure" in attrs, "explicit cookie_secure=true must force Secure"
+
+
+async def test_cookie_samesite_lax_override_applies(monkeypatch, tmp_path):
+    """Operators who need cross-site nav with the session cookie can opt
+    back into SameSite=lax."""
+    monkeypatch.setenv("GENWATCH_MOCK", "true")
+    monkeypatch.setenv("GENWATCH_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("GENWATCH_AUTH__ADMIN_PASSWORD_HASH", hash_password("test"))
+    monkeypatch.setenv("GENWATCH_AUTH__JWT_SECRET", "x" * 64)
+    monkeypatch.setenv("GENWATCH_AUTH__COOKIE_SAMESITE", "lax")
+
+    app = create_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        async with app.router.lifespan_context(app):
+            await asyncio.sleep(0.1)
+            r = await c.post("/api/auth/login", json={"password": "test"})
+    assert r.status_code == 200
+    attrs = _parse_set_cookie(r.headers.get("set-cookie", ""))
+    assert attrs.get("samesite", "").lower() == "lax"
+
+
+def test_cookie_samesite_none_without_secure_rejected_at_config_load():
+    """Browsers require Secure for SameSite=None; reject the invalid
+    combo at startup rather than at runtime when the cookie would
+    silently be discarded by the browser."""
+    from pydantic import ValidationError
+    from genwatch.config import AuthConfig
+
+    with pytest.raises(ValidationError):
+        AuthConfig(cookie_samesite="none", cookie_secure=False)
+    # Allowed when paired with secure=True
+    cfg = AuthConfig(cookie_samesite="none", cookie_secure=True)
+    assert cfg.cookie_samesite == "none"
+
+
+async def test_logout_clears_cookie_with_matching_attributes(client):
+    """delete_cookie() must mirror set_cookie()'s SameSite / Secure /
+    Path so the browser actually evicts the cookie. Missing attributes
+    cause some browsers to leave a stale (but expired) cookie behind."""
+    # Establish a session
+    r = await client.post("/api/auth/login", json={"password": "test"})
+    assert r.status_code == 200
+    # Logout and inspect the clearing Set-Cookie
+    r = await client.post("/api/auth/logout")
+    assert r.status_code == 200
+    sc = r.headers.get("set-cookie", "")
+    attrs = _parse_set_cookie(sc)
+    assert attrs["name"] == "genwatch_session"
+    assert attrs.get("samesite", "").lower() == "strict"
+    assert attrs.get("path") == "/"
+    # Either Max-Age=0 or an Expires in the past — both are valid clears
+    cleared = (
+        attrs.get("max-age") == "0"
+        or "expires" in attrs
+    )
+    assert cleared, f"logout did not clear the cookie: {sc!r}"
+
+
 async def test_tcp_client_reports_failure_when_bridge_unreachable():
     """Reads must not raise — they return a ModbusResult with ok=False
     so the poller can surface a 'comms lost' state instead of crashing."""
