@@ -147,7 +147,13 @@ class AtsConfig(BaseModel):
 
     enabled: bool = False
     host: str = "192.168.1.250"
-    port: int = 502
+    # Default 5020 matches the companion starter's secure-by-default
+    # bind (high port → no CAP_NET_BIND_SERVICE / no root on the
+    # companion side). Existing deployments with explicit port: 502
+    # in their config.yaml are unaffected — only fresh installs see
+    # the new default. If your companion is configured for 502, keep
+    # `port: 502` in /etc/genwatch/config.yaml.
+    port: int = 5020
     # 'socket' = real Modbus/TCP (MBAP framer). The ATS-Pi speaks proper
     # Modbus/TCP, *not* the RTU-over-TCP that the H-100 Lantronix bridge
     # uses. Don't change unless the ATS-Pi side documents otherwise.
