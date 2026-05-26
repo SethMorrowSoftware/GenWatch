@@ -421,6 +421,22 @@ function AtsCard({ status }: { status: StatusBody }) {
             {ats.faultCodes.map((c) => (
               <Pill key={c} tone="warn">{c.replace(/^ATS_PI_/, "")}</Pill>
             ))}
+            {/* Set commissioning-day expectations: the ATS-Pi ICD §6
+                command set (Test / Inhibit / Force Transfer / Bypass
+                Delay) is wired in the register map and read-back, but
+                Phase 1 ships GenWatch's consumer read-only. Operators
+                expecting a "Test transfer" button on this card need
+                to know it's intentional, not a broken/missing UI. */}
+            <span
+              title={
+                "Phase 1 of the ATS-Pi integration is read-only. Test, "
+                + "Inhibit, Force Transfer and Bypass Delay commands "
+                + "(ICD §6) ship in Phase 3."
+              }
+              style={{ display: "inline-flex" }}
+            >
+              <Pill tone="info">Read-only · commands in Phase 3</Pill>
+            </span>
           </div>
         )}
 
