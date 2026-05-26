@@ -1,0 +1,102 @@
+# GenWatch — ATS-Pi companion register map
+#
+# Consumes the ICD v1.0 read side from docs/integrations/ats-pi-icd.md.
+# All addresses, encodings, and semantics are documented there — this
+# file just translates the ICD into the YAML schema GenWatch's existing
+# Modbus client + register loader understand.
+#
+# To validate end-to-end without real hardware, point GenWatch at the
+# mock fixture in backend/tests/fixtures/mock_ats_pi.py.
+
+site:
+  id: "ATSPI-23"
+  name: "ASCO Series 300 (via ATS-Pi)"
+  # ATS-Pi is a companion device — these fields aren't meaningful for it
+  # but the SiteConfig schema requires them. Real generator
+  # rating/tank/fuel live in registers/h100.yaml.
+  rating_kw: 0
+  engine: "n/a (companion device)"
+  tank_gal: 0
+  fuel_type: unknown
+  exercise:
+    enabled: false
+    day: sun
+    time: "00:00"
+    duration_min: 0
+    quiet: false
+
+modbus:
+  slave: 1
+  read_fc: 3
+  prime_poll_ms: 1500
+  base_poll_ms: 15000
+  timeout_s: 1.0
+  retries: 2
+  backoff_s: [0.25, 0.5, 1.0]
+
+# State-bits derivation rules are not used by the ATS register decoder
+# (the AtsService consumes the register values directly via the
+# documented enums in the ICD), but the loader requires the section to
+# exist with at least an empty list.
+engine_state_bits: []
+
+# Panel-mode bits — n/a for the ATS-Pi. The ats_mode register is a
+# direct enum read by AtsService, not derived from a bitfield.
+panel_mode_bits: []
+
+# Fault bits — surfaced via GenWatch's existing alarm pipeline so they
+# appear in the events feed and Slack alongside H-100 alarms.
+alarm_bits:
+  - { register: fault_summary, mask: 0x0001, code: "ATS_PI_INPUT_FAULT",  desc: "ATS-Pi input fault — contact stuck",   severity: warn }
+  - { register: fault_summary, mask: 0x0002, code: "ATS_PI_OUTPUT_FAULT", desc: "ATS-Pi output fault — relay readback", severity: warn }
+  - { register: fault_summary, mask: 0x0004, code: "ATS_PI_MODE_UNKNOWN", desc: "ATS-Pi cannot determine mode",         severity: warn }
+  - { register: fault_summary, mask: 0x0008, code: "ATS_PI_CALIBRATION",  desc: "ATS-Pi calibration check needed",      severity: warn }
+
+# ─── Registers ────────────────────────────────────────────────────────────
+# Addresses, types, and tier assignments per ICD §5. Prime tier polls
+# at 1.5 s for fast-changing state; base tier polls at 15 s for
+# timestamps, counters, and identification.
+registers:
+  # Core state — prime tier (1.5 s)
+  - { name: position,             addr: 0x0000, fc: 3, type: u16,    tier: prime, group: "ATS", unit: enum }
+  - { name: normal_available,     addr: 0x0001, fc: 3, type: u16,    tier: prime, group: "ATS", unit: bool }
+  - { name: emergency_available,  addr: 0x0002, fc: 3, type: u16,    tier: prime, group: "ATS", unit: bool }
+  - { name: engine_start_calling, addr: 0x0003, fc: 3, type: u16,    tier: prime, group: "ATS", unit: bool }
+  - { name: ats_mode,             addr: 0x0004, fc: 3, type: u16,    tier: prime, group: "ATS", unit: enum }
+  - { name: fault_summary,        addr: 0x0005, fc: 3, type: bitfld, tier: prime, group: "ATS", unit: bits }
+
+  # Timestamps — base tier (15 s)
+  - { name: last_transfer_to_gen_ts,    addr: 0x0010, fc: 3, type: u32, tier: base, group: "ATS", unit: epoch_s }
+  - { name: last_retransfer_to_util_ts, addr: 0x0012, fc: 3, type: u32, tier: base, group: "ATS", unit: epoch_s }
+  - { name: ats_pi_uptime_s,            addr: 0x0014, fc: 3, type: u32, tier: base, group: "ATS", unit: s }
+  - { name: ats_pi_wallclock,           addr: 0x0016, fc: 3, type: u32, tier: base, group: "ATS", unit: epoch_s }
+
+  # Lifetime counters — base tier
+  - { name: transfer_count_lifetime, addr: 0x0020, fc: 3, type: u32, tier: base, group: "ATS", unit: count }
+  - { name: transfer_count_24h,      addr: 0x0022, fc: 3, type: u32, tier: base, group: "ATS", unit: count }
+
+  # Identification + ICD version — base tier
+  - { name: icd_version_major, addr: 0x0030, fc: 3, type: u16, tier: base, group: "ATS", unit: version }
+  - { name: icd_version_minor, addr: 0x0031, fc: 3, type: u16, tier: base, group: "ATS", unit: version }
+  - { name: ats_pi_fw_major,   addr: 0x0032, fc: 3, type: u16, tier: base, group: "ATS", unit: version }
+  - { name: ats_pi_fw_minor,   addr: 0x0033, fc: 3, type: u16, tier: base, group: "ATS", unit: version }
+  - { name: ats_pi_fw_patch,   addr: 0x0034, fc: 3, type: u16, tier: base, group: "ATS", unit: version }
+  - { name: ats_pi_unit_id,    addr: 0x0035, fc: 3, type: u16, tier: base, group: "ATS", unit: id }
+
+  # Command read-back — prime tier so the UI command buttons reflect
+  # actual asserted state within one poll cycle.
+  - { name: cmd_test_active,           addr: 0x0040, fc: 3, type: u16, tier: prime, group: "ATS", unit: bool }
+  - { name: cmd_inhibit_active,        addr: 0x0041, fc: 3, type: u16, tier: prime, group: "ATS", unit: bool }
+  - { name: cmd_force_transfer_active, addr: 0x0042, fc: 3, type: u16, tier: prime, group: "ATS", unit: bool }
+  - { name: cmd_bypass_delay_active,   addr: 0x0043, fc: 3, type: u16, tier: prime, group: "ATS", unit: bool }
+
+# ─── Controls ─────────────────────────────────────────────────────────────
+# Defined here for completeness but unused in Phase 1 (read-only consumer).
+# Wired up in Phase 3 (bidirectional commands).
+controls:
+  - { name: ats_test,            addr: 0x0100, fc: 6, values: [0x0001], desc: "Momentary test transfer" }
+  - { name: ats_inhibit_assert,  addr: 0x0101, fc: 6, values: [0x0001], desc: "Assert inhibit (maintained)" }
+  - { name: ats_inhibit_release, addr: 0x0101, fc: 6, values: [0x0000], desc: "Release inhibit" }
+  - { name: ats_force_assert,    addr: 0x0102, fc: 6, values: [0x0001], desc: "Force transfer to gen (maintained)" }
+  - { name: ats_force_release,   addr: 0x0102, fc: 6, values: [0x0000], desc: "Release force-transfer" }
+  - { name: ats_bypass_delay,    addr: 0x0103, fc: 6, values: [0x0001], desc: "Bypass transfer time delay (momentary)" }

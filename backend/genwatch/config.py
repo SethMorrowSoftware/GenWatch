@@ -85,6 +85,38 @@ class AuthConfig(BaseModel):
     session_hours: int = 12
 
 
+class AtsConfig(BaseModel):
+    """ATS-Pi companion device (see docs/integrations/ats-pi-icd.md).
+
+    A second Modbus TCP device on the LAN that physically observes the
+    ASCO Series 300 ATS via 18RX module + aux contacts. When healthy,
+    its `position` register is the authoritative loadSource for the UI;
+    when unreachable, GenWatch falls back to the H-100-derived value.
+
+    Disabled by default — sites without an ATS-Pi see no change. When
+    enabled, GenWatch starts a second Modbus client + poller targeting
+    the configured host. The two stacks are fully independent: ATS-Pi
+    going down does not affect generator monitoring or vice versa.
+    """
+
+    enabled: bool = False
+    host: str = "192.168.1.250"
+    port: int = 502
+    # 'socket' = real Modbus/TCP (MBAP framer). The ATS-Pi speaks proper
+    # Modbus/TCP, *not* the RTU-over-TCP that the H-100 Lantronix bridge
+    # uses. Don't change unless the ATS-Pi side documents otherwise.
+    framer: Literal["socket", "rtu"] = "socket"
+    slave: int = 1
+    timeout_s: float = 1.0
+    connect_timeout_s: float = 3.0
+    register_file: str = "registers/ats_pi.yaml"
+    # When set, GenWatch refuses to mark the ATS poller authoritative
+    # unless the device's reported ats_pi_unit_id register matches. Lets
+    # the site catch a misconfigured-IP-points-at-wrong-ATS-Pi mistake
+    # before bad data influences the operator UI.
+    expected_unit_id: int | None = None
+
+
 class SlackConfig(BaseModel):
     """Slack alerts via the Web API (chat.postMessage) using a bot token.
 
@@ -139,6 +171,7 @@ class Settings(BaseSettings):
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
+    ats: AtsConfig = Field(default_factory=AtsConfig)
 
     # WebSocket push cadence — kept at prime poll by default per design
     ws_push_ms: int = 1500

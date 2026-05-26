@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Runtime
+config.yaml
+state.json
+*.sqlite
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
