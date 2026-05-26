@@ -17,6 +17,12 @@ interface Props {
   // safety regression. The same flag drives the red STALE DATA badge
   // in the topbar so the two signals stay in sync.
   stale: boolean;
+  // Panel-specific staleness: true when we haven't received a snapshot
+  // *containing the panel block* recently, even if other messages keep
+  // flowing. Distinct from `stale` so a backend that drops `panel`
+  // from snapshots can't leave the panel-mode gate running against
+  // a frozen seed while the rest of the UI looks live.
+  panelStale: boolean;
 }
 
 const STATE_LABEL: Record<EngineState, string> = {
@@ -70,7 +76,7 @@ const STATE_BADGE: Record<EngineState, string> = {
   unknown: "—",
 };
 
-export function LiveView({ status, history, operator, stale }: Props) {
+export function LiveView({ status, history, operator, stale, panelStale }: Props) {
   const [confirmCmd, setConfirmCmd] = useState<"start" | "stop" | "exercise" | "transfer" | null>(null);
 
   const reading = status.reading;
@@ -106,6 +112,7 @@ export function LiveView({ status, history, operator, stale }: Props) {
           state={status.state}
           panelMode={status.panel.mode}
           stale={stale}
+          panelStale={panelStale}
           onCommand={setConfirmCmd}
         />
       </div>
@@ -674,13 +681,14 @@ function EngineMetric({ label, value, unit, sparkPoints, color, warnRange, numer
 }
 
 // ─── Controls panel ──────────────────────────────────────────────────────
-function ControlsPanel({ state, panelMode, stale, onCommand }: {
+function ControlsPanel({ state, panelMode, stale, panelStale, onCommand }: {
   state: EngineState;
   panelMode: "auto" | "manual" | "off" | "unknown";
   stale: boolean;
+  panelStale: boolean;
   onCommand: (cmd: "start" | "stop" | "exercise" | "transfer") => void;
 }) {
-  // Two gates, both required before any remote command is offered:
+  // Three gates, all required before any remote command is offered:
   //
   // 1. Live-link freshness (`linkOk`). When the WebSocket is down or the
   //    server has gone silent for ~3 prime intervals (same signal as the
@@ -699,8 +707,16 @@ function ControlsPanel({ state, panelMode, stale, onCommand }: {
   //    means the prime poll hasn't decoded input_status_1 yet (cold
   //    start) or the operator's panel_mode_bits YAML rules don't match
   //    their firmware — safer to gate.
+  //
+  // 3. Panel-block freshness (`!panelStale`). Defense-in-depth against
+  //    a backend that keeps the WS alive but stops including `panel`
+  //    in snapshots — without this gate the panel-mode check would run
+  //    against a frozen seed value forever. With a current backend
+  //    (which always emits `panel`), panelStale is only ever true
+  //    when the WS itself is also stale, so this is a no-op in normal
+  //    operation; the value comes from the asymmetric failure mode.
   const linkOk = !stale;
-  const panelOk = panelMode === "auto";
+  const panelOk = panelMode === "auto" && !panelStale;
   const canStart = linkOk && panelOk && state === "stopped";
   const canStop = linkOk && panelOk && (state === "running" || state === "exercising" || state === "cranking");
   const canExercise = linkOk && panelOk && state === "stopped";
@@ -713,12 +729,15 @@ function ControlsPanel({ state, panelMode, stale, onCommand }: {
   const staleHint = stale
     ? "Live link is stale — values shown may be out of date. Commands are blocked until the link recovers."
     : null;
+  const panelStaleHint = panelStale && !stale
+    ? "Panel state has not refreshed recently — backend may not be emitting panel data. Commands are blocked until a fresh snapshot arrives."
+    : null;
   const panelHint =
     panelMode === "auto"           ? null :
     panelMode === "manual"         ? "Panel key switch is MANUAL — set to AUTO at the unit to enable remote commands." :
     panelMode === "off"            ? "Panel key switch is OFF — engine is locked out. Set to AUTO at the unit." :
     /* unknown */                    "Panel key-switch position is unknown — waiting for prime poll or verify panel_mode_bits in h100.yaml.";
-  const hint = staleHint ?? panelHint;
+  const hint = staleHint ?? panelStaleHint ?? panelHint;
 
   return (
     <Card title="Controls" sub="Operator · two-step confirm">

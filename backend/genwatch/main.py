@@ -58,6 +58,13 @@ def setup_logging() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Capture monotonic service-start moment up front. The watchdog
+    # cold-start grace is measured from this point so a slow
+    # client.connect() or poller.start() doesn't artificially extend
+    # the grace window past what systemd's WatchdogSec expects.
+    # Monotonic clock survives NTP steps; wall-clock here would not.
+    service_start_mono = time.monotonic()
+
     settings = cfgmod.load(os.environ.get("GENWATCH_CONFIG_PATH"))
     if not settings.auth.jwt_secret:
         # Generate an ephemeral secret so the service still runs without
@@ -346,11 +353,11 @@ async def lifespan(app: FastAPI):
         # A simple `poller.is_running` flag isn't enough: a deadlocked
         # poll task keeps the flag True while telemetry freezes.
         stale_after = max(10.0, (regmap.prime_poll_ms / 1000.0) * 6.0)
-        # Captured at watchdog-loop start so the cold-start grace is
-        # measured from when *this* lifespan started, not from process
-        # boot — important across systemd restarts where Python is
-        # respawned but the monotonic clock isn't reset.
-        service_start_mono = time.monotonic()
+        # service_start_mono is captured at the top of lifespan so the
+        # cold-start grace is measured from the actual service start,
+        # not from after poller/client startup completes (which could
+        # take many seconds on a slow Modbus connect path and chew
+        # into the grace window before the watchdog loop even begins).
 
         async def _watchdog_loop() -> None:
             log.info(

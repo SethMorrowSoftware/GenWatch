@@ -33,6 +33,14 @@ export interface LiveState {
   // one. Consumers compute "stale" against this — never against
   // status.serverTs, which is the controller's wall clock and can drift.
   lastPushAt: number | null;
+  // Wall-clock instant when we last received a snapshot that included
+  // a `panel` block, or null if we've never received one. Tracked
+  // separately from lastPushAt so a backend that emits snapshots
+  // without `panel` (older version, or a future code change that
+  // accidentally drops the field) doesn't let the control-button
+  // panel-mode gate run against a frozen seed value. ControlsPanel
+  // gates Start/Stop/Transfer on this AND lastPushAt being recent.
+  panelLastSeenAt: number | null;
   // True when the WebSocket is currently closed and waiting to
   // reconnect. The UI uses this together with lastPushAt to decide
   // whether to show a "STALE DATA" badge.
@@ -47,6 +55,7 @@ export function useLiveData(): LiveState {
     history: [],
     reconnects: 0,
     lastPushAt: null,
+    panelLastSeenAt: null,
     wsDown: false,
   });
   const historyRef = useRef<Reading[]>([]);
@@ -62,6 +71,11 @@ export function useLiveData(): LiveState {
         const s = await api.status();
         if (cancelled) return;
         historyRef.current = [s.reading].concat(historyRef.current).slice(0, HISTORY_SIZE);
+        // The REST seed always includes a panel block (server-side
+        // mirror of the WS shape), so it counts as a fresh panel
+        // observation — but only until staleThresholdMs passes
+        // without a WS confirmation, at which point ControlsPanel
+        // will block remote commands until live data resumes.
         setState((cur) => ({
           ...cur,
           loading: false,
@@ -69,6 +83,7 @@ export function useLiveData(): LiveState {
           status: s,
           history: historyRef.current,
           lastPushAt: Date.now(),
+          panelLastSeenAt: Date.now(),
         }));
       } catch (e: any) {
         if (cancelled) return;
@@ -120,9 +135,20 @@ export function useLiveData(): LiveState {
         // freshness clock on `Date.now()` (client wall clock) so the
         // stale check can't be fooled by a controller clock that drifts.
         const lastPushAt = Date.now();
+        // Panel freshness is a SEPARATE clock: only refreshed when a
+        // snapshot actually carries the `panel` block. Without this,
+        // a backend that drops `panel` from its snapshots (older
+        // version, or a future bug) would let the UI's panel-mode
+        // gate run forever against the boot seed — an operator key
+        // turn at the unit would never propagate. Default to carrying
+        // forward; only the snapshot case below bumps it.
+        let panelLastSeenAt = cur.panelLastSeenAt;
 
         switch (msg.type) {
           case "snapshot": {
+            if (msg.panel) {
+              panelLastSeenAt = Date.now();
+            }
             s = {
               ...s,
               state: msg.state,
@@ -269,7 +295,7 @@ export function useLiveData(): LiveState {
             // No state change for these here; events view re-fetches.
             break;
         }
-        return { ...cur, status: s, history, lastPushAt };
+        return { ...cur, status: s, history, lastPushAt, panelLastSeenAt };
       });
     };
 
