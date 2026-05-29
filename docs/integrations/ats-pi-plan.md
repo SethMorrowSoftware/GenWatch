@@ -539,6 +539,11 @@ Run the ICD §13 golden test sequence against:
 
 ## 8. Commissioning checklist (Phase 4)
 
+> The full step-by-step field procedure (with bench verification of the
+> ADAM relays, safety-gate tests, and sign-off blocks) is in
+> [`../COMMISSIONING.md`](../COMMISSIONING.md) Phases 5-9. The checklist
+> below is the condensed version.
+
 Before flipping `ats.enabled: true` in production:
 
 - [ ] ATS-Pi physically wired and powered per its team's install doc
