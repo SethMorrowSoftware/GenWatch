@@ -188,9 +188,11 @@ class AtsControlService:
                 )
 
             # Commit by consuming the token (reuses H-100 token store,
-            # audited there). A failed write below requires a fresh token
-            # to retry — same discipline as the H-100 control path.
-            await self.control.consume_token(token, operator)
+            # audited there). Verb-bound to this command so a token issued
+            # for one ATS action can't be spent on another. A failed write
+            # below requires a fresh token to retry — same discipline as
+            # the H-100 control path.
+            await self.control.consume_token(token, operator, verb=command)
 
             write_words = list(ctl.write_values)
             log.warning(

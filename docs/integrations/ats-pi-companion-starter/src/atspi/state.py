@@ -11,12 +11,15 @@ to the side and then assigning the full bag at once.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
-from . import ICD_VERSION, __version__
+from . import ICD_VERSION
 from .io_driver import InputSnapshot, OutputState
 
 log = logging.getLogger("atspi.state")
@@ -99,17 +102,27 @@ class RegisterStore:
     for clarity).
     """
 
-    def __init__(self, unit_id: int = 1):
+    def __init__(self, unit_id: int = 1, state_file: str | None = None):
         self._unit_id = unit_id
         self._fw_version = (0, 1, 0)
         self._icd_version = ICD_VERSION
         self._snap = _StateSnapshot()
         self._lock = threading.Lock()
         self._boot_ts = time.time()
+        # Command writes from GenWatch land here; the command-dispatch
+        # loop (see __main__) drains them and drives the I/O relays.
+        self._pending_cmds: list[tuple[str, object]] = []
+        # Persistence (ICD §9.3): transfer_count_lifetime MUST survive a
+        # reboot; the transfer timestamps SHOULD. Loaded at boot, written
+        # on each transfer transition. Command/uptime registers always
+        # start cleared (per §9.3), which the default snapshot gives us.
+        self._state_file = Path(state_file) if state_file else None
+        self._load_persisted()
 
     # ─── Sampling-loop writers ────────────────────────────────────────
 
     def apply_input_snapshot(self, inputs: InputSnapshot) -> None:
+        persist_needed = False
         with self._lock:
             prev = self._snap
             new = _StateSnapshot(
@@ -135,10 +148,17 @@ class RegisterStore:
                 new.last_transfer_to_gen_ts = now
                 new.transfer_count_lifetime = prev.transfer_count_lifetime + 1
                 new.transfer_count_24h = prev.transfer_count_24h + 1
+                persist_needed = True
             elif prev.position == "generator" and new.position == "utility":
                 new.last_retransfer_to_util_ts = now
+                persist_needed = True
 
             self._snap = new
+
+        # Persist OUTSIDE the lock (file I/O shouldn't stall Modbus reads).
+        # Only fires on an actual transfer transition, not every 10 Hz tick.
+        if persist_needed:
+            self._persist()
 
     def apply_output_state(self, outputs: OutputState) -> None:
         with self._lock:
@@ -243,30 +263,75 @@ class RegisterStore:
             return 0
 
     def write_register(self, addr: int, value: int) -> bool:
-        """Handle a write from a Modbus client.
+        """Handle a command-register write from GenWatch.
 
-        Phase 1 stub — actually routing this to the I/O driver to drive
-        physical outputs happens in implementation Phase C (see SPEC §8).
-        Returns True if the address+value was a recognized command.
-
-        TODO: this currently only mirrors writes into the read-back
-        store. Wire to the IODriver so the ASCO inputs are actually
-        driven.
+        Recognized writes are queued for the command-dispatch loop (see
+        __main__._command_loop), which drives the physical relay through
+        the I/O driver. The read-back registers (0x0040-0x0043) are NOT
+        set here — they reflect the *actual driven* output state sampled
+        back from the driver each cycle (ICD §5.5), so a relay the driver
+        couldn't actuate (interlock, stuck contact) does not read back as
+        asserted. Returns True if the write was a recognized command.
         """
+        cmd: tuple[str, object] | None = None
         if addr == ADDR_CMD_TEST and value == 0x0001:
-            with self._lock:
-                self._snap.cmd_test_active = True
-            return True
-        if addr == ADDR_CMD_INHIBIT and value in (0x0000, 0x0001):
-            with self._lock:
-                self._snap.cmd_inhibit_active = value == 0x0001
-            return True
-        if addr == ADDR_CMD_FORCE_TRANSFER and value in (0x0000, 0x0001):
-            with self._lock:
-                self._snap.cmd_force_transfer_active = value == 0x0001
-            return True
-        if addr == ADDR_CMD_BYPASS_DELAY and value == 0x0001:
-            with self._lock:
-                self._snap.cmd_bypass_delay_active = True
-            return True
-        return False
+            cmd = ("test", None)
+        elif addr == ADDR_CMD_INHIBIT and value in (0x0000, 0x0001):
+            cmd = ("inhibit", value == 0x0001)
+        elif addr == ADDR_CMD_FORCE_TRANSFER and value in (0x0000, 0x0001):
+            cmd = ("force_transfer", value == 0x0001)
+        elif addr == ADDR_CMD_BYPASS_DELAY and value == 0x0001:
+            cmd = ("bypass", None)
+        if cmd is None:
+            return False
+        with self._lock:
+            self._pending_cmds.append(cmd)
+        return True
+
+    def drain_pending_commands(self) -> list[tuple[str, object]]:
+        """Pop and return queued command writes for the dispatch loop."""
+        with self._lock:
+            cmds = self._pending_cmds
+            self._pending_cmds = []
+        return cmds
+
+    # ─── persistence (ICD §9.3) ───────────────────────────────────────────
+
+    def _load_persisted(self) -> None:
+        if self._state_file is None or not self._state_file.exists():
+            return
+        try:
+            data = json.loads(self._state_file.read_text())
+        except (OSError, ValueError) as e:
+            log.warning(
+                "could not read persisted state %s: %s — starting from zero",
+                self._state_file, e,
+            )
+            return
+        with self._lock:
+            self._snap.transfer_count_lifetime = int(data.get("transfer_count_lifetime", 0))
+            self._snap.last_transfer_to_gen_ts = int(data.get("last_transfer_to_gen_ts", 0))
+            self._snap.last_retransfer_to_util_ts = int(data.get("last_retransfer_to_util_ts", 0))
+        log.info(
+            "restored persisted state: lifetime_transfers=%d",
+            self._snap.transfer_count_lifetime,
+        )
+
+    def _persist(self) -> None:
+        if self._state_file is None:
+            return
+        with self._lock:
+            payload = {
+                "transfer_count_lifetime": self._snap.transfer_count_lifetime,
+                "last_transfer_to_gen_ts": self._snap.last_transfer_to_gen_ts,
+                "last_retransfer_to_util_ts": self._snap.last_retransfer_to_util_ts,
+            }
+        try:
+            self._state_file.parent.mkdir(parents=True, exist_ok=True)
+            # Atomic write: tmp + rename, so a crash mid-write can't
+            # corrupt the persisted counter (ICD §10 / SPEC §10).
+            tmp = self._state_file.with_suffix(self._state_file.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload))
+            os.replace(tmp, self._state_file)
+        except OSError as e:
+            log.warning("could not persist state to %s: %s", self._state_file, e)

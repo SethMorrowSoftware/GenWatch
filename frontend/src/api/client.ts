@@ -109,7 +109,7 @@ export const api = {
     // the confirm response body (same-origin policy), so chaining
     // confirm→ack also closes the CSRF hole on this endpoint that
     // existed when only an authenticated session was required.
-    const tok = await request<ConfirmToken>("/api/control/confirm");
+    const tok = await request<ConfirmToken>("/api/control/confirm?verb=ack");
     return request<{ ok: boolean; code: string; hw_ack: boolean }>(
       `/api/alarms/${encodeURIComponent(code)}/ack`,
       {
@@ -136,8 +136,13 @@ export const api = {
     }>(`/api/telemetry?${q}`);
   },
 
-  // Control flow
-  confirmToken: () => request<ConfirmToken>("/api/control/confirm"),
+  // Control flow. `verb` binds the token to the action it will confirm
+  // (start/stop/exercise/transfer, an ATS command, or "ack") so a token
+  // can't be cross-spent between two open confirm dialogs.
+  confirmToken: (verb?: string) =>
+    request<ConfirmToken>(
+      "/api/control/confirm" + (verb ? `?verb=${encodeURIComponent(verb)}` : "")
+    ),
   control: (verb: "start" | "stop" | "exercise" | "transfer", confirm_token: string) =>
     request<{ ok: boolean }>(`/api/control/${verb}`, {
       method: "POST",

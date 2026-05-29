@@ -132,6 +132,25 @@ function specFor(cmd: ConfirmCmd): Spec {
   }
 }
 
+/** Backend verb a confirm token is bound to for this command. */
+function verbFor(cmd: ConfirmCmd): string {
+  switch (cmd.kind) {
+    case "start":
+    case "stop":
+    case "exercise":
+    case "transfer":
+      return cmd.kind;
+    case "ats_test":
+      return "test";
+    case "ats_inhibit":
+      return "inhibit";
+    case "ats_force_transfer":
+      return "force_transfer";
+    case "ats_bypass_delay":
+      return "bypass_delay";
+  }
+}
+
 async function runCommand(cmd: ConfirmCmd, token: string): Promise<unknown> {
   switch (cmd.kind) {
     case "start":
@@ -180,7 +199,7 @@ export function ConfirmModal({ command, operator, onClose, onSuccess }: Props) {
     setTokenExpiresAtMs(0);
     setError(null);
     setFetchFailed(false);
-    api.confirmToken()
+    api.confirmToken(command ? verbFor(command) : undefined)
       .then((r) => {
         setToken(r.token);
         // Anchor expiry to OUR clock at receipt, not the server's
@@ -207,7 +226,7 @@ export function ConfirmModal({ command, operator, onClose, onSuccess }: Props) {
             : "Failed to fetch confirm token"
         );
       });
-  }, []);
+  }, [command]);
 
   const fetchTokenRef = useRef(fetchToken);
   fetchTokenRef.current = fetchToken;

@@ -60,6 +60,41 @@ async def _sampling_loop(driver: IODriver, store: RegisterStore) -> None:
         await asyncio.sleep(0.1)
 
 
+# Pulse width for momentary commands (test, bypass-delay). Clamped to the
+# ICD §6.1 500-1500 ms range by the driver regardless.
+DEFAULT_PULSE_MS = 800
+COMMAND_DISPATCH_INTERVAL_S = 0.05
+
+
+async def _command_loop(driver: IODriver, store: RegisterStore) -> None:
+    """Drain command-register writes from GenWatch and drive the relays.
+
+    Phase C of the SPEC: a Modbus write lands in the store as a pending
+    command; this loop translates it into a driver.drive_outputs() call.
+    The read-back of the actual driven state happens in the sampling loop
+    (ICD §5.5), so the command read-back registers reflect reality, not
+    just the last value written.
+    """
+    log.info("command dispatch loop starting")
+    while True:
+        try:
+            await asyncio.sleep(COMMAND_DISPATCH_INTERVAL_S)
+        except asyncio.CancelledError:
+            return
+        for name, arg in store.drain_pending_commands():
+            try:
+                if name == "test":
+                    await driver.drive_outputs(test_pulse_ms=DEFAULT_PULSE_MS)
+                elif name == "inhibit":
+                    await driver.drive_outputs(inhibit=bool(arg))
+                elif name == "force_transfer":
+                    await driver.drive_outputs(force_transfer=bool(arg))
+                elif name == "bypass":
+                    await driver.drive_outputs(bypass_delay_pulse_ms=DEFAULT_PULSE_MS)
+            except Exception as e:  # noqa: BLE001
+                log.exception("command %s dispatch failed: %s", name, e)
+
+
 async def _amain(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     logging.basicConfig(
@@ -73,10 +108,11 @@ async def _amain(args: argparse.Namespace) -> int:
     if not connected:
         log.error("I/O driver failed to connect; will keep retrying in sampling loop")
 
-    store = RegisterStore(unit_id=cfg.site.unit_id)
+    store = RegisterStore(unit_id=cfg.site.unit_id, state_file=cfg.persistence.state_file)
     watchdog = SafetyWatchdog(store, driver)
 
     sample_task = asyncio.create_task(_sampling_loop(driver, store), name="sampling")
+    command_task = asyncio.create_task(_command_loop(driver, store), name="command-dispatch")
     watchdog_task = asyncio.create_task(watchdog.run(), name="safety-watchdog")
     server_task = await start_server(
         host=cfg.modbus_server.host,
@@ -95,10 +131,10 @@ async def _amain(args: argparse.Namespace) -> int:
     await stop.wait()
 
     log.info("atspi shutting down")
-    for t in (sample_task, watchdog_task, server_task):
+    for t in (sample_task, command_task, watchdog_task, server_task):
         if t is not None:
             t.cancel()
-    for t in (sample_task, watchdog_task, server_task):
+    for t in (sample_task, command_task, watchdog_task, server_task):
         if t is None:
             continue
         try:

@@ -44,6 +44,10 @@ class ConfirmToken:
     expires_at: float         # wall-clock, returned to the client for its countdown
     expires_monotonic: float  # authoritative expiry — monotonic so an NTP/DST step
     #                           can't extend (or prematurely void) a live token
+    verb: str | None = None   # action the token was issued for; None = unbound
+    #                           (non-browser clients may omit it). A bound token
+    #                           can only be spent on its own action, so a stale
+    #                           Start tab can't confirm a Stop with it.
 
 
 VERB_TO_CONTROL = {
@@ -105,7 +109,7 @@ class ControlService:
         async with self._lock:
             self.regmap = new_regmap
 
-    async def issue_token(self, operator: str) -> ConfirmToken:
+    async def issue_token(self, operator: str, verb: str | None = None) -> ConfirmToken:
         async with self._lock:
             await self._evict_expired_locked()
             # 128-bit token. The confirm code isn't typed by the operator
@@ -123,12 +127,13 @@ class ControlService:
                 issued_at=now,
                 expires_at=now + TOKEN_TTL_S,
                 expires_monotonic=time.monotonic() + TOKEN_TTL_S,
+                verb=verb,
             )
             self._tokens[tok] = ct
-            self.db.write_audit(operator, "control.issue_token", "", tok, "ok")
+            self.db.write_audit(operator, "control.issue_token", f"verb={verb or '*'}", tok, "ok")
             return ct
 
-    async def consume_token(self, token: str, operator: str) -> ConfirmToken:
+    async def consume_token(self, token: str, operator: str, verb: str | None = None) -> ConfirmToken:
         """Validate + consume a confirm token (takes self._lock).
 
         Used by callers that need a confirm-token gate but don't go
@@ -137,11 +142,14 @@ class ControlService:
         _consume_token_locked directly so the entire
         gate-recheck → consume → modbus-write critical section runs
         under a single lock acquisition.
+
+        `verb` is the action being performed; if the token was issued
+        bound to a specific action it must match.
         """
         async with self._lock:
-            return await self._consume_token_locked(token, operator)
+            return await self._consume_token_locked(token, operator, verb)
 
-    async def _consume_token_locked(self, token: str, operator: str) -> ConfirmToken:
+    async def _consume_token_locked(self, token: str, operator: str, verb: str | None = None) -> ConfirmToken:
         """Caller MUST hold self._lock — does not acquire it itself."""
         await self._evict_expired_locked()
         ct = self._tokens.pop(token, None)
@@ -154,6 +162,17 @@ class ControlService:
         if ct.operator != operator:
             self.db.write_audit(operator, "control.consume_token", "operator_mismatch", token, "denied")
             raise ControlError("token_mismatch", "Confirm token was issued to a different operator", 403)
+        # Verb binding: a token issued for a specific action can only be
+        # spent on that action — stops a stale Start tab from confirming a
+        # Stop with its token. Unbound tokens (verb=None, e.g. a non-browser
+        # client that didn't specify) remain usable for any action.
+        if ct.verb is not None and verb is not None and ct.verb != verb:
+            self.db.write_audit(
+                operator, "control.consume_token", f"verb_mismatch want={verb} token={ct.verb}", token, "denied"
+            )
+            raise ControlError(
+                "token_action_mismatch", "Confirm token was issued for a different action", 403
+            )
         return ct
 
     async def _evict_expired_locked(self) -> None:
@@ -252,10 +271,11 @@ class ControlService:
                 raise ControlError("invalid_state", f"cannot {verb} while engine is {cur}", 409)
 
             # All gates passed against the freshest snap. Commit by
-            # consuming the token. If the modbus write below fails,
-            # the operator must issue a fresh token to retry — that's
-            # intentional (same behavior as before this refactor).
-            await self._consume_token_locked(token, operator)
+            # consuming the token (verb-checked: a token issued for a
+            # different action is rejected). If the modbus write below
+            # fails, the operator must issue a fresh token to retry —
+            # that's intentional (same behavior as before this refactor).
+            await self._consume_token_locked(token, operator, verb=verb)
 
             # Write the Modbus register(s). FC16 multi-register writes use `values`;
             # FC06/FC16 single-register writes use a one-element list.
