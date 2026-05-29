@@ -135,7 +135,7 @@ async def ack_alarm(
     # consumed atomically — the same operator's parallel ack attempt
     # with the same token will see token_invalid.
     try:
-        await ctl_service.consume_token(body.confirm_token, p.operator)
+        await ctl_service.consume_token(body.confirm_token, p.operator, verb="ack")
     except ControlError as e:
         raise HTTPException(e.http_status, detail={"code": e.code, "message": str(e)})
 

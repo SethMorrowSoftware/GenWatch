@@ -50,7 +50,7 @@ ats-pi-companion-starter/
 │   ├── server.py                 ← Modbus TCP server (pymodbus)
 │   ├── io_driver.py              ← abstract I/O interface
 │   ├── io_mock.py                ← mock driver (no hardware)
-│   └── io_adam.py                ← ADAM-6060 driver (STUB)
+│   └── io_adam.py                ← ADAM-6060 driver (implemented)
 │
 ├── tests/
 │   ├── __init__.py
@@ -75,18 +75,18 @@ After copying into the repo, `cd`ing in, and running
 
 ## What needs to be implemented (in priority order)
 
-The starter is the scaffold. The actual work to make this production-ready
-is summarized in `docs/SPEC.md §8`:
+Phases A–F are now implemented and unit-tested; phase G is the
+hardware-commissioning task. Breakdown from `docs/SPEC.md §8`:
 
-| Phase | What | Files affected |
+| Phase | What | Status |
 |---|---|---|
-| A ✅ | Register store + mock I/O + Modbus server | already done in starter |
-| B | Sampling loop wiring + atomic snapshot | `__main__.py`, `state.py` (verify atomicity under load) |
-| C | Write command handling — make `cmd_test` etc. actually trigger the I/O driver to pulse the relay | `state.py` `write_register` needs to call into the driver |
-| D | Safety watchdog hardware-driven test | `safety.py` is implemented; verify against real timer |
-| E | **`io_adam.py` — implement the ADAM-6060 driver** | `io_adam.py` (currently raises `NotImplementedError`) |
-| F | Persistence of `transfer_count_lifetime` | `state.py` + a new `persistence.py` |
-| G | Production install — systemd setup, real wiring | nothing code-side; commissioning task |
+| A ✅ | Register store + mock I/O + Modbus server | done |
+| B ✅ | Sampling loop wiring + atomic snapshot | done (`__main__.py`, `state.py`) |
+| C ✅ | Write command handling — `cmd_test` etc. drive the I/O relays | done; `write_register` queues commands, `_command_loop` drives the driver, read-back reflects driven state (ICD §5.5) |
+| D ✅ | Safety watchdog comms-loss auto-release | done (`safety.py`); real-timer test in `tests/test_safety.py` |
+| E ✅ | **`io_adam.py` — ADAM-6060 driver** | implemented; **verify the Modbus address map on your unit** (`docs/HARDWARE.md §6`) |
+| F ✅ | Persistence of `transfer_count_lifetime` | done (atomic JSON in `state.py`; `tests/test_persistence.py`) |
+| G | Production install — systemd, real wiring, ICD §13 golden run | commissioning task (needs hardware) |
 
 ## The contract
 

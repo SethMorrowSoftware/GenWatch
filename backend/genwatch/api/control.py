@@ -1,7 +1,7 @@
 """Control endpoints — confirm-token gated."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from ..services.control import ControlError
@@ -15,9 +15,17 @@ class ControlBody(BaseModel):
 
 
 @router.get("/confirm")
-async def confirm(request: Request, p: Principal = Depends(require_operator)) -> dict:
+async def confirm(
+    request: Request,
+    verb: str | None = Query(None),
+    p: Principal = Depends(require_operator),
+) -> dict:
+    # `verb` binds the token to the action it'll confirm (start/stop/…,
+    # an ATS command, or "ack"). Optional for non-browser clients; the UI
+    # always supplies it so a token can't be cross-spent between, say, a
+    # stale Start tab and a Stop tab.
     ctl = request.app.state.control
-    tok = await ctl.issue_token(p.operator)
+    tok = await ctl.issue_token(p.operator, verb=verb)
     return {
         "token": tok.token,
         "issuedAt": tok.issued_at,

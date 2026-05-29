@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Version** | 1.1 |
-| **Status** | Phases 1-3 **shipped on the GenWatch side** (Phase 3 validated against the mock); live ATS commands gated on the companion ADAM-6060 driver + ICD §8.3 auto-release. |
+| **Status** | Phases 1-3 **software-complete on both sides** (GenWatch consumer + ATS-Pi companion, validated against mocks); live ATS commands gated only on hardware commissioning (ADAM address-map verification + field wiring + ICD §13 golden run). |
 | **Companion document** | [`ats-pi-icd.md`](./ats-pi-icd.md) — the wire contract |
 | **Supersedes (partially)** | [`asco-series-300.md`](./asco-series-300.md) Path B sections 3-5, for sites with an ATS-Pi |
 
@@ -116,11 +116,13 @@ Landed on `main` in commit `a106ef3` (Live view consumes the ATS block). Cross-c
 | **Files modified** | `frontend/src/types.ts` (add `AtsBlock` type, extend snapshot WS message); `frontend/src/hooks/useLiveData.ts` (merge ATS data from snapshots and `load-source` events); `frontend/src/views/LiveView.tsx` (ATS card additions); `backend/genwatch/services/state.py` (loadSource precedence change). |
 | **Acceptance criteria** | (1) With healthy ATS-Pi mock, the HTS-1 pill on the Live view reflects the ATS-Pi's `position` value, not the H-100-derived one. (2) With ATS-Pi unreachable, the badge silently falls back to H-100 derivation and shows a small "(via gen telemetry)" subscript. (3) `UTILITY_LOST` / `UTILITY_RESTORED` events appear in the events feed within one prime-poll cycle of the simulated state change. (4) Slack receives a message on each transition, gated by the existing `alert_on_load_source_change` flag. (5) Frontend `tsc --noEmit` passes; build passes. |
 
-### Phase 3 — Bidirectional commands ✅ Shipped (GenWatch side) · ⏳ live use gated on companion
+### Phase 3 — Bidirectional commands ✅ Shipped (both sides, software-complete) · ⏳ live use gated on hardware commissioning
 
-The GenWatch consumer side is implemented and validated against the mock ATS-Pi: `AtsControlService` (`backend/genwatch/services/ats_control.py`), the four endpoints (`backend/genwatch/api/ats.py`), and the Live-view command row + confirm-modal specs. Covered by `backend/tests/test_ats_control.py` and an end-to-end smoke against `MockAtsPiServer` (confirm → command → ICD register write observed in the mock's read-back).
+**GenWatch consumer side** — implemented and validated against the mock ATS-Pi: `AtsControlService` (`backend/genwatch/services/ats_control.py`), the four endpoints (`backend/genwatch/api/ats.py`), and the Live-view command row + confirm-modal specs. Covered by `backend/tests/test_ats_control.py` and an end-to-end smoke against `MockAtsPiServer` (confirm → command → ICD register write observed in the read-back).
 
-**Still gated for live use** on the companion side: `docs/integrations/ats-pi-companion-starter/src/atspi/io_adam.py` is a `NotImplementedError` stub. The ICD §8.3 30-second comms-loss auto-release — the critical safety backstop for the maintained commands (inhibit / force-transfer) — lives entirely on the ATS-Pi and **must be implemented and bench-verified before `ats.enabled: true` drives a real ASCO** (see the Phase 4 commissioning checklist).
+**Companion side** (`docs/integrations/ats-pi-companion-starter/`) — now software-complete too: the ADAM-6060 driver (`io_adam.py`), the write-command dispatch path (a Modbus write drives the relay through the driver; read-back reflects the *driven* state per ICD §5.5), persistence of `transfer_count_lifetime`, and the §8.3 30 s comms-loss auto-release are all implemented and unit-tested (incl. a real-timer auto-release test). An end-to-end smoke drives a command through the real Modbus server → dispatch → driver → read-back.
+
+**Still gated for live use:** the ADAM-6060 Modbus address map must be confirmed against the physical unit's firmware (`HARDWARE.md §6`), the field wiring landed (`HARDWARE.md §3`), and the ICD §13 golden test sequence run against the live ASCO. That's the Phase 4 commissioning work below — no code remains.
 
 | | |
 |---|---|

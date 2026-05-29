@@ -441,6 +441,42 @@ async def test_control_rejected_when_comms_lost(tmp_path):
     assert writes == [(0x019C, None, 16, [0x0080, 0x0000, 0x0000])]
 
 
+async def test_confirm_token_is_verb_bound(tmp_path):
+    """A token issued for one action can't be spent on another (stops a
+    stale Start tab from confirming a Stop with its token). Unbound
+    tokens (no verb at issue) stay usable for any action — backward-compat
+    for non-browser clients."""
+    from pathlib import Path
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from genwatch.modbus.registers import load_register_map
+    from genwatch.services.control import ControlError, ControlService
+
+    regmap = load_register_map(Path(__file__).parent.parent / "genwatch/registers/h100.yaml")
+    state = SimpleNamespace(snap=SimpleNamespace(
+        panel_mode="auto", engine_state="stopped", comms=SimpleNamespace(state="healthy"),
+    ))
+    ctl = ControlService(regmap, MagicMock(), MagicMock(), state, slack=None)
+
+    # Bound to 'start' → cannot be consumed for 'stop'.
+    tok = await ctl.issue_token("op", verb="start")
+    with pytest.raises(ControlError) as ei:
+        await ctl.consume_token(tok.token, "op", verb="stop")
+    assert ei.value.code == "token_action_mismatch"
+    assert ei.value.http_status == 403
+
+    # Bound to 'start' → works for 'start'.
+    tok2 = await ctl.issue_token("op", verb="start")
+    ct = await ctl.consume_token(tok2.token, "op", verb="start")
+    assert ct.verb == "start"
+
+    # Unbound (verb=None at issue) → usable for any action.
+    tok3 = await ctl.issue_token("op")
+    ct3 = await ctl.consume_token(tok3.token, "op", verb="stop")
+    assert ct3 is not None
+
+
 def test_config_does_not_auto_mock_when_device_missing(monkeypatch, tmp_path):
     """When the serial device is absent and mock isn't requested, the
     config layer must leave mock=False — we never silently switch to

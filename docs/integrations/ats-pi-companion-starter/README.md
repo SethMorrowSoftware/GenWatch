@@ -59,7 +59,8 @@ src/atspi/
   safety.py         — 30-second comms-loss auto-release per ICD §8.3
   io_driver.py      — abstract I/O base class
   io_mock.py        — mock driver for dev/testing without hardware
-  io_adam.py        — Advantech ADAM-6060 driver (stub — implement first)
+  io_adam.py        — Advantech ADAM-6060 driver (implemented; verify the
+                      Modbus address map on your unit per docs/HARDWARE.md §6)
 
 docs/
   SPEC.md           — implementation specification (companion to the ICD)
@@ -67,9 +68,11 @@ docs/
   DEVELOPMENT.md    — getting started, running tests, manual testing
 
 tests/
-  test_smoke.py     — imports, basic config load
-  test_state.py     — state model unit tests
-  test_safety.py    — comms-loss auto-release tests
+  test_smoke.py            — imports, config load, store defaults
+  test_io_adam.py          — ADAM-6060 decode / position / fault / drive / pulse
+  test_command_dispatch.py — write → drive → driven-state read-back (Phase C)
+  test_persistence.py      — transfer_count_lifetime survives restart (Phase F)
+  test_safety.py           — 30 s comms-loss auto-release (ICD §8.3)
 
 systemd/
   atspi.service     — production systemd unit
@@ -93,9 +96,16 @@ modpoll -m tcp -a 1 -r 1 -c 6 127.0.0.1
 
 ## Status
 
-**Phase 1 starter scaffold.** Module signatures and stubs are in place;
-real I/O integration and the safety watchdog need to be implemented.
-See `docs/SPEC.md` for the work breakdown.
+**Software-complete (SPEC phases A–F).** The register store + Modbus
+server (A), 10 Hz sampling loop (B), write-command dispatch to the I/O
+relays (C), comms-loss safety auto-release (D), the ADAM-6060 driver (E),
+and persistence of `transfer_count_lifetime` (F) are all implemented and
+unit-tested against the mock and a fake Modbus client.
+
+**What still needs real hardware (phase G — commissioning):** confirm the
+ADAM-6060 Modbus address map matches your firmware (`docs/HARDWARE.md §6`),
+land the field wiring per `docs/HARDWARE.md §3`, and run the ICD §13 golden
+test sequence against the live ASCO. See `docs/SPEC.md` for the breakdown.
 
 The companion **GenWatch consumer** for this service is already
 shipped (`ats.enabled: true` in GenWatch's config). It will fall back
