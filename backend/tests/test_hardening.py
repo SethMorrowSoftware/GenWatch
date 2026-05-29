@@ -453,6 +453,87 @@ def test_config_does_not_auto_mock_when_device_missing(monkeypatch, tmp_path):
     assert s.mock is False
 
 
+def test_config_env_overrides_yaml(monkeypatch, tmp_path):
+    """Environment variables must outrank config.yaml (the documented
+    contract). The previous loader passed YAML as constructor kwargs,
+    which in pydantic-settings silently won over every GENWATCH_*
+    override. The nested deep-merge must also preserve sibling YAML
+    fields when env overrides just one of them."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "transport: tcp\n"
+        f"data_dir: {tmp_path / 'yamldata'}\n"
+        "auth:\n"
+        "  jwt_secret: YAML_SECRET\n"
+        "  admin_password_hash: YAML_HASH\n"
+        "modbus_tcp:\n"
+        "  host: 9.9.9.9\n"
+    )
+    monkeypatch.setenv("GENWATCH_AUTH__JWT_SECRET", "ENV_SECRET")
+    monkeypatch.setenv("GENWATCH_DATA_DIR", str(tmp_path / "envdata"))
+
+    s = load(str(cfg))
+    # Env wins on the conflicting key…
+    assert s.auth.jwt_secret == "ENV_SECRET"
+    # …but the sibling YAML field under the same nested model survives.
+    assert s.auth.admin_password_hash == "YAML_HASH"
+    # YAML applies where there's no env override.
+    assert s.modbus_tcp.host == "9.9.9.9"
+    # Top-level env (data_dir, set by the systemd unit) beats YAML too.
+    assert s.data_dir == str(tmp_path / "envdata")
+
+
+def test_db_rollup_1h_and_long_span_read(tmp_path):
+    """The 1m→1h rollup must populate telemetry_1h, and a long-span read
+    must serve from it — otherwise history older than the 1m horizon
+    (90 d) is silently lost despite the config advertising ~2 years."""
+    from genwatch.db import Database
+
+    db = Database(tmp_path / "t.sqlite")
+    base = 1_000_000  # fixed epoch
+    for i in range(0, 3 * 3600, 30):  # 3 hours of raw, every 30 s
+        db.write_telemetry(base + i, {"total_kw": 100.0, "rpm": 1800.0}, "running", 0)
+    db.aggregate_rollup_1m(base, base + 3 * 3600)
+    n1h = db.aggregate_rollup_1h(base, base + 3 * 3600 + 1)
+    assert n1h >= 3  # ~3 hourly buckets
+
+    # A >14-day span routes to the 1h tier and returns the rolled data.
+    rows = db.read_telemetry("kw", base, base + 30 * 86400)
+    assert len(rows) >= 3
+    assert all(abs(v - 100.0) < 1.0 for _, v in rows)
+    db.close()
+
+
+def test_db_prune_is_chunked(tmp_path):
+    """Chunked prune must delete everything matching across multiple
+    chunks (releasing the write lock between each)."""
+    from genwatch.db import Database
+
+    db = Database(tmp_path / "t.sqlite")
+    for i in range(25):
+        db.write_telemetry(1000.0 + i, {"total_kw": 1.0}, "running", 0)
+    deleted = db.prune_raw_telemetry(2000.0, chunk=10)  # 25 rows, chunk 10 → 3 passes
+    assert deleted == 25
+    assert db.read_telemetry("kw", 0, 3000) == []
+    db.close()
+
+
+def test_db_checkpoint_and_reads_dont_take_write_lock(tmp_path):
+    """checkpoint() is best-effort and must not raise; a read must be
+    possible while the write lock is held (reads use their own
+    connection, so they don't serialize behind writes/prunes)."""
+    from genwatch.db import Database
+
+    db = Database(tmp_path / "t.sqlite")
+    db.write_event("info", "BOOT", "hi")
+    db.checkpoint()  # must not raise
+    # Hold the write lock and confirm a read still completes.
+    with db._writer():
+        rows = db.read_events(limit=10)
+    assert any(e["type"] == "BOOT" for e in rows)
+    db.close()
+
+
 # ─── Transport selection (serial vs tcp) ────────────────────────────────
 
 
@@ -777,6 +858,112 @@ async def test_poller_eviction_is_per_tier(tmp_path):
     assert p.reading.values.get(base_reg.name) == 0xBEEF, (
         "prime poll's eviction sweep must not retire base-tier values"
     )
+
+
+async def test_short_read_counts_as_failure(tmp_path):
+    """A truncated frame (fewer registers than requested, no isError) must
+    be treated as a failure — never accepted as success, which would
+    zero-extend the decode and read 'healthy' while telemetry froze."""
+    from genwatch.modbus.client import SerialModbusClient
+
+    client = SerialModbusClient(
+        device="x", baud=9600, parity="N", stopbits=1, bytesize=8,
+        timeout_s=0.1, slave=1, retries=0, backoff_s=[0.01],
+    )
+
+    class FakeRR:
+        registers = [0x11]  # only 1 word for a 4-register request
+
+        def isError(self):
+            return False
+
+    class FakeWire:
+        async def read_holding_registers(self, address, count, slave):
+            return FakeRR()
+
+    client._client = FakeWire()
+    r = await client.read(0x0010, 4, fc=3)
+    assert not r.ok
+    assert r.error == "short_read"
+
+
+async def test_fanout_partial_failure_does_not_flip_comms_lost(tmp_path):
+    """A few unreadable registers inside a fan-out must NOT flip comms to
+    LOST. Health is sampled once per logical batch, not once per fan-out
+    single — otherwise 3 bad registers in a row trip the 3-consecutive-
+    failure LOST threshold while the rest of the block reads fine."""
+    from dataclasses import dataclass
+    from genwatch.modbus.client import ModbusResult
+    from genwatch.modbus.poller import Poller
+    from genwatch.modbus.registers import load_register_map
+
+    regmap = load_register_map("genwatch/registers/h100.yaml")
+    # Alarm registers (not state registers) — failing these must not LOSE comms.
+    fail_addrs = {0x0083, 0x0084, 0x0085}
+
+    @dataclass
+    class FakeClient:
+        async def connect(self): return True
+
+        async def close(self): pass
+
+        async def read(self, addr, count, fc=3):
+            if count > 1:
+                return ModbusResult.failure("batch", 1.0)
+            if addr in fail_addrs:
+                return ModbusResult.failure("addr", 1.0)
+            return ModbusResult.success([0x4321], 1.0)
+
+    p = Poller(FakeClient(), regmap, lambda *a: _noop())
+    await p._poll_tier("prime")
+    assert p.health.state != "lost", (
+        "a handful of unreadable registers must not flip comms to LOST when "
+        "the batch fan-out recovered the rest"
+    )
+    # State block (0x0082 / 0x0088) read fine → heartbeat stamped.
+    assert p.health.last_prime_good_monotonic is not None
+
+
+async def test_heartbeat_withheld_when_state_block_fails(tmp_path):
+    """The prime heartbeat must reflect engine-state detection, not just
+    'some prime register was readable'. If output_status_1 (a state
+    register) can't be decoded, the watchdog heartbeat is withheld even
+    though unrelated prime registers (alarm count, etc.) read fine."""
+    from dataclasses import dataclass
+    from genwatch.modbus.client import ModbusResult
+    from genwatch.modbus.poller import Poller
+    from genwatch.modbus.registers import load_register_map
+
+    regmap = load_register_map("genwatch/registers/h100.yaml")
+    state_reg = regmap.by_name("output_status_1")
+    assert state_reg is not None
+
+    @dataclass
+    class FakeClient:
+        async def connect(self): return True
+
+        async def close(self): pass
+
+        async def read(self, addr, count, fc=3):
+            if count > 1:
+                return ModbusResult.failure("batch", 1.0)
+            if addr == state_reg.addr:
+                return ModbusResult.failure("state_addr", 1.0)
+            return ModbusResult.success([0x0001], 1.0)
+
+    p = Poller(FakeClient(), regmap, lambda *a: _noop())
+    assert p.health.last_prime_good_monotonic is None
+    await p._poll_tier("prime")
+    # A far-flung prime single did decode, but the state register didn't —
+    # so the heartbeat must stay unstamped (M1).
+    assert p.reading.values.get("active_alarm_count") is not None
+    assert p.health.last_prime_good_monotonic is None, (
+        "heartbeat must be withheld when an engine-state register failed to decode"
+    )
+
+
+async def _noop():
+    return None
 
 
 async def test_modbus_read_releases_lock_between_retry_attempts(tmp_path):

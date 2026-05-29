@@ -179,7 +179,7 @@ function StatusHero({ status, history }: { status: StatusBody; history: Reading[
         <HeroKpi
           icon="wave"
           label="Frequency"
-          value={r.hz != null ? r.hz.toFixed(1) : "0.0"}
+          value={r.hz != null ? r.hz.toFixed(1) : "—"}
           unit="Hz"
           spark={history.map((h) => h.hz ?? 0).reverse()}
           color="var(--green)"
@@ -356,7 +356,7 @@ function AtsCard({ status, role, onCommand, stale }: {
             <text x="72" y="118" textAnchor="middle" fontSize="10" fontFamily="Geist" fontWeight="600" fill="var(--text-3)" letterSpacing="2">GENERATOR</text>
             <text x="72" y="136" textAnchor="middle" fontSize="13" fontFamily="JetBrains Mono" fontWeight="500" fill="var(--text)">
               {ats && ats.emergencyAvailable === false ? "NOT READY"
-                : r.vAB != null ? `${Math.round(r.vAB)} V` : "0 V"}
+                : r.vAB != null ? `${Math.round(r.vAB)} V` : "—"}
             </text>
 
             {/* Wires — animated dashed during transferring */}

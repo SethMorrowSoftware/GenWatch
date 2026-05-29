@@ -146,6 +146,12 @@ def test_control_addresses_distinct_from_reads(regmap):
         ("s16", [0x8000], 1.0, -32768),
         ("u32", [0, 18476], 0.1, 1847.6),
         ("u32", [1, 0], 1.0, 65536),
+        # u32_lo reads only the low word. With a zero high word it matches
+        # the u32 decode (safe migration); with a GARBAGE high word it
+        # ignores it instead of blowing the value up by ~65536×.
+        ("u32_lo", [0, 18476], 0.1, 1847.6),
+        ("u32_lo", [0xDEAD, 188], 1.0, 188),
+        ("u32", [0xDEAD, 188], 1.0, 0xDEAD0188),  # contrast: u32 honours the high word
         ("s32", [0xFFFF, 0xFFFF], 1.0, -1),
         ("bitfld", [0b1011], 1.0, 0b1011),
         ("enum", [3], 1.0, 3),

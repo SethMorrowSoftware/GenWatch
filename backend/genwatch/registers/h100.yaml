@@ -212,33 +212,37 @@ registers:
   - { name: output_status_8,   addr: 0x0089, fc: 3, type: bitfld, tier: prime, group: "Alarms", unit: bits }
 
   # Base · 15 s — engine telemetry
-  # The H-100 returns these as 2-register (u32) slots. The meaningful
-  # value sits in the low word; the high word is reserved/zero. Decoding
-  # as u32 big-endian gives the correct integer for both single- and
-  # large-value sensors (e.g. engine_hours).
-  - { name: oil_temp,          addr: 0x008A, fc: 3, type: u32, tier: base, group: "Engine", unit: F }
-  - { name: coolant_temp,      addr: 0x008C, fc: 3, type: u32, tier: base, group: "Engine", unit: F,    warn_range: [170, 210], alarm_range: [120, 235] }
-  - { name: oil_pressure,      addr: 0x008E, fc: 3, type: u32, tier: base, group: "Engine", unit: psi,  warn_range: [35, 80] }
-  - { name: coolant_level,     addr: 0x0090, fc: 3, type: u32, tier: base, group: "Engine", unit: pct, scale: 0.1 }
-  - { name: fuel_level_pct,    addr: 0x0092, fc: 3, type: u32, tier: base, group: "Engine", unit: pct }
-  - { name: throttle_position, addr: 0x0096, fc: 3, type: u32, tier: base, group: "Engine", unit: pct }
-  - { name: o2_sensor,         addr: 0x0098, fc: 3, type: u32, tier: base, group: "Engine", unit: pct }
-  - { name: batt_charge_current, addr: 0x009A, fc: 3, type: u32, tier: base, group: "Engine", unit: A }
-  - { name: battery_volts,     addr: 0x009C, fc: 3, type: u32, tier: base, group: "Engine", unit: V,    scale: 0.01, warn_range: [12.6, 14.6] }
+  # The H-100 returns these as 2-register (u32) slots, but the meaningful
+  # value sits in the LOW word — the high word is reserved/zero. We decode
+  # them as `u32_lo`, which reads only the low word, so a framing slip on
+  # the RTU-over-TCP bridge that leaves garbage in the high word can't
+  # blow a reading up by ~65536× (a 188 °F coolant temp masquerading as
+  # millions). When the high word is zero — the documented normal case —
+  # u32_lo is identical to the old u32 decode. Genuine 32-bit counters
+  # that legitimately use both words (run_hours, below) stay `u32`.
+  - { name: oil_temp,          addr: 0x008A, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: F }
+  - { name: coolant_temp,      addr: 0x008C, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: F,    warn_range: [170, 210], alarm_range: [120, 235] }
+  - { name: oil_pressure,      addr: 0x008E, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: psi,  warn_range: [35, 80] }
+  - { name: coolant_level,     addr: 0x0090, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: pct, scale: 0.1 }
+  - { name: fuel_level_pct,    addr: 0x0092, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: pct }
+  - { name: throttle_position, addr: 0x0096, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: pct }
+  - { name: o2_sensor,         addr: 0x0098, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: pct }
+  - { name: batt_charge_current, addr: 0x009A, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: A }
+  - { name: battery_volts,     addr: 0x009C, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: V,    scale: 0.01, warn_range: [12.6, 14.6] }
 
-  # Base · 15 s — AC output
-  - { name: gen_current_a,     addr: 0x009E, fc: 3, type: u32, tier: base, group: "Electrical", unit: A }
-  - { name: gen_current_b,     addr: 0x00A0, fc: 3, type: u32, tier: base, group: "Electrical", unit: A }
-  - { name: gen_current_c,     addr: 0x00A2, fc: 3, type: u32, tier: base, group: "Electrical", unit: A }
-  - { name: avg_current,       addr: 0x00A4, fc: 3, type: u32, tier: base, group: "Electrical", unit: A }
-  - { name: gen_voltage_ab,    addr: 0x00A6, fc: 3, type: u32, tier: base, group: "Electrical", unit: V }
-  - { name: gen_voltage_bc,    addr: 0x00A8, fc: 3, type: u32, tier: base, group: "Electrical", unit: V }
-  - { name: gen_voltage_ca,    addr: 0x00AA, fc: 3, type: u32, tier: base, group: "Electrical", unit: V }
-  - { name: avg_voltage,       addr: 0x00AC, fc: 3, type: u32, tier: base, group: "Electrical", unit: V }
-  - { name: total_kw,          addr: 0x00AE, fc: 3, type: u32, tier: base, group: "Electrical", unit: kW }
-  - { name: power_factor,      addr: 0x00B0, fc: 3, type: u32, tier: base, group: "Electrical", unit: pf, scale: 0.01 }
-  - { name: frequency,         addr: 0x00B2, fc: 3, type: u32, tier: base, group: "Electrical", unit: Hz, scale: 0.1 }
-  - { name: rpm,               addr: 0x00B4, fc: 3, type: u32, tier: base, group: "Engine", unit: rpm,  warn_range: [1750, 1850] }
+  # Base · 15 s — AC output (all 16-bit-in-u32 → u32_lo, see note above)
+  - { name: gen_current_a,     addr: 0x009E, fc: 3, type: u32_lo, tier: base, group: "Electrical", unit: A }
+  - { name: gen_current_b,     addr: 0x00A0, fc: 3, type: u32_lo, tier: base, group: "Electrical", unit: A }
+  - { name: gen_current_c,     addr: 0x00A2, fc: 3, type: u32_lo, tier: base, group: "Electrical", unit: A }
+  - { name: avg_current,       addr: 0x00A4, fc: 3, type: u32_lo, tier: base, group: "Electrical", unit: A }
+  - { name: gen_voltage_ab,    addr: 0x00A6, fc: 3, type: u32_lo, tier: base, group: "Electrical", unit: V }
+  - { name: gen_voltage_bc,    addr: 0x00A8, fc: 3, type: u32_lo, tier: base, group: "Electrical", unit: V }
+  - { name: gen_voltage_ca,    addr: 0x00AA, fc: 3, type: u32_lo, tier: base, group: "Electrical", unit: V }
+  - { name: avg_voltage,       addr: 0x00AC, fc: 3, type: u32_lo, tier: base, group: "Electrical", unit: V }
+  - { name: total_kw,          addr: 0x00AE, fc: 3, type: u32_lo, tier: base, group: "Electrical", unit: kW }
+  - { name: power_factor,      addr: 0x00B0, fc: 3, type: u32_lo, tier: base, group: "Electrical", unit: pf, scale: 0.01 }
+  - { name: frequency,         addr: 0x00B2, fc: 3, type: u32_lo, tier: base, group: "Electrical", unit: Hz, scale: 0.1 }
+  - { name: rpm,               addr: 0x00B4, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: rpm,  warn_range: [1750, 1850] }
 
   # Base · 15 s — counters / status
   - { name: active_alarm_count, addr: 0x012F, fc: 3, type: u16, tier: prime, group: "State", unit: count }

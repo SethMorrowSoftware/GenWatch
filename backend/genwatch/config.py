@@ -11,17 +11,51 @@ hot-reloadable; it is *not* part of this Pydantic model.
 from __future__ import annotations
 
 import os
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
 
 DEFAULT_CONFIG_PATHS = [
     "/etc/genwatch/config.yaml",
     "./config.yaml",
 ]
+
+# Holds the parsed config.yaml for the current load() call so the YAML
+# settings source (ranked BELOW env) can read it. A ContextVar keeps it
+# reentrancy-safe — load() sets it around construction and resets after.
+_yaml_ctx: ContextVar[dict] = ContextVar("genwatch_yaml_cfg", default={})
+
+
+class _YamlSettingsSource(PydanticBaseSettingsSource):
+    """Feeds config.yaml into Settings as a source ranked below env.
+
+    The previous implementation passed the YAML dict as constructor
+    kwargs, which in pydantic-settings outranks *every* environment
+    source — so any key present in config.yaml silently ignored its
+    GENWATCH_* override, the exact opposite of the documented contract.
+    Wiring the YAML in as a proper low-priority source restores
+    "env wins", and pydantic-settings deep-merges the nested models so an
+    env override of one field (e.g. GENWATCH_AUTH__JWT_SECRET) doesn't
+    wipe the sibling YAML fields.
+    """
+
+    def get_field_value(self, field, field_name):  # noqa: ANN001
+        return _yaml_ctx.get().get(field_name), field_name, False
+
+    def prepare_field_value(self, field_name, field, value, value_is_complex):  # noqa: ANN001
+        return value
+
+    def __call__(self) -> dict:
+        data = _yaml_ctx.get()
+        return {name: data[name] for name in self.settings_cls.model_fields if name in data}
 
 
 class SerialConfig(BaseModel):
@@ -204,6 +238,26 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls,
+        init_settings,
+        env_settings,
+        dotenv_settings,
+        file_secret_settings,
+    ):
+        # Priority, highest first: explicit init kwargs > env > config.yaml
+        # > file secrets/defaults. This is what the module docstring
+        # promises; the YAML source is injected here rather than as
+        # constructor kwargs so it can't outrank env.
+        return (
+            init_settings,
+            env_settings,
+            _YamlSettingsSource(settings_cls),
+            file_secret_settings,
+        )
+
     # paths
     data_dir: str = "/var/lib/genwatch"
     config_path: str = ""  # set by load()
@@ -274,11 +328,14 @@ def load(config_path: str | None = None) -> Settings:
             chosen = c
             break
 
-    # 2. Merge into Settings via pydantic
-    if yaml_data:
-        s = Settings(**yaml_data, config_path=chosen)
-    else:
+    # 2. Build Settings. The YAML is fed through a dedicated low-priority
+    #    source (see _YamlSettingsSource) so environment variables still
+    #    win — passing it as kwargs here would invert that.
+    token = _yaml_ctx.set(yaml_data)
+    try:
         s = Settings(config_path=chosen)
+    finally:
+        _yaml_ctx.reset(token)
 
     # 3. Ensure data dir exists. If we can't create it (read-only fs in
     #    test), fall back to a tempdir under the cwd.

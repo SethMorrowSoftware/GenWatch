@@ -26,7 +26,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
-from .client import ModbusClient, ModbusResult
+from .client import ModbusClient
 from .registers import RegisterMap, batch_reads, decode_value
 
 log = logging.getLogger("genwatch.modbus.poller")
@@ -243,8 +243,8 @@ class Poller:
         any_batch_ok = False
         for start, count in batches:
             r = await self.client.read(start, count, fc=regmap.read_fc)
-            self._record(r)
             if r.ok and r.words is not None:
+                self._record(True, r.elapsed_ms)
                 results.append((start, list(r.words), set()))
                 any_batch_ok = True
                 continue
@@ -261,6 +261,17 @@ class Poller:
                 fb_words, fb_failed = fb
                 results.append((start, fb_words, fb_failed))
                 any_batch_ok = True
+                # Record ONE comms-health sample per batch — not one per
+                # fan-out single. Otherwise a handful of unreadable
+                # registers flood the 60-sample rolling window and flip
+                # comms to LOST (3 consecutive failures) even though the
+                # rest of the block reads fine. Fan-out recovered data, so
+                # the link is alive → count the batch as a success.
+                self._record(True, r.elapsed_ms)
+            else:
+                # Not a single register in the batch could be read — the
+                # link is down for this range. One failure sample.
+                self._record(False, r.elapsed_ms)
 
         # Decode every register whose address falls within a successful
         # batch. Registers whose words include a fan-out failure are
@@ -313,7 +324,7 @@ class Poller:
                 # The first-poll case is naturally handled because the
                 # value dict won't have this key either.
                 continue
-            if (mono_now - age_ts) > stale_threshold_s:
+            if (mono_now - age_ts) >= stale_threshold_s:
                 if reg.name in new_values:
                     log.debug(
                         "evicting stale value for %s "
@@ -327,12 +338,25 @@ class Poller:
 
         self.reading = Reading(values=new_values, ts=time.time(), value_ages=new_ages)
 
-        # Heartbeat for the systemd watchdog: only stamp on a *prime* poll
-        # cycle that produced at least one good batch. A wholly failed
-        # prime cycle means downstream consumers (state machine, UI) are
-        # operating on stale data and we should let the watchdog notice.
-        if tier == "prime" and any_batch_ok:
-            self.health.last_prime_good_monotonic = time.monotonic()
+        # Heartbeat for the systemd watchdog. It must mean "engine-state
+        # detection is alive", not merely "some prime register was
+        # readable". Stamp only when EVERY register the engine-state rules
+        # depend on (output_status_1 / output_status_7 in the H-100 map)
+        # got a fresh decode THIS cycle. A poll where the contiguous state
+        # block failed but a far-flung prime single (active_alarm_count,
+        # quiettest_status, key_switch_state…) succeeded must not satisfy
+        # the watchdog — that's the M1 gap where a frozen state block hid
+        # behind an unrelated readable register. For a map without
+        # engine_state_bits (the ATS-Pi poller) fall back to "any batch ok"
+        # so its own comms-LOST detection still works.
+        if tier == "prime":
+            state_regs = {rule.register for rule in regmap.engine_state_bits}
+            if state_regs:
+                state_fresh = all(new_ages.get(n) == mono_now for n in state_regs)
+            else:
+                state_fresh = any_batch_ok
+            if state_fresh:
+                self.health.last_prime_good_monotonic = time.monotonic()
 
         try:
             await self.callback(tier, self.reading, self.health)
@@ -361,7 +385,9 @@ class Poller:
         any_ok = False
         for offset in range(count):
             r = await self.client.read(start + offset, 1, fc=read_fc)
-            self._record(r)
+            # NB: comms health is recorded once per batch by the caller —
+            # not here — so a few unreadable registers in a fan-out don't
+            # flood the rolling window and flip comms to LOST.
             if r.ok and r.words:
                 words.append(int(r.words[0]))
                 any_ok = True
@@ -371,31 +397,41 @@ class Poller:
         return (words, failed) if any_ok else None
 
     # ---- comms health ----
-    def _record(self, r: ModbusResult) -> None:
+    def _record(self, ok: bool, elapsed_ms: float | None = None) -> None:
+        """Record one comms-health sample. Called once per logical batch
+        (a fan-out of many singles still counts as one sample) so a few
+        unreadable registers can't dominate the rolling window."""
         now = time.time()
         self.health.last_attempt_at = now
-        self._results.append(r.ok)
-        if r.elapsed_ms:
-            self._latencies.append(r.elapsed_ms)
-        if r.ok:
+        self._results.append(ok)
+        if elapsed_ms:
+            self._latencies.append(elapsed_ms)
+        if ok:
             self.health.last_good_at = now
             self.health.consecutive_failures = 0
         else:
             self.health.consecutive_failures += 1
 
         if self._results:
-            ok = sum(1 for x in self._results if x)
-            self.health.success_pct = round(100.0 * ok / len(self._results), 1)
+            n_ok = sum(1 for x in self._results if x)
+            self.health.success_pct = round(100.0 * n_ok / len(self._results), 1)
         if self._latencies:
             ordered = sorted(self._latencies)
-            self.health.p95_latency_ms = round(ordered[int(0.95 * (len(ordered) - 1))], 1)
+            # Guard the small-window case: nearest-rank p95 of a nearly
+            # empty window collapses toward the minimum (e.g. n=2 → index
+            # 0), making a degrading link look fast right after a
+            # reconnect. Report the max until the window has some depth.
+            if len(ordered) < 5:
+                self.health.p95_latency_ms = round(ordered[-1], 1)
+            else:
+                self.health.p95_latency_ms = round(ordered[int(0.95 * (len(ordered) - 1))], 1)
 
-        new_state = self._classify(r)
+        new_state = self._classify()
         if new_state != self.health.state:
             log.info("Comms %s -> %s (%.1f%% success)", self.health.state, new_state, self.health.success_pct)
             self.health.state = new_state
 
-    def _classify(self, r: ModbusResult) -> str:
+    def _classify(self) -> str:
         if self.health.consecutive_failures >= 3:
             return "lost"
         if self.health.success_pct < 95 or self.health.consecutive_failures >= 1:

@@ -213,6 +213,15 @@ class SerialModbusClient:
                         last_err = "no_response"
                     elif rr.isError():
                         last_err = f"exc_{getattr(rr, 'exception_code', '?')}"
+                    elif rr.registers is None or len(rr.registers) != count:
+                        # Short/truncated frame. A Lantronix bridge under
+                        # packet fragmentation can return fewer registers
+                        # than requested without isError() being set.
+                        # Treat as a failure so it counts against comms
+                        # health and triggers the fan-out — never accept a
+                        # short read as success (it would zero-extend
+                        # downstream decoding and read "healthy").
+                        last_err = "short_read"
                     else:
                         return ModbusResult.success(rr.registers, (time.perf_counter() - t0) * 1000)
                 except asyncio.TimeoutError:
@@ -367,7 +376,11 @@ class TcpRtuModbusClient:
             ok = bool(await asyncio.wait_for(
                 self._client.connect(), timeout=self.connect_timeout_s,
             ))
-        except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001  (covers asyncio.TimeoutError)
+            # Preserve the underlying cause for diagnostics — collapsing
+            # every reconnect failure to a bare "tcp_disconnected" upstream
+            # hid DNS/refused/SSL distinctions on a flaky bridge.
+            log.debug("reconnect to %s:%d failed: %s", self.host, self.port, e)
             return False
         if ok:
             # Re-apply keepalive on the freshly created socket.
@@ -407,6 +420,12 @@ class TcpRtuModbusClient:
                             last_err = "no_response"
                         elif rr.isError():
                             last_err = f"exc_{getattr(rr, 'exception_code', '?')}"
+                        elif rr.registers is None or len(rr.registers) != count:
+                            # Short/truncated frame (see SerialModbusClient
+                            # for rationale) — fail so it triggers fan-out
+                            # and counts against comms health rather than
+                            # zero-extending the decode.
+                            last_err = "short_read"
                         else:
                             return ModbusResult.success(rr.registers, (time.perf_counter() - t0) * 1000)
                     except asyncio.TimeoutError:

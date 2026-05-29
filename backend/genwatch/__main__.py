@@ -34,6 +34,15 @@ def main() -> int:
             workers=1,  # single worker — Modbus serial is single-master
             ws_ping_interval=20,
             ws_ping_timeout=20,
+            # Trust X-Forwarded-* only from the loopback proxy by default
+            # (Caddy / `tailscale serve` on the same Pi). This pins what was
+            # previously an implicit uvicorn default: a LAN client can no
+            # longer spoof X-Forwarded-Proto to flip the Secure cookie, nor
+            # X-Forwarded-For to forge the rate-limiter / audit source IP.
+            # Widen via GENWATCH_TRUSTED_PROXIES only with a header-
+            # sanitizing proxy you control.
+            proxy_headers=True,
+            forwarded_allow_ips=os.environ.get("GENWATCH_TRUSTED_PROXIES", "127.0.0.1"),
         )
         return 0
 

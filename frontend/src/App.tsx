@@ -1,7 +1,7 @@
 // Top-level app: auth gate, topbar + nav + footer, view switching.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api } from "./api/client";
+import { api, setUnauthorizedHandler } from "./api/client";
 import { BrandMark, Icon, IconButton } from "./components/primitives";
 import { useLiveData } from "./hooks/useLiveData";
 import type { MeBody } from "./types";
@@ -45,6 +45,14 @@ export function App() {
 
   useEffect(() => {
     api.me().then(setAuth).catch(() => setAuth({ authenticated: false }));
+  }, []);
+
+  // A mid-session 401 (token expiry / secret rotation) from any request
+  // forces the UI back to the login screen instead of leaving a stale,
+  // live-looking dashboard. Unmounting Shell also tears down the WS loop.
+  useEffect(() => {
+    setUnauthorizedHandler(() => setAuth({ authenticated: false }));
+    return () => setUnauthorizedHandler(null);
   }, []);
 
   useEffect(() => { applyTheme(theme, false); }, []);

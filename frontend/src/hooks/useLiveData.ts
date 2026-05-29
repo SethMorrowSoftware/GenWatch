@@ -64,7 +64,16 @@ export function useLiveData(): LiveState {
     let cancelled = false;
     let ws: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let stableTimer: ReturnType<typeof setTimeout> | null = null;
     let backoff = 1000;
+
+    const clearTimers = () => {
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      if (stableTimer) { clearTimeout(stableTimer); stableTimer = null; }
+    };
+    const detach = (sock: WebSocket | null) => {
+      if (sock) sock.onopen = sock.onmessage = sock.onclose = sock.onerror = null;
+    };
 
     const seed = async () => {
       try {
@@ -92,16 +101,29 @@ export function useLiveData(): LiveState {
     };
 
     const openWs = () => {
+      // Tear down any previous socket + pending timers first so stale
+      // handlers can't fire setState or schedule a *second* reconnect
+      // (which would multiply sockets on every cycle).
+      clearTimers();
+      detach(ws);
+      try { ws?.close(); } catch { /* already closed */ }
+
       const proto = window.location.protocol === "https:" ? "wss" : "ws";
       const url = `${proto}://${window.location.host}/ws/live`;
-      ws = new WebSocket(url);
+      const sock = new WebSocket(url);
+      ws = sock;
 
-      ws.onopen = () => {
-        backoff = 1000;
+      sock.onopen = () => {
+        if (cancelled || ws !== sock) return;
         setState((cur) => ({ ...cur, wsDown: false }));
+        // Only reset the backoff after the connection has stayed up a
+        // few seconds. Resetting it on open (the old behaviour) let a
+        // half-broken server that accepts then immediately drops every
+        // socket get hammered in a tight 1 s loop forever.
+        stableTimer = setTimeout(() => { backoff = 1000; }, 3000);
       };
-      ws.onmessage = (ev) => {
-        if (cancelled) return;
+      sock.onmessage = (ev) => {
+        if (cancelled || ws !== sock) return;
         let msg: LiveMessage;
         try {
           msg = JSON.parse(ev.data);
@@ -111,19 +133,23 @@ export function useLiveData(): LiveState {
         }
         applyMessage(msg);
       };
-      ws.onclose = () => {
-        if (cancelled) return;
-        // Reconnect with exponential backoff (max 30s). Mark wsDown so
-        // the UI can surface a stale-data warning instead of pretending
-        // the last reading we have is still current.
+      sock.onclose = () => {
+        if (cancelled || ws !== sock) return;
+        if (stableTimer) { clearTimeout(stableTimer); stableTimer = null; }
+        // Mark wsDown so the UI surfaces a stale-data warning instead of
+        // pretending the last reading is still current.
         setState((cur) => ({ ...cur, wsDown: true }));
+        // Backoff with jitter (max 30 s). Grow AFTER capturing this
+        // attempt's wait so successive closes back off 1s, 1.8s, 3.2s…
+        const wait = Math.min(backoff, 30000) + Math.random() * 250;
+        backoff = Math.min(backoff * 1.8, 30000);
         reconnectTimer = setTimeout(() => {
-          backoff = Math.min(backoff * 1.8, 30000);
+          if (cancelled) return;
           setState((cur) => ({ ...cur, reconnects: cur.reconnects + 1 }));
           openWs();
-        }, backoff);
+        }, wait);
       };
-      ws.onerror = () => ws?.close();
+      sock.onerror = () => { try { sock.close(); } catch { /* noop */ } };
     };
 
     const applyMessage = (msg: LiveMessage) => {
@@ -311,8 +337,9 @@ export function useLiveData(): LiveState {
 
     return () => {
       cancelled = true;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      ws?.close();
+      clearTimers();
+      detach(ws);
+      try { ws?.close(); } catch { /* already closed */ }
     };
   }, []);
 
@@ -322,8 +349,12 @@ export function useLiveData(): LiveState {
 function mergeReading(prev: Reading, patch: Partial<Reading>): Reading {
   const out: Reading = { ...EMPTY_READING, ...prev };
   for (const k in patch) {
-    const v = (patch as any)[k];
-    if (v !== null && v !== undefined) (out as any)[k] = v;
+    // Assign even when the value is null. A snapshot reports a field as
+    // null when the sensor dropped out or the poller evicted a stale
+    // last-good value (per-register TTL) — we must clear the displayed
+    // number rather than keep showing a frozen reading forever. Keys
+    // ABSENT from the patch keep their previous value.
+    (out as any)[k] = (patch as any)[k] ?? null;
   }
   return out;
 }

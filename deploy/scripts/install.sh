@@ -198,18 +198,28 @@ fi
 
 if (( build_needed )); then
   log "Building frontend bundle (this can take ~30 s on a Pi 4)"
-  pushd "$REPO_ROOT/frontend" >/dev/null
   # `npm ci` (rather than `npm install`) requires package-lock.json,
   # refuses to write to it, and installs exactly the locked versions
   # — reproducible builds across reinstalls and across customer Pis.
-  # `--ignore-scripts` blocks any pre/postinstall scripts from running
-  # under root (the installer runs as root). Vite, React, and the
-  # TypeScript toolchain are pure-JS at build time and don't need
-  # postinstall hooks; if a future dep does, the build will fail
-  # loudly and we can re-evaluate that specific case.
-  npm ci --no-audit --no-fund --ignore-scripts --silent
-  npm run build
-  popd >/dev/null
+  # `--ignore-scripts` blocks any pre/postinstall lifecycle scripts from
+  # running (the installer is root). The build itself (`npm run build`)
+  # still executes vite/esbuild, so we drop privileges to the invoking
+  # user for the whole step when possible — npm is installed system-wide
+  # by this script, so it's on every user's PATH.
+  if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]] \
+       && sudo -u "$SUDO_USER" sh -c 'command -v npm' >/dev/null 2>&1; then
+    log "Building frontend as $SUDO_USER (build tooling does not run as root)"
+    # A prior root build could leave a root-owned node_modules that blocks
+    # the unprivileged `npm ci` clean — re-own it best-effort first.
+    chown -R "$SUDO_USER" "$REPO_ROOT/frontend/node_modules" 2>/dev/null || true
+    sudo -u "$SUDO_USER" sh -c "cd '$REPO_ROOT/frontend' && npm ci --no-audit --no-fund --ignore-scripts --silent && npm run build"
+  else
+    warn "Building frontend as root — build-time deps run with full privileges. Run install.sh via 'sudo' from your normal user to drop them."
+    pushd "$REPO_ROOT/frontend" >/dev/null
+    npm ci --no-audit --no-fund --ignore-scripts --silent
+    npm run build
+    popd >/dev/null
+  fi
 fi
 
 log "Installing frontend bundle to $UI_DIR"
@@ -229,9 +239,18 @@ fi
 # will pick up the lock automatically).
 if [[ -f "$REPO_ROOT/backend/requirements.lock" ]]; then
   retry "$APP_DIR/venv/bin/pip" install --quiet --require-hashes -r "$REPO_ROOT/backend/requirements.lock"
+elif [[ "${GENWATCH_ALLOW_UNPINNED:-0}" == "1" ]]; then
+  warn "requirements.lock not found — installing UNPINNED from requirements.txt (GENWATCH_ALLOW_UNPINNED=1)."
+  retry "$APP_DIR/venv/bin/pip" install --quiet -r "$REPO_ROOT/backend/requirements.txt"
 else
-  warn "backend/requirements.lock not found — installing from requirements.txt without hash pinning"
-  retry "$APP_DIR/venv/bin/pip" install --quiet --upgrade -r "$REPO_ROOT/backend/requirements.txt"
+  # The lockfile is committed to the repo, so a missing one means a broken
+  # or partial checkout — not a normal state. Refuse rather than silently
+  # install unverified wheels (the exact supply-chain risk the lock
+  # defends against). The previous silent fallback also used --upgrade,
+  # which could drift transitive versions on every re-run.
+  err "backend/requirements.lock not found — refusing to install without hash-pinned dependencies."
+  err "Re-clone the repo (this usually means a partial checkout). To override at your own risk: GENWATCH_ALLOW_UNPINNED=1."
+  exit 1
 fi
 
 log "Copying backend package to $APP_DIR/genwatch"
@@ -298,6 +317,15 @@ systemctl daemon-reload
 # is the documented way to apply system.conf changes without a reboot
 # and is safe to call repeatedly.
 systemctl daemon-reexec || warn "systemctl daemon-reexec failed — HW watchdog will activate on next reboot"
+# Confirm the hardware watchdog actually armed. A silent miss here leaves
+# the top-level "Pi resets on a kernel hang" guarantee inactive until the
+# next reboot — exactly when nobody expects it to be off. RuntimeWatchdogUSec=0
+# means not armed.
+if systemctl show -p RuntimeWatchdogUSec 2>/dev/null | grep -q 'RuntimeWatchdogUSec=0$'; then
+  warn "Hardware watchdog NOT active yet (RuntimeWatchdogUSec=0). Reboot to apply, then verify: systemctl show -p RuntimeWatchdogUSec"
+else
+  log "Hardware watchdog active ($(systemctl show -p RuntimeWatchdogUSec 2>/dev/null || echo '?'))"
+fi
 systemctl enable genwatch.service
 
 # Sanity-check the hardware watchdog is actually present. Absent on

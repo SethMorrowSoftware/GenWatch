@@ -40,8 +40,10 @@ TOKEN_TTL_S = 30
 class ConfirmToken:
     token: str
     operator: str
-    issued_at: float
-    expires_at: float
+    issued_at: float          # wall-clock, for display + audit only
+    expires_at: float         # wall-clock, returned to the client for its countdown
+    expires_monotonic: float  # authoritative expiry — monotonic so an NTP/DST step
+    #                           can't extend (or prematurely void) a live token
 
 
 VERB_TO_CONTROL = {
@@ -106,16 +108,21 @@ class ControlService:
     async def issue_token(self, operator: str) -> ConfirmToken:
         async with self._lock:
             await self._evict_expired_locked()
-            tok = secrets.token_hex(4).upper()  # 8 hex chars to match design
+            # 128-bit token. The confirm code isn't typed by the operator
+            # (the modal fetches and submits it), so there's no UX reason
+            # to keep it short — and a 32-bit code guarding a generator
+            # start/stop is brute-forceable within the 30 s window.
+            tok = secrets.token_hex(16).upper()
             # Avoid collisions
             while tok in self._tokens:
-                tok = secrets.token_hex(4).upper()
+                tok = secrets.token_hex(16).upper()
             now = time.time()
             ct = ConfirmToken(
                 token=tok,
                 operator=operator,
                 issued_at=now,
                 expires_at=now + TOKEN_TTL_S,
+                expires_monotonic=time.monotonic() + TOKEN_TTL_S,
             )
             self._tokens[tok] = ct
             self.db.write_audit(operator, "control.issue_token", "", tok, "ok")
@@ -141,7 +148,7 @@ class ControlService:
         if ct is None:
             self.db.write_audit(operator, "control.consume_token", "missing", token, "denied")
             raise ControlError("token_invalid", "Invalid or expired confirm token", 400)
-        if ct.expires_at < time.time():
+        if ct.expires_monotonic < time.monotonic():
             self.db.write_audit(operator, "control.consume_token", "expired", token, "denied")
             raise ControlError("token_expired", "Confirm token expired (>30s)", 400)
         if ct.operator != operator:
@@ -151,9 +158,9 @@ class ControlService:
 
     async def _evict_expired_locked(self) -> None:
         """Caller MUST hold self._lock — does not acquire it itself."""
-        now = time.time()
+        mono = time.monotonic()
         for t, ct in list(self._tokens.items()):
-            if ct.expires_at < now:
+            if ct.expires_monotonic < mono:
                 self._tokens.pop(t, None)
                 self.db.write_audit(ct.operator, "control.evict_token", "ttl", t, "expired")
 
