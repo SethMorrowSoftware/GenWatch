@@ -418,6 +418,12 @@ async def lifespan(app: FastAPI):
         # A simple `poller.is_running` flag isn't enough: a deadlocked
         # poll task keeps the flag True while telemetry freezes.
         stale_after = max(10.0, (regmap.prime_poll_ms / 1000.0) * 6.0)
+        # Tick at ~WatchdogSec/4 (half the systemd-recommended interval)
+        # rather than WatchdogSec/2. On a busy Pi an SD-card fsync stall
+        # can swallow a tick; the tighter cadence leaves several missed
+        # ticks of margin before WatchdogSec elapses and SIGKILLs us,
+        # avoiding spurious restarts.
+        tick = max(1.0, interval / 2.0)
         # service_start_mono is captured at the top of lifespan so the
         # cold-start grace is measured from the actual service start,
         # not from after poller/client startup completes (which could
@@ -428,14 +434,14 @@ async def lifespan(app: FastAPI):
             log.info(
                 "sd_notify watchdog ticker every %.1fs "
                 "(stale_after=%.1fs, cold_start_grace=%.0fs)",
-                interval, stale_after, notify.WATCHDOG_COLD_START_GRACE_S,
+                tick, stale_after, notify.WATCHDOG_COLD_START_GRACE_S,
             )
             # Track regime so we only log on transitions instead of
             # spamming the journal every interval while withholding.
             withholding = False
             while True:
                 try:
-                    await asyncio.sleep(interval)
+                    await asyncio.sleep(tick)
                 except asyncio.CancelledError:
                     return
                 if not poller.is_running:
@@ -483,6 +489,7 @@ async def lifespan(app: FastAPI):
         await slack.stop()
         await client.close()
         db.write_event("info", "BOOT", "Castle Generator Monitor stopped", None)
+        db.close()
 
 
 async def _forward_to_slack(slack: SlackNotifier, evt: dict) -> None:

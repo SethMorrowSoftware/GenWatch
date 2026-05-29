@@ -294,12 +294,27 @@ class SlackNotifier:
         if not self.is_enabled():
             return
         blocks = _build_blocks(severity=severity, title=title, fields=fields)
+        msg = _PendingMessage(blocks=blocks, fallback=fallback, enqueued_at=time.time())
         try:
-            self._queue.put_nowait(
-                _PendingMessage(blocks=blocks, fallback=fallback, enqueued_at=time.time())
-            )
+            self._queue.put_nowait(msg)
         except asyncio.QueueFull:
-            log.warning("Slack queue full — dropping notification: %s", fallback)
+            # Prefer FRESH alerts over a stale backlog. Under a sustained
+            # Slack outage the queue fills with old retried messages;
+            # dropping the *newest* (the previous behaviour) meant the most
+            # actionable alarm was the one thrown away, and because the
+            # dedupe timestamp was already recorded, its immediate retry
+            # was suppressed too. Evict the oldest to make room so the new
+            # alert (whose dedupe we just recorded) actually gets queued.
+            try:
+                dropped = self._queue.get_nowait()
+                log.warning("Slack queue full — evicted oldest (%s) to enqueue %s",
+                            dropped.fallback, fallback)
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                self._queue.put_nowait(msg)
+            except asyncio.QueueFull:
+                log.warning("Slack queue full — dropping notification: %s", fallback)
 
     async def _worker(self) -> None:
         while self._running:

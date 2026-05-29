@@ -9,9 +9,19 @@ Schema goals:
   - WAL journal mode for crash safety + concurrent reads while writes
     are queued.
 
-We use the stdlib sqlite3 driver in a single dedicated thread executor
-to keep the FastAPI event loop responsive. Connections are cheap to
-re-open per call but we keep one writer + one reader open for reuse.
+Concurrency model:
+  - ONE persistent write connection (check_same_thread=False) reused for
+    every mutation, serialized by a process-wide RLock. This avoids the
+    per-write open/close churn (each close ran a WAL checkpoint) that
+    dominated write cost and could stall the event loop.
+  - Reads use their own short-lived connections and do NOT take the write
+    lock — WAL allows concurrent readers, so /api/status, history, and
+    events queries don't serialize behind a write or a retention prune.
+  - Telemetry and retention writes are dispatched off the event loop via
+    asyncio.to_thread; the remaining (sparse) event/alarm/audit writes go
+    straight to the persistent connection, which keeps them cheap.
+  - A periodic wal_checkpoint(TRUNCATE) (from the retention tick) bounds
+    WAL growth on the SD card.
 """
 from __future__ import annotations
 
@@ -77,6 +87,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_events_sev ON events(severity, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_events_type_ts ON events(type, ts DESC);
 
 CREATE TABLE IF NOT EXISTS alarms_active (
     code        TEXT    PRIMARY KEY,
@@ -125,16 +136,36 @@ COLUMN_MAP = {
 
 ALL_COLUMNS = ["ts"] + list(COLUMN_MAP.values()) + ["state", "alarm_raw"]
 
+# Which averaged columns each rollup tier carries (see SCHEMA). Used by
+# read_telemetry to pick the coarsest tier that actually has the metric,
+# and to keep the dynamically-built column name confined to a known set.
+ROLLUP_1M_AVG_COLS = {"rpm", "hz", "kw", "oil_p", "cool_t", "batt", "v_ab", "i_a"}
+ROLLUP_1H_AVG_COLS = {"rpm", "hz", "kw", "oil_p", "cool_t", "batt"}
+RAW_TIER_MAX_SPAN_S = 6 * 3600        # <= 6h → raw samples
+ROLLUP_1M_MAX_SPAN_S = 14 * 86400     # <= 14d → 1-minute rollup
+
 
 class Database:
     def __init__(self, path: Path | str):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._wlock = threading.RLock()
+        self._closed = False
+        # One persistent write connection reused for every mutation. The
+        # previous per-call open/close churned a connection (+5 PRAGMAs +
+        # a WAL checkpoint on close) on EVERY write — far more expensive
+        # than the INSERT itself, and the close-checkpoint is what could
+        # stall the loop. check_same_thread=False + _wlock lets the event
+        # loop, the to_thread telemetry/retention workers, and the control
+        # path share it safely (serialized by the lock).
+        self._wconn = self._connect(check_same_thread=False)
         self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
-        c = sqlite3.connect(self.path, isolation_level=None, timeout=10)
+    def _connect(self, check_same_thread: bool = True) -> sqlite3.Connection:
+        c = sqlite3.connect(
+            self.path, isolation_level=None, timeout=10,
+            check_same_thread=check_same_thread,
+        )
         c.row_factory = sqlite3.Row
         c.execute("PRAGMA journal_mode=WAL")
         # synchronous=FULL: in WAL mode this fsyncs the WAL on every
@@ -150,17 +181,46 @@ class Database:
         return c
 
     def _init_schema(self) -> None:
-        with self._wlock, self._connect() as c:
-            c.executescript(SCHEMA)
+        with self._wlock:
+            self._wconn.executescript(SCHEMA)
 
     @contextmanager
     def _writer(self):
+        """Serialized access to the single persistent write connection."""
         with self._wlock:
-            c = self._connect()
-            try:
-                yield c
-            finally:
-                c.close()
+            yield self._wconn
+
+    @contextmanager
+    def _reader(self):
+        """A short-lived read connection that does NOT take the write
+        lock. WAL permits concurrent readers, so reads never serialize
+        behind a write or a multi-thousand-row retention prune."""
+        c = sqlite3.connect(self.path, isolation_level=None, timeout=10)
+        c.row_factory = sqlite3.Row
+        try:
+            yield c
+        finally:
+            c.close()
+
+    def close(self) -> None:
+        """Close the persistent write connection (clean shutdown)."""
+        with self._wlock:
+            if not self._closed:
+                try:
+                    self._wconn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._closed = True
+
+    def checkpoint(self) -> None:
+        """Truncate the WAL so it can't grow unbounded on the SD card.
+        Best-effort — a busy checkpoint (a reader holding a lock) just
+        defers to the next retention tick rather than erroring."""
+        try:
+            with self._writer() as c:
+                c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception as e:  # noqa: BLE001
+            log.debug("wal checkpoint deferred: %s", e)
 
     # ─── telemetry ─────────────────────────────────────────────────────
     def write_telemetry(self, ts: float, values: dict, state: str, alarm_raw: int) -> None:
@@ -183,22 +243,36 @@ class Database:
         to_ts: float,
         max_points: int = 2000,
     ) -> list[tuple[float, float]]:
-        if metric not in COLUMN_MAP.values() and metric not in ("state",):
+        if metric not in COLUMN_MAP.values() and metric != "state":
             raise ValueError(f"unknown metric {metric!r}")
-        # Decide resolution: if the raw range is small enough, return raw;
-        # otherwise use the 1-min rollup to keep the payload bounded.
+        # Pick the coarsest tier that (a) bounds the payload for the span
+        # and (b) actually carries this metric. `state` and metrics not in
+        # a rollup tier always fall back to raw. The column name is only
+        # ever a member of the validated COLUMN_MAP / rollup sets, so the
+        # f-string interpolation can't carry untrusted input.
         span = max(1.0, to_ts - from_ts)
-        if span <= 6 * 3600:
-            # raw, optionally decimated
+        if metric == "state" or span <= RAW_TIER_MAX_SPAN_S:
             sql = "SELECT ts, " + metric + " FROM telemetry WHERE ts >= ? AND ts <= ? ORDER BY ts"
-            with self._writer() as c:
-                rows = c.execute(sql, (from_ts, to_ts)).fetchall()
+            params: tuple = (from_ts, to_ts)
+        elif span <= ROLLUP_1M_MAX_SPAN_S and metric in ROLLUP_1M_AVG_COLS:
+            sql = f"SELECT ts, {metric}_avg FROM telemetry_1m WHERE ts >= ? AND ts <= ? ORDER BY ts"
+            params = (int(from_ts), int(to_ts))
+        elif metric in ROLLUP_1H_AVG_COLS:
+            # Long span: use the hourly rollup (retained ~2 years) so a
+            # multi-month query returns data instead of nothing once the
+            # 1-minute rollup (90 d) has been pruned.
+            sql = f"SELECT ts, {metric}_avg FROM telemetry_1h WHERE ts >= ? AND ts <= ? ORDER BY ts"
+            params = (int(from_ts), int(to_ts))
+        elif metric in ROLLUP_1M_AVG_COLS:
+            # Long span but the metric is only rolled up at 1-minute
+            # granularity — use it (sparse past the 1m horizon).
+            sql = f"SELECT ts, {metric}_avg FROM telemetry_1m WHERE ts >= ? AND ts <= ? ORDER BY ts"
+            params = (int(from_ts), int(to_ts))
         else:
-            # 1-min rollup avg column
-            col = metric + "_avg"
-            sql = f"SELECT ts, {col} FROM telemetry_1m WHERE ts >= ? AND ts <= ? ORDER BY ts"
-            with self._writer() as c:
-                rows = c.execute(sql, (int(from_ts), int(to_ts))).fetchall()
+            sql = "SELECT ts, " + metric + " FROM telemetry WHERE ts >= ? AND ts <= ? ORDER BY ts"
+            params = (from_ts, to_ts)
+        with self._reader() as c:
+            rows = c.execute(sql, params).fetchall()
 
         # decimate
         if len(rows) > max_points:
@@ -208,29 +282,43 @@ class Database:
 
     def telemetry_latest(self) -> dict | None:
         sql = f"SELECT {','.join(ALL_COLUMNS)} FROM telemetry ORDER BY ts DESC LIMIT 1"
-        with self._writer() as c:
+        with self._reader() as c:
             r = c.execute(sql).fetchone()
         return dict(r) if r else None
 
-    def prune_raw_telemetry(self, older_than_ts: float) -> int:
-        with self._writer() as c:
-            cur = c.execute("DELETE FROM telemetry WHERE ts < ?", (older_than_ts,))
-            return cur.rowcount or 0
+    def _prune_chunked(self, table: str, older_than_ts, chunk: int, extra: str = "") -> int:
+        """Delete rows older than ts in bounded chunks, releasing the write
+        lock between each so a large prune can't hold off live writes or
+        reads for the whole delete. `table`/`extra` are internal constants,
+        never user input."""
+        total = 0
+        while True:
+            with self._writer() as c:
+                cur = c.execute(
+                    f"DELETE FROM {table} WHERE rowid IN "
+                    f"(SELECT rowid FROM {table} WHERE ts < ?{extra} LIMIT ?)",
+                    (older_than_ts, chunk),
+                )
+                n = cur.rowcount or 0
+            total += n
+            if n < chunk:
+                return total
 
-    def prune_rollup_1m(self, older_than_ts: float) -> int:
-        with self._writer() as c:
-            cur = c.execute("DELETE FROM telemetry_1m WHERE ts < ?", (int(older_than_ts),))
-            return cur.rowcount or 0
+    def prune_raw_telemetry(self, older_than_ts: float, chunk: int = 5000) -> int:
+        return self._prune_chunked("telemetry", older_than_ts, chunk)
 
-    def prune_events(self, older_than_ts: float) -> int:
+    def prune_rollup_1m(self, older_than_ts: float, chunk: int = 5000) -> int:
+        return self._prune_chunked("telemetry_1m", int(older_than_ts), chunk)
+
+    def prune_rollup_1h(self, older_than_ts: float, chunk: int = 5000) -> int:
+        return self._prune_chunked("telemetry_1h", int(older_than_ts), chunk)
+
+    def prune_events(self, older_than_ts: float, chunk: int = 5000) -> int:
         """Prune info/ok events older than ts. Alarms and warnings are
         always kept for forensic review."""
-        with self._writer() as c:
-            cur = c.execute(
-                "DELETE FROM events WHERE ts < ? AND severity IN ('info', 'ok')",
-                (older_than_ts,),
-            )
-            return cur.rowcount or 0
+        return self._prune_chunked(
+            "events", older_than_ts, chunk, extra=" AND severity IN ('info','ok')"
+        )
 
     def aggregate_rollup_1m(self, from_ts: float, to_ts: float) -> int:
         """Aggregate raw telemetry into 1-minute buckets in the half-open
@@ -259,6 +347,35 @@ class Database:
         """
         with self._writer() as c:
             cur = c.execute(sql, (from_ts, to_ts))
+            return cur.rowcount or 0
+
+    def aggregate_rollup_1h(self, from_ts: float, to_ts: float) -> int:
+        """Aggregate 1-minute rollups into 1-hour buckets in [from_ts, to_ts).
+
+        Sourced from telemetry_1m (which is retained ~90 d, far longer than
+        raw's 7 d) so hourly history survives well past the raw window —
+        without this, all history older than the 1m horizon was silently
+        lost despite the schema/config advertising ~2 years. Idempotent via
+        INSERT OR REPLACE. kwh = Σ(minute kW averages)/60; runtime_s is not
+        derivable from the 1m rollup and is left 0.
+        """
+        sql = """
+            INSERT OR REPLACE INTO telemetry_1h
+                (ts, rpm_avg, hz_avg, kw_avg, oil_p_avg, cool_t_avg, batt_avg,
+                 samples, runtime_s, kwh)
+            SELECT
+                CAST(ts/3600 AS INTEGER)*3600,
+                AVG(rpm_avg), AVG(hz_avg), AVG(kw_avg),
+                AVG(oil_p_avg), AVG(cool_t_avg), AVG(batt_avg),
+                COALESCE(SUM(samples), 0),
+                0,
+                COALESCE(SUM(kw_avg), 0.0) / 60.0
+            FROM telemetry_1m
+            WHERE ts >= ? AND ts < ?
+            GROUP BY CAST(ts/3600 AS INTEGER)
+        """
+        with self._writer() as c:
+            cur = c.execute(sql, (int(from_ts), int(to_ts)))
             return cur.rowcount or 0
 
     # ─── events ────────────────────────────────────────────────────────
@@ -296,7 +413,7 @@ class Database:
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         sql = f"SELECT id, ts, severity, type, message, meta FROM events {where} ORDER BY ts DESC LIMIT ?"
         args.append(limit)
-        with self._writer() as c:
+        with self._reader() as c:
             rows = c.execute(sql, args).fetchall()
         return [dict(r) for r in rows]
 
@@ -316,7 +433,7 @@ class Database:
             return (cur.rowcount or 0) > 0
 
     def active_alarms(self) -> list[dict]:
-        with self._writer() as c:
+        with self._reader() as c:
             rows = c.execute(
                 "SELECT code, desc, severity, raised_at, raw FROM alarms_active ORDER BY raised_at DESC"
             ).fetchall()
@@ -335,7 +452,7 @@ class Database:
         event stream. The state-machine writes a "→ cranking" event on
         every transition into cranking, so this is the canonical count.
         """
-        with self._writer() as c:
+        with self._reader() as c:
             row = c.execute(
                 "SELECT COUNT(*) AS n FROM events "
                 "WHERE type = 'TRANSITION' AND message LIKE '%→ cranking%'"
@@ -349,7 +466,7 @@ class Database:
         contact register on this map, so this is our best proxy for
         when the load was last on the generator.
         """
-        with self._writer() as c:
+        with self._reader() as c:
             row = c.execute(
                 "SELECT ts, message FROM events "
                 "WHERE type = 'TRANSITION' AND message LIKE '%→ running%' "
@@ -359,7 +476,7 @@ class Database:
 
     def count_transfers_since(self, since_ts: float) -> int:
         """Count transitions into 'running' since `since_ts` (unix seconds)."""
-        with self._writer() as c:
+        with self._reader() as c:
             row = c.execute(
                 "SELECT COUNT(*) AS n FROM events "
                 "WHERE type = 'TRANSITION' AND message LIKE '%→ running%' "
@@ -374,7 +491,7 @@ class Database:
         Used by the Live view's "Last alarm" line so it remains useful
         when no alarms are currently active.
         """
-        with self._writer() as c:
+        with self._reader() as c:
             row = c.execute(
                 "SELECT ts, severity, message, meta FROM events "
                 "WHERE type = 'ALARM' AND severity IN ('warn', 'alarm') "
@@ -399,7 +516,7 @@ class Database:
 
     # ─── kv ────────────────────────────────────────────────────────────
     def kv_get(self, key: str) -> str | None:
-        with self._writer() as c:
+        with self._reader() as c:
             r = c.execute("SELECT v FROM kv WHERE k = ?", (key,)).fetchone()
         return r["v"] if r else None
 

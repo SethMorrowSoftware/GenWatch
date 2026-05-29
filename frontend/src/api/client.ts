@@ -21,6 +21,15 @@ export class ApiError extends Error {
   }
 }
 
+// Global hook fired when any non-login request comes back 401 — lets the
+// app drop the operator back to the login screen on a mid-session expiry
+// (or secret rotation) instead of leaving a frozen, live-looking
+// dashboard. App registers this; null when unmounted.
+let unauthorizedHandler: (() => void) | null = null;
+export function setUnauthorizedHandler(fn: (() => void) | null) {
+  unauthorizedHandler = fn;
+}
+
 async function request<T>(
   path: string,
   init: RequestInit = {}
@@ -41,7 +50,22 @@ async function request<T>(
     ...init,
   });
   const text = await res.text();
-  const data = text ? (JSON.parse(text) as unknown) : null;
+  let data: unknown = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      // Non-JSON body — e.g. an HTML 502/504 page from a reverse proxy.
+      // Keep the raw text as the body so the caller still sees a typed
+      // ApiError WITH the real status, not a raw SyntaxError.
+      data = text;
+    }
+  }
+  // A 401 on anything other than the login attempt itself means the
+  // session lapsed — surface it globally so the UI returns to login.
+  if (res.status === 401 && path !== "/api/auth/login") {
+    unauthorizedHandler?.();
+  }
   if (!res.ok) throw new ApiError(res.status, data);
   return data as T;
 }

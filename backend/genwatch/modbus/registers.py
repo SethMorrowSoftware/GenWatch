@@ -19,7 +19,7 @@ from typing import Literal
 
 import yaml
 
-RegType = Literal["u16", "s16", "u32", "s32", "bitfld", "enum"]
+RegType = Literal["u16", "s16", "u32", "u32_lo", "s32", "bitfld", "enum"]
 RegTier = Literal["prime", "base"]
 
 
@@ -39,7 +39,7 @@ class RegisterDef:
     @property
     def words(self) -> int:
         """How many 16-bit registers this definition consumes."""
-        return 2 if self.type in ("u32", "s32") else 1
+        return 2 if self.type in ("u32", "u32_lo", "s32") else 1
 
 
 @dataclass(frozen=True)
@@ -457,6 +457,18 @@ def decode_value(reg: RegisterDef, words: list[int]) -> float | int | None:
         # Big-endian (Modbus default); high word first
         hi, lo = words[0] & 0xFFFF, words[1] & 0xFFFF
         v = (hi << 16) | lo
+    elif reg.type == "u32_lo":
+        # 16-bit value carried in the LOW word of a 2-register slot; the
+        # high word is reserved (documented zero on the H-100). Read only
+        # the low word so a framing slip that leaves garbage in the high
+        # word can't blow the value up by ~65536× into the UI or a
+        # cross-check. Contrast `u32`, which honours both words for
+        # genuine 32-bit counters (e.g. run_hours). When the high word is
+        # actually zero — the documented normal case — this is byte-for-
+        # byte identical to the old u32 decode, so it's a safe migration.
+        if len(words) < 2:
+            return None
+        v = words[1] & 0xFFFF
     elif reg.type == "s32":
         if len(words) < 2:
             return None
