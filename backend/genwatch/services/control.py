@@ -193,6 +193,28 @@ class ControlService:
                     500,
                 )
 
+            # Freshness gate (defense in depth). engine_state is pinned to
+            # its last value across a comms outage (services/state.py keeps
+            # the last-known state rather than downgrading to 'unknown'),
+            # and panel_mode reads from cached register values until they
+            # age out — so without this, an operator (or a stale browser
+            # tab) could pass the state-validity and panel-AUTO gates below
+            # against minutes-old data and fire a start/stop the H-100
+            # would silently drop. If the link is LOST we cannot confirm
+            # live engine state or key-switch position, so refuse outright.
+            comms_state = getattr(self.state.snap.comms, "state", "lost")
+            if comms_state == "lost":
+                self.db.write_audit(
+                    operator, f"control.{verb}", f"comms={comms_state}", token, "denied"
+                )
+                raise ControlError(
+                    "comms_lost",
+                    f"cannot {verb}: H-100 communication is LOST — live engine "
+                    f"state and panel position can't be confirmed. Restore the "
+                    f"link (run `genwatch doctor`) before issuing remote commands.",
+                    409,
+                )
+
             # Panel key-switch gate. The H-100 ignores remote writes
             # unless the front-panel key is in AUTO; surfacing this
             # server-side turns the failure mode from "silent no-op at

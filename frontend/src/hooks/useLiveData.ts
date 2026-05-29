@@ -131,10 +131,14 @@ export function useLiveData(): LiveState {
         if (!cur.status) return cur;
         let s: StatusBody = cur.status;
         let history = historyRef.current;
-        // Any inbound message proves the WS is delivering — keep the
-        // freshness clock on `Date.now()` (client wall clock) so the
-        // stale check can't be fooled by a controller clock that drifts.
-        const lastPushAt = Date.now();
+        // Freshness clock: only a `snapshot` or `transition` proves the
+        // H-100 poll loop actually produced fresh data this tick. Keepalive
+        // `ping`s — and `hello`/`event`/`ats-*` diagnostics — must NOT
+        // reset it; otherwise a frozen poll loop whose WebSocket keeps
+        // pinging would hold off the STALE badge and keep control buttons
+        // enabled against stale numbers. Bumped to the client wall clock
+        // (drift-immune vs the controller's clock) only in those cases.
+        let lastPushAt = cur.lastPushAt;
         // Panel freshness is a SEPARATE clock: only refreshed when a
         // snapshot actually carries the `panel` block. Without this,
         // a backend that drops `panel` from its snapshots (older
@@ -146,6 +150,7 @@ export function useLiveData(): LiveState {
 
         switch (msg.type) {
           case "snapshot": {
+            lastPushAt = Date.now();
             if (msg.panel) {
               panelLastSeenAt = Date.now();
             }
@@ -186,6 +191,7 @@ export function useLiveData(): LiveState {
             break;
           }
           case "transition": {
+            lastPushAt = Date.now();
             s = { ...s, state: msg.to, stateStartedAt: msg.ts, timeInState: 0 };
             break;
           }
