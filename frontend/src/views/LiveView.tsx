@@ -3,13 +3,16 @@
 import { useEffect, useState } from "react";
 import { api } from "../api/client";
 import { Card, EmptyState, Icon, LiveTick, Pill, Sparkline, fmt, formatTimeInState } from "../components/primitives";
-import type { ActiveAlarm, AtsMode, EngineState, EventRow, LoadSource, Reading, StatusBody } from "../types";
-import { ConfirmModal } from "./ConfirmModal";
+import type { ActiveAlarm, AtsBlock, AtsMode, EngineState, EventRow, LoadSource, Reading, Role, StatusBody } from "../types";
+import { ConfirmModal, type ConfirmCmd } from "./ConfirmModal";
 
 interface Props {
   status: StatusBody;
   history: Reading[];
   operator: string;
+  // Operator's role — gates admin-only ATS commands (force-transfer) in
+  // the UI. The backend enforces the same gate server-side regardless.
+  role: Role;
   // True when the live link is stale: WebSocket down OR no push received
   // within ~3 prime intervals. Plumbed in from App so ControlsPanel can
   // block remote commands — issuing Stop based on a frozen "running"
@@ -76,8 +79,8 @@ const STATE_BADGE: Record<EngineState, string> = {
   unknown: "—",
 };
 
-export function LiveView({ status, history, operator, stale, panelStale }: Props) {
-  const [confirmCmd, setConfirmCmd] = useState<"start" | "stop" | "exercise" | "transfer" | null>(null);
+export function LiveView({ status, history, operator, role, stale, panelStale }: Props) {
+  const [confirmCmd, setConfirmCmd] = useState<ConfirmCmd | null>(null);
 
   const reading = status.reading;
   const alarm: ActiveAlarm | undefined = status.activeAlarms[0];
@@ -107,13 +110,13 @@ export function LiveView({ status, history, operator, stale, panelStale }: Props
       <StatusHero status={status} history={history} />
 
       <div className="row-ats" style={{ marginTop: "var(--gap)" }}>
-        <AtsCard status={status} />
+        <AtsCard status={status} role={role} onCommand={setConfirmCmd} stale={stale} />
         <ControlsPanel
           state={status.state}
           panelMode={status.panel.mode}
           stale={stale}
           panelStale={panelStale}
-          onCommand={setConfirmCmd}
+          onCommand={(v) => setConfirmCmd({ kind: v })}
         />
       </div>
 
@@ -257,7 +260,12 @@ function LoadRing({ pct, kw, ratingKw }: { pct: number; kw: number | null; ratin
 }
 
 // ─── ATS card (separate from hero) ───────────────────────────────────────
-function AtsCard({ status }: { status: StatusBody }) {
+function AtsCard({ status, role, onCommand, stale }: {
+  status: StatusBody;
+  role: Role;
+  onCommand: (cmd: ConfirmCmd) => void;
+  stale: boolean;
+}) {
   // Drive the diagram from the load-source classifier rather than the
   // legacy boolean — this keeps the visualization accurate during
   // quiet-test exercises (engine running, load still on utility) and
@@ -428,24 +436,13 @@ function AtsCard({ status }: { status: StatusBody }) {
             {ats.faultCodes.map((c) => (
               <Pill key={c} tone="warn">{c.replace(/^ATS_PI_/, "")}</Pill>
             ))}
-            {/* Set commissioning-day expectations: the ATS-Pi ICD §6
-                command set (Test / Inhibit / Force Transfer / Bypass
-                Delay) is wired in the register map and read-back, but
-                Phase 1 ships GenWatch's consumer read-only. Operators
-                expecting a "Test transfer" button on this card need
-                to know it's intentional, not a broken/missing UI. */}
-            <span
-              title={
-                "Phase 1 of the ATS-Pi integration is read-only. Test, "
-                + "Inhibit, Force Transfer and Bypass Delay commands "
-                + "(ICD §6) ship in Phase 3."
-              }
-              style={{ display: "inline-flex" }}
-            >
-              <Pill tone="info">Read-only · commands in Phase 3</Pill>
-            </span>
           </div>
         )}
+
+        {/* ATS command row (Phase 3, ICD §6). Two-step confirm-token
+            gated; disabled unless the ATS-Pi link is authoritative.
+            Force Transfer is admin-only (also enforced server-side). */}
+        {ats && <AtsControls ats={ats} role={role} stale={stale} onCommand={onCommand} />}
 
         <div className="ats-grid">
           <div className="ats-stat">
@@ -465,6 +462,56 @@ function AtsCard({ status }: { status: StatusBody }) {
         </div>
       </div>
     </Card>
+  );
+}
+
+function AtsControls({ ats, role, stale, onCommand }: {
+  ats: Extract<AtsBlock, { enabled: true }>;
+  role: Role;
+  stale: boolean;
+  onCommand: (cmd: ConfirmCmd) => void;
+}) {
+  // Gate on the ATS link being authoritative (comms healthy + ICD/unit
+  // match) and the overall UI not being stale (a dead WS freezes the
+  // snapshot these flags come from). Mirrors the backend, which returns
+  // 502/409 when not authoritative.
+  const linkOk = !stale && ats.authoritative && ats.comms.state !== "lost";
+  const isAdmin = role === "admin";
+  const inhibitOn = ats.cmdInhibitActive;
+  const forceOn = ats.cmdForceTransferActive;
+  const linkHint = !linkOk
+    ? "ATS-Pi link is not authoritative — commands are disabled until it recovers."
+    : undefined;
+  const btn = (active: boolean) =>
+    `btn ${active ? "btn-danger" : "btn-ghost"}`;
+  const sz = { fontSize: 12, padding: "6px 11px" } as const;
+  return (
+    <div className="ats-controls" style={{ display: "flex", gap: 8, flexWrap: "wrap", padding: "2px 4px 12px" }}>
+      <button className="btn btn-ghost" style={sz} disabled={!linkOk} title={linkHint}
+              onClick={() => onCommand({ kind: "ats_test" })}>
+        Test
+      </button>
+      <button className={btn(inhibitOn)} style={sz} disabled={!linkOk} title={linkHint}
+              onClick={() => onCommand({ kind: "ats_inhibit", assert: !inhibitOn })}>
+        {inhibitOn ? "Release Inhibit" : "Inhibit"}
+      </button>
+      <button className={btn(forceOn)} style={sz}
+              disabled={!linkOk || !isAdmin}
+              title={!isAdmin ? "Force Transfer requires the admin role." : linkHint}
+              onClick={() => onCommand({
+                kind: "ats_force_transfer",
+                assert: !forceOn,
+                // Override is needed only when ASSERTING while utility is
+                // still available; the modal surfaces the warning copy.
+                override: !forceOn && ats.normalAvailable === true,
+              })}>
+        {forceOn ? "Release Force" : "Force Transfer"}
+      </button>
+      <button className="btn btn-ghost" style={sz} disabled={!linkOk} title={linkHint}
+              onClick={() => onCommand({ kind: "ats_bypass_delay" })}>
+        Bypass Delay
+      </button>
+    </div>
   );
 }
 
@@ -488,25 +535,54 @@ function ModeChip({ mode }: { mode: AtsMode }) {
 
 // ─── Alarm strip ──────────────────────────────────────────────────────────
 function AlarmStrip({ alarm }: { alarm: ActiveAlarm }) {
-  const [ack, setAck] = useState(false);
+  // `submitting` is true ONLY while the ack request is in flight — we no
+  // longer optimistically flip to "Acknowledged" before the controller
+  // has actually been written. On success the row disappears when the
+  // alarm-cleared WS message / next snapshot drops it from activeAlarms;
+  // until then the operator still sees the alarm (correct — it's still
+  // latched). Failures (e.g. 502 "Modbus ack write failed", or a
+  // local-only clear with hw_ack=false) surface inline so the operator
+  // never believes a still-latched alarm was cleared.
+  const [submitting, setSubmitting] = useState(false);
+  const [ackError, setAckError] = useState<string | null>(null);
   const onAck = async () => {
-    setAck(true);
+    setSubmitting(true);
+    setAckError(null);
     try {
-      await api.ackAlarm(alarm.code);
-    } catch (e) {
-      setAck(false);
+      const res = await api.ackAlarm(alarm.code);
+      if (!res.hw_ack) {
+        setAckError(
+          "Cleared locally, but the controller was not written (no ack control mapped) — "
+          + "the panel may still be latched; acknowledge at the H-100."
+        );
+      }
+    } catch (e: any) {
+      const detail = e?.body?.detail;
+      const msg =
+        detail?.message ??
+        (typeof detail === "string" ? detail : null) ??
+        e?.message ??
+        "Acknowledge failed — the controller may still be latched.";
+      setAckError(msg);
+    } finally {
+      setSubmitting(false);
     }
   };
   const ago = Math.floor((Date.now() / 1000 - alarm.raised_at));
   const agoStr = `${Math.floor(ago / 60)}m ${ago % 60}s`;
   return (
-    <div className="alarm-strip" role="alert" style={{ marginBottom: "var(--gap)" }}>
+    <div className="alarm-strip" role="alert" style={{ marginBottom: "var(--gap)", flexWrap: "wrap" }}>
       <span className="led" />
       <strong>Active alarm</strong>
       <span>{alarm.desc} · raised {agoStr} ago</span>
-      <button className="btn btn-danger" disabled={ack} onClick={onAck}>
-        {ack ? "Acknowledged" : "Acknowledge"}
+      <button className="btn btn-danger" disabled={submitting} onClick={onAck}>
+        {submitting ? "Acknowledging…" : "Acknowledge"}
       </button>
+      {ackError && (
+        <span style={{ flexBasis: "100%", marginTop: 6, color: "var(--red)", fontSize: 12.5, fontWeight: 600 }}>
+          {ackError}
+        </span>
+      )}
     </div>
   );
 }
@@ -681,6 +757,12 @@ function EngineMetric({ label, value, unit, sparkPoints, color, warnRange, numer
 }
 
 // ─── Controls panel ──────────────────────────────────────────────────────
+// Engine states from which Remote Stop is valid. Keep in lockstep with
+// backend ALLOWED["stop"] in services/control.py.
+const STOPPABLE_STATES = new Set<EngineState>([
+  "running", "exercising", "cranking", "cooling", "alarm",
+]);
+
 function ControlsPanel({ state, panelMode, stale, panelStale, onCommand }: {
   state: EngineState;
   panelMode: "auto" | "manual" | "off" | "unknown";
@@ -718,7 +800,11 @@ function ControlsPanel({ state, panelMode, stale, panelStale, onCommand }: {
   const linkOk = !stale;
   const panelOk = panelMode === "auto" && !panelStale;
   const canStart = linkOk && panelOk && state === "stopped";
-  const canStop = linkOk && panelOk && (state === "running" || state === "exercising" || state === "cranking");
+  // Mirror backend ALLOWED["stop"] (services/control.py) exactly — it
+  // permits stop from cooling and alarm too. A narrower client set left
+  // the operator with no remote Stop during an alarm shutdown or
+  // cool-down, even though the controller would accept it.
+  const canStop = linkOk && panelOk && STOPPABLE_STATES.has(state);
   const canExercise = linkOk && panelOk && state === "stopped";
   const canTransfer = linkOk && panelOk && state === "running";
 

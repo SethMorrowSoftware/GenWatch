@@ -26,6 +26,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__, config as cfgmod
+from .api import ats as ats_routes
 from .api import auth as auth_routes
 from .api import control as control_routes
 from .api import events as events_routes
@@ -39,6 +40,7 @@ from .modbus.poller import Poller
 from .modbus.registers import load_register_map
 from .services import notify
 from .services.ats import AtsService
+from .services.ats_control import AtsControlService
 from .services.control import ControlService
 from .services.ratelimit import RateLimiter
 from .services.retention import RetentionService
@@ -67,27 +69,58 @@ async def lifespan(app: FastAPI):
     service_start_mono = time.monotonic()
 
     settings = cfgmod.load(os.environ.get("GENWATCH_CONFIG_PATH"))
-    if not settings.auth.jwt_secret:
-        # Mock mode (dev / CI) generates an ephemeral secret to keep
-        # the test runner unblocked. Production refuses to start —
-        # silently minting an ephemeral secret under `Restart=always`
-        # produces a unit that's "up" but logs every operator out on
-        # each restart, masking the real problem (config corrupted /
-        # secret never set). The fix is to set jwt_secret in
-        # /etc/genwatch/config.yaml and restart; the installer
-        # generates one automatically (see deploy/scripts/install.sh).
+
+    # ── Secret sanity gates (production) ──────────────────────────────
+    # The shipped config template seeds jwt_secret / admin_password_hash
+    # with the literal placeholder "REPLACE_ME". The installer rewrites
+    # jwt_secret on a *fresh* install, but only WARNS if a re-install,
+    # restored backup, or hand-edit leaves the placeholder in place. A
+    # truthy-but-known secret previously sailed past the empty-string
+    # check below, so the service would boot signing every admin session
+    # with a world-known HS256 key — anyone who could reach the port
+    # could forge an operator cookie and command the generator. Treat the
+    # placeholder, and anything obviously too short to be a 256-bit
+    # secret, as "unset".
+    PLACEHOLDER = "REPLACE_ME"
+    secret = settings.auth.jwt_secret
+    secret_unusable = (not secret) or secret == PLACEHOLDER or len(secret) < 32
+    if secret_unusable:
+        # Mock mode (dev / CI) generates an ephemeral secret to keep the
+        # test runner unblocked. Production refuses to start — silently
+        # minting an ephemeral secret under `Restart=always` produces a
+        # unit that's "up" but logs every operator out on each restart,
+        # masking the real problem (config corrupted / secret never set).
         if not settings.mock:
             raise RuntimeError(
-                "auth.jwt_secret is unset in production mode. Set it in "
-                "/etc/genwatch/config.yaml (the installer generates one "
-                "automatically). Refusing to start with an ephemeral "
-                "secret because every restart would invalidate sessions "
-                "and the underlying misconfiguration would go unnoticed."
+                "auth.jwt_secret is unset, the 'REPLACE_ME' placeholder, or "
+                "shorter than 32 chars in production mode. Generate one with "
+                "`sudo genwatch gensecret` and paste it into "
+                "/etc/genwatch/config.yaml, then restart (the installer does "
+                "this automatically on a fresh install). Refusing to start: a "
+                "missing or guessable secret lets anyone forge an operator "
+                "session and command the generator."
             )
         settings = settings.model_copy(
             update={"auth": settings.auth.model_copy(update={"jwt_secret": secrets.token_hex(32)})}
         )
-        log.warning("auth.jwt_secret was empty — generated an ephemeral one for mock mode (tokens won't survive restart).")
+        log.warning("auth.jwt_secret was unset/placeholder — generated an ephemeral one for mock mode (tokens won't survive restart).")
+
+    # admin_password_hash must be a real bcrypt hash in production. With
+    # the "REPLACE_ME" placeholder (or any non-bcrypt string) the service
+    # would boot "healthy" — green systemd unit, green watchdog — but
+    # every /api/auth/login returns 401 because bcrypt.checkpw rejects a
+    # non-$2 hash. Fail loudly so an unusable deployment surfaces as an
+    # actionable boot error rather than a mysterious lockout. (The
+    # installer only starts the service once a real hash is set; this is
+    # the runtime backstop for manual starts / restored configs.)
+    pw_hash = settings.auth.admin_password_hash
+    if not settings.mock and ((not pw_hash) or pw_hash == PLACEHOLDER or not pw_hash.startswith("$2")):
+        raise RuntimeError(
+            "auth.admin_password_hash is unset or still the 'REPLACE_ME' "
+            "placeholder. Generate it with `sudo genwatch hash` and paste the "
+            "$2b$... value into /etc/genwatch/config.yaml, then restart. "
+            "Refusing to start: login would fail for every operator."
+        )
 
     # Locate register file
     reg_path = Path(settings.modbus.register_file)
@@ -165,6 +198,7 @@ async def lifespan(app: FastAPI):
     ats_service: AtsService | None = None
     ats_client: ModbusClient | None = None
     ats_poller: Poller | None = None
+    ats_regmap = None
     if settings.ats.enabled:
         ats_reg_path = Path(settings.ats.register_file)
         if not ats_reg_path.is_absolute():
@@ -205,6 +239,15 @@ async def lifespan(app: FastAPI):
 
     state_machine = StateMachine(regmap, db, bus, ats_service=ats_service)
     control_service = ControlService(regmap, client, db, state_machine, slack=slack)
+
+    # ATS-Pi command service (Phase 3) — only when the companion is
+    # configured. Reuses the H-100 confirm-token store so one token works
+    # across both surfaces. Writes go to the independent ATS client.
+    ats_control: AtsControlService | None = None
+    if ats_service is not None and ats_client is not None and ats_regmap is not None:
+        ats_control = AtsControlService(
+            ats_regmap, ats_client, db, ats_service, control_service, slack=slack
+        )
 
     # WebSocket snapshot push cadence. Defaults to the prime-poll interval
     # but operators can dial back the UI refresh rate via ws_push_ms
@@ -347,6 +390,7 @@ async def lifespan(app: FastAPI):
     app.state.ats_service = ats_service
     app.state.ats_client = ats_client
     app.state.ats_poller = ats_poller
+    app.state.ats_control = ats_control
 
     if settings.mock:
         boot_mode = "mock"
@@ -593,6 +637,7 @@ def create_app() -> FastAPI:
     app.include_router(telemetry_routes.router)
     app.include_router(events_routes.router)
     app.include_router(control_routes.router)
+    app.include_router(ats_routes.router)
     app.include_router(auth_routes.router)
     app.include_router(settings_routes.router)
     app.include_router(ws_routes.router)

@@ -7,7 +7,26 @@ import { Icon, Modal } from "../components/primitives";
 
 type Verb = "start" | "stop" | "exercise" | "transfer";
 
-const SPECS: Record<Verb, { title: string; verb: string; danger: boolean; bullets: string[] }> = {
+// Discriminated command the modal can confirm. H-100 verbs carry no
+// extra args; ATS maintained commands carry assert (assert vs release)
+// and force-transfer additionally carries override (set by the caller
+// when utility is available, so the backend's healthy-utility guard is
+// satisfied after the operator confirms the warning copy).
+export type ConfirmCmd =
+  | { kind: Verb }
+  | { kind: "ats_test" }
+  | { kind: "ats_inhibit"; assert: boolean }
+  | { kind: "ats_force_transfer"; assert: boolean; override: boolean }
+  | { kind: "ats_bypass_delay" };
+
+interface Spec {
+  title: string;
+  verb: string;
+  danger: boolean;
+  bullets: string[];
+}
+
+const H100_SPECS: Record<Verb, Spec> = {
   start: {
     title: "Confirm Remote Start", verb: "Start", danger: false,
     bullets: [
@@ -47,8 +66,92 @@ const SPECS: Record<Verb, { title: string; verb: string; danger: boolean; bullet
   },
 };
 
+function specFor(cmd: ConfirmCmd): Spec {
+  switch (cmd.kind) {
+    case "start":
+    case "stop":
+    case "exercise":
+    case "transfer":
+      return H100_SPECS[cmd.kind];
+    case "ats_test":
+      return {
+        title: "Confirm ATS Test", verb: "Test transfer", danger: false,
+        bullets: [
+          "Pulses the ATS test input (ASCO terminals 6–7)",
+          "The ATS performs a live test transfer to the generator",
+          "Momentary — self-clears within ~1.5 s",
+        ],
+      };
+    case "ats_inhibit":
+      return cmd.assert
+        ? {
+            title: "Confirm Inhibit Transfer", verb: "Inhibit", danger: true,
+            bullets: [
+              "Asserts the ASCO inhibit input (maintained)",
+              "The ATS will NOT transfer to the generator while inhibited",
+              "Auto-releases ~30 s after a GenWatch comms loss (ICD §8.3)",
+            ],
+          }
+        : {
+            title: "Release Inhibit", verb: "Release inhibit", danger: false,
+            bullets: [
+              "Clears the inhibit signal",
+              "The ATS resumes normal automatic transfer logic",
+            ],
+          };
+    case "ats_force_transfer":
+      if (!cmd.assert) {
+        return {
+          title: "Release Force-Transfer", verb: "Release force", danger: false,
+          bullets: [
+            "Clears the force-transfer signal",
+            "The ATS resumes normal automatic logic",
+          ],
+        };
+      }
+      return {
+        title: "Confirm FORCE TRANSFER", verb: "Force transfer", danger: true,
+        bullets: [
+          ...(cmd.override
+            ? ["⚠ Utility (normal source) is AVAILABLE — this drops a healthy utility feed and moves the load onto the generator."]
+            : []),
+          "Asserts the ASCO force-transfer input (maintained)",
+          "Load transfers to the generator",
+          "Admin-only · auto-releases ~30 s after a GenWatch comms loss (ICD §8.3)",
+        ],
+      };
+    case "ats_bypass_delay":
+      return {
+        title: "Confirm Bypass Delay", verb: "Bypass delay", danger: false,
+        bullets: [
+          "Pulses the ASCO bypass-transfer-time-delay input",
+          "Skips the ATS's transfer time delay for the next transfer",
+          "Momentary — self-clears within ~1.5 s",
+        ],
+      };
+  }
+}
+
+async function runCommand(cmd: ConfirmCmd, token: string): Promise<unknown> {
+  switch (cmd.kind) {
+    case "start":
+    case "stop":
+    case "exercise":
+    case "transfer":
+      return api.control(cmd.kind, token);
+    case "ats_test":
+      return api.atsCommand("test", token);
+    case "ats_inhibit":
+      return api.atsCommand("inhibit", token, { assert: cmd.assert });
+    case "ats_force_transfer":
+      return api.atsCommand("force_transfer", token, { assert: cmd.assert, override: cmd.override });
+    case "ats_bypass_delay":
+      return api.atsCommand("bypass_delay", token);
+  }
+}
+
 interface Props {
-  command: Verb | null;
+  command: ConfirmCmd | null;
   operator: string;
   onClose: () => void;
   onSuccess: () => void;
@@ -134,7 +237,7 @@ export function ConfirmModal({ command, operator, onClose, onSuccess }: Props) {
   }, [command, tokenExpiresAtMs, fetchFailed]);
 
   if (!command) return null;
-  const spec = SPECS[command];
+  const spec = specFor(command);
 
   // Seconds remaining on the current token. Negative-clamped; 0 while
   // an auto-refresh fetch is in flight (token cleared, expires reset).
@@ -149,7 +252,7 @@ export function ConfirmModal({ command, operator, onClose, onSuccess }: Props) {
     setSubmitting(true);
     setError(null);
     try {
-      await api.control(command, token);
+      await runCommand(command, token);
       onSuccess();
     } catch (e: any) {
       const detail = e?.body?.detail;

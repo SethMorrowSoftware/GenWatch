@@ -6,7 +6,7 @@ A single-pane operator console: live engine state, electrical output, two-step-c
 
 > **Note on naming.** The product was previously called *GenWatch*. The internal Python package, systemd unit, CLI, and on-disk paths (`/etc/genwatch/`, `genwatch.service`, the `genwatch` CLI) keep those identifiers so existing deployments don't break. Only the operator-facing copy was rebranded.
 
-> **Reliability summary.** Hardware watchdog on pid 1 (Pi reboots on kernel hang); software watchdog on the polling loop driven by a monotonic prime-poll heartbeat (service restarts on a deadlocked read); TCP keepalive on the Modbus socket (dead Lantronix detected in ~60 s); SQLite WAL with `synchronous=FULL` (audit/alarm rows survive a power cut); graceful degradation when the link is down (UI stays reachable, comms shown as LOST, reconnect in the background); panel-mode gate on every remote command (server rejects with 409 unless the H-100 key switch is in AUTO); batch-read fan-out preserves last-good values when a single register fails (no sentinel zeros that could trip an alarm comparator), with per-register TTL so a stale value can't masquerade as fresh forever; register-map hot-reload propagates to the live poller without a service restart; confirm-token gate on every state-changing endpoint including alarm-ack; CSRF middleware on every mutating `/api/*` request; SQLite writes offloaded from the event loop so a checkpoint can't stall the next poll; Modbus client lock released between retry attempts so an operator command can pre-empt a degraded-link retry chain; Slack notifier dedupes flapping alarms within a 60 s window and abandons stale retries past 5 min; supply chain pinned with `package-lock.json` + hash-locked `requirements.lock` and `npm ci --ignore-scripts` on every install; login rate-limited; audit log on every control command. Test coverage under `backend/tests/` (201 tests).
+> **Reliability summary.** Hardware watchdog on pid 1 (Pi reboots on kernel hang); software watchdog on the polling loop driven by a monotonic prime-poll heartbeat (service restarts on a deadlocked read); TCP keepalive on the Modbus socket (dead Lantronix detected in ~60 s); SQLite WAL with `synchronous=FULL` (audit/alarm rows survive a power cut); graceful degradation when the link is down (UI stays reachable, comms shown as LOST, reconnect in the background); panel-mode gate on every remote command (server rejects with 409 unless the H-100 key switch is in AUTO); freshness gate so remote start/stop/ack are rejected when the H-100 link is LOST rather than firing against a last-known engine state; placeholder/weak `jwt_secret` and missing/`REPLACE_ME` `admin_password_hash` refuse to boot in production; batch-read fan-out preserves last-good values when a single register fails (no sentinel zeros that could trip an alarm comparator), with per-register TTL so a stale value can't masquerade as fresh forever; register-map hot-reload propagates to the live poller without a service restart; confirm-token gate on every state-changing endpoint including alarm-ack; CSRF middleware on every mutating `/api/*` request; SQLite writes offloaded from the event loop so a checkpoint can't stall the next poll; Modbus client lock released between retry attempts so an operator command can pre-empt a degraded-link retry chain; Slack notifier dedupes flapping alarms within a 60 s window and abandons stale retries past 5 min; supply chain pinned with `package-lock.json` + hash-locked `requirements.lock` and `npm ci --ignore-scripts` on every install; login rate-limited; audit log on every control command. Test coverage under `backend/tests/` (221 tests).
 
 ---
 
@@ -589,9 +589,9 @@ The H-100 front-panel key switch is not in AUTO. Set the panel to AUTO at the un
 
 If a single Modbus read fails inside a coalesced batch, the poller falls back to single-register reads. Registers whose single-read fallback ALSO fails are *skipped* — the previous value is kept rather than overwritten with `0`. So a coolant temp displayed as 188 °F will simply stay at 188 °F until the next successful read, rather than briefly flicker to 0 °F and trip an alarm comparator. The journal shows `skipping decode of <name> @0x<addr> — fan-out read failed` at debug level. If the freeze persists, run `sudo genwatch doctor` and look at the bridge.
 
-### Symptom: Service exits with `auth.jwt_secret is unset in production mode`
+### Symptom: Service exits with `auth.jwt_secret is unset … in production mode`
 
-The config has `jwt_secret: ""` (or the key is missing). Production refuses to generate an ephemeral secret because that would silently invalidate every operator session on each restart while masking the underlying config problem. Generate a real one:
+The config has `jwt_secret: ""`, the literal `REPLACE_ME` placeholder, or a value shorter than 32 chars (the key is also rejected if missing). Production refuses to start rather than sign sessions with a guessable key — a placeholder secret is a world-known signing key that lets anyone forge an operator session. Generate a real one:
 
 ```bash
 sudo genwatch gensecret                      # prints hex on stdout
@@ -600,6 +600,16 @@ sudo systemctl restart genwatch
 ```
 
 For dev / CI, set `GENWATCH_MOCK=true` to re-enable the ephemeral fallback.
+
+### Symptom: Service exits with `auth.admin_password_hash is unset or still the 'REPLACE_ME' placeholder`
+
+No usable admin password is set. Production refuses to start with a missing / placeholder / non-bcrypt hash, because the service would otherwise come up "healthy" while every login returns 401 — a silent lockout. Set it:
+
+```bash
+sudo genwatch hash                           # prompts (no echo) → $2b$... hash
+sudo nano /etc/genwatch/config.yaml          # paste into auth.admin_password_hash
+sudo systemctl restart genwatch
+```
 
 ### Symptom: Install fails with `Unsupported OS tag`
 
@@ -699,11 +709,11 @@ Pi 5 needs a true 5 V / 5 A supply. Cheap USB-C chargers brown out under USB per
                        │ Network      │   │ ATS-Pi companion │  optional
                        │ serial bridge│   │ (separate Pi +   │  ats.enabled
                        │ Lantronix /  │   │  ADAM-6060) —    │  in config
-                       │ Moxa / ser2net│  │  ASCO transfer   │  Phase 1+2
+                       │ Moxa / ser2net│  │  ASCO transfer   │  Phases 1-3
                        └──────┬───────┘   │  switch sensing  │  shipped;
-                              │           └──────────────────┘  Phase 3
-                              │ RS-232 (9600 8N1)               pending
-                              v
+                              │           └──────────────────┘  live use of
+                              │ RS-232 (9600 8N1)               commands needs
+                              v                                 companion driver
                        ┌──────────────┐
                        │ H-100        │  Generac H-100 controller
                        │ controller   │  on the generator panel
@@ -840,13 +850,14 @@ cd backend
 .venv/bin/python -m pytest tests/ -v
 ```
 
-201 tests across nine files:
+221 tests across ten files:
 
 - `test_registers.py` — YAML loader, decoder for every `RegType`, batch coalescing, address-overlap + bad-FC validation.
 - `test_state_machine.py` — engine-state derivation, alarm-bit debounce, panel-mode decode.
 - `test_alarm_filtering.py` — `min_poll_count` debounce + `suppress_in_states` filter behavior across raise/clear edge cases.
 - `test_endtoend.py` — boots the app with the mock client, drives the full operator flow (login → confirm → start → state-validity rejection → panel-mode-locked rejection), verifies confirm-token on alarm-ack, CSRF blocks cross-origin POSTs, and that `/api/registers/reload` propagates to the live poller / state machine / control service.
-- `test_hardening.py` — rate-limiter math, events retention, `sd_notify` parsing, transport selection, TCP keepalive socket options, poller heartbeat stamping, batch-fallback behavior, fan-out-failure preserves last-good value, per-tier TTL evicts stale values, Modbus client lock released between retry attempts, JWT-secret refuses-to-boot in production, `panel` CLI command output (text + JSON), `genwatch hash` stdin-prompt behavior.
+- `test_hardening.py` — rate-limiter math, events retention, `sd_notify` parsing, transport selection, TCP keepalive socket options, poller heartbeat stamping, batch-fallback behavior, fan-out-failure preserves last-good value, per-tier TTL evicts stale values, Modbus client lock released between retry attempts, JWT-secret + admin-hash refuse-to-boot in production (empty / `REPLACE_ME` placeholder / too-short / non-bcrypt), control rejected when H-100 comms LOST, `panel` CLI command output (text + JSON), `genwatch hash` stdin-prompt behavior.
+- `test_ats_control.py` — ATS-Pi command write side (Phase 3): each command writes the expected ICD register/value, confirm-token flow (valid / invalid / single-use), role gating (force-transfer admin-only), force-transfer healthy-utility override guard, comms-loss / non-authoritative link returns 502 / 409.
 - `test_slack.py` — block builder, gating flags, dispatch worker, retry-on-transport-error vs no-retry-on-Slack-error, dedupe window suppresses flap, retry deadline abandons stale messages, token sanitization (never echoed to audit), hot-reload from `PUT /api/config`.
 - `test_ats_service.py` — ATS-Pi snapshot decode, authoritative-gate, ICD §5.4 minor-version semantics, reboot detection.
 - `test_ats_loadsource_precedence.py` — load-source derivation precedence (ATS-Pi authoritative vs H-100 fallback), `ATS_LOADSOURCE_DISAGREE` debounce + gating on `normal_available`, handover across comms-lost / comms-recovered windows.
@@ -892,8 +903,11 @@ docs/integrations/                        Wire contracts + integration plans
   ats-pi-icd.md                           ATS-Pi ↔ GenWatch wire contract.
                                           Companion repo reads this.
   ats-pi-plan.md                          Phased integration plan
-                                          (Phase 1+2 shipped, Phase 3
-                                          pending companion write-side).
+                                          (Phases 1-3 shipped on the
+                                          GenWatch side & validated against
+                                          the mock; live ATS commands still
+                                          gated on the companion ADAM driver
+                                          + §8.3 comms-loss auto-release).
   ats-pi-companion-starter/               Starter handed to the companion
                                           repo team — runnable mock,
                                           hardened systemd unit, ICD test.
@@ -918,7 +932,11 @@ Every `/api/*` endpoint requires authentication except `/api/health` (a delibera
 | POST   | `/api/alarms/{code}/ack`                      | op+    | Body `{ confirm_token }`; writes `0x0001` → `0x012E`        |
 | GET    | `/api/alarm-codes`                            | op+    | Static alarm-code reference table from the YAML             |
 | GET    | `/api/control/confirm`                        | op+    | Issue 8-char hex confirm token (30 s TTL, single-use)       |
-| POST   | `/api/control/{start,stop,exercise,transfer}` | op+    | Body `{ confirm_token }`; 409 on invalid state or panel ≠ AUTO |
+| POST   | `/api/control/{start,stop,exercise,transfer}` | op+    | Body `{ confirm_token }`; 409 on invalid state, panel ≠ AUTO, or comms LOST |
+| POST   | `/api/ats/test`                               | op+    | ATS-Pi momentary test transfer; body `{ confirm_token }` (ATS Phase 3) |
+| POST   | `/api/ats/inhibit`                            | op+    | Body `{ confirm_token, assert }` — assert/release inhibit (maintained) |
+| POST   | `/api/ats/force-transfer`                     | admin  | Body `{ confirm_token, assert, override }`; 409 unless `override` while utility available |
+| POST   | `/api/ats/bypass-delay`                       | op+    | ATS-Pi momentary bypass of the transfer time delay          |
 | GET    | `/api/config`                                 | op+    | Effective config (bot_token + jwt_secret never returned)    |
 | PUT    | `/api/config`                                 | admin  | Update on-disk config; Slack hot-reloads, others need restart |
 | POST   | `/api/slack/test`                             | admin  | Send a synchronous test message; returns `{ok, detail}`     |

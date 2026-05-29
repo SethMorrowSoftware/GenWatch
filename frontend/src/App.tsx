@@ -148,7 +148,14 @@ function Shell({ auth, view, setView, theme, onToggleTheme, onLogout }: {
   // poll cadence doesn't flash the warning.
   const staleThresholdMs = Math.max(6000, (comms?.rateMs ?? 1500) * 3);
   const sinceLastPushMs = live.lastPushAt == null ? Infinity : Date.now() - live.lastPushAt;
-  const stale = (live.wsDown || sinceLastPushMs > staleThresholdMs) && !!status;
+  // A known-dead Modbus link is stale even if the WebSocket is happily
+  // delivering snapshots (the backend keeps pushing with comms.state
+  // "lost"). Folding it in here forces the STALE badge and the
+  // control-button gate the moment the H-100 link drops, rather than
+  // waiting out the no-push timer — which the keepalive `ping`s would
+  // otherwise keep resetting.
+  const commsLost = comms?.state === "lost";
+  const stale = (live.wsDown || sinceLastPushMs > staleThresholdMs || commsLost) && !!status;
   // Panel-mode freshness gate (defense in depth against a backend
   // mismatch that drops `panel` from snapshots while keeping the WS
   // alive). The control buttons consume this — when the panel block
@@ -198,6 +205,8 @@ function Shell({ auth, view, setView, theme, onToggleTheme, onLogout }: {
               title={
                 live.wsDown
                   ? "Live connection to server is down — values shown are last known."
+                  : commsLost
+                  ? "Modbus link to the H-100 is LOST — values shown are last known. Remote commands are blocked."
                   : `No live updates for ${Math.round(sinceLastPushMs / 1000)}s — values shown may be stale.`
               }
               style={{ borderColor: "var(--red)" }}
@@ -246,7 +255,7 @@ function Shell({ auth, view, setView, theme, onToggleTheme, onLogout }: {
         )}
         {tickedStatus && (
           <div className="view" key={view}>
-            {view === "live" && <LiveView status={tickedStatus} history={live.history} operator={auth.operator ?? "operator"} stale={stale} panelStale={panelStale} />}
+            {view === "live" && <LiveView status={tickedStatus} history={live.history} operator={auth.operator ?? "operator"} role={auth.role ?? "viewer"} stale={stale} panelStale={panelStale} />}
             {view === "history" && <HistoryView />}
             {view === "events" && <EventsView />}
             {view === "settings" && <SettingsView />}

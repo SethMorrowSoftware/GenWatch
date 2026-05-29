@@ -86,7 +86,7 @@ export const api = {
     // confirm→ack also closes the CSRF hole on this endpoint that
     // existed when only an authenticated session was required.
     const tok = await request<ConfirmToken>("/api/control/confirm");
-    return request<{ ok: boolean }>(
+    return request<{ ok: boolean; code: string; hw_ack: boolean }>(
       `/api/alarms/${encodeURIComponent(code)}/ack`,
       {
         method: "POST",
@@ -119,6 +119,28 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ confirm_token }),
     }),
+
+  // ATS-Pi commands (Phase 3). All confirm-token gated via the shared
+  // /api/control/confirm token. `assert` selects assert vs release for
+  // the maintained commands (inhibit / force-transfer); `override` is
+  // required by the backend to force-transfer while utility is available.
+  atsCommand: (
+    cmd: "test" | "inhibit" | "force_transfer" | "bypass_delay",
+    confirm_token: string,
+    opts: { assert?: boolean; override?: boolean } = {}
+  ) => {
+    const path =
+      cmd === "force_transfer" ? "/api/ats/force-transfer"
+      : cmd === "bypass_delay" ? "/api/ats/bypass-delay"
+      : `/api/ats/${cmd}`;
+    const body: Record<string, unknown> = { confirm_token };
+    if (cmd === "inhibit" || cmd === "force_transfer") body.assert = opts.assert ?? true;
+    if (cmd === "force_transfer") body.override = opts.override ?? false;
+    return request<{ ok: boolean; command: string; register: string }>(path, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  },
 
   // Settings
   config: () => request<any>("/api/config"),

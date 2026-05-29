@@ -114,6 +114,22 @@ async def ack_alarm(
     if code not in {a["code"] for a in db.active_alarms()}:
         raise HTTPException(404, f"alarm {code} not active")
 
+    # Freshness gate: an ack is a write to the controller. If the H-100
+    # link is LOST we can't confirm the alarm is still latched (the active
+    # set is held from the last good poll), and the write would fail or be
+    # dropped anyway — refuse with a clear reason instead of issuing a
+    # blind write against a dead link. Mirrors the control-endpoint gate.
+    comms_state = getattr(request.app.state.state_machine.snap.comms, "state", "lost")
+    if comms_state == "lost":
+        raise HTTPException(
+            409,
+            detail={
+                "code": "comms_lost",
+                "message": "cannot acknowledge: H-100 communication is LOST. "
+                "Restore the link before acknowledging alarms.",
+            },
+        )
+
     # Validate + consume the confirm token before touching hardware.
     # consume_token takes the control service's lock so the token is
     # consumed atomically — the same operator's parallel ack attempt

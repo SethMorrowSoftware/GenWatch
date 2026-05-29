@@ -351,6 +351,96 @@ async def test_lifespan_mock_mode_still_generates_ephemeral_secret(monkeypatch, 
         assert app.state.settings.auth.jwt_secret != ""
 
 
+@pytest.mark.parametrize("bad_secret", ["REPLACE_ME", "short"])
+async def test_lifespan_refuses_placeholder_or_short_jwt_secret(monkeypatch, tmp_path, bad_secret):
+    """A truthy-but-known/weak jwt_secret must be rejected in production,
+    not just an empty one. The shipped config template seeds the literal
+    'REPLACE_ME'; a restored/hand-edited config that keeps it would
+    otherwise boot signing admin sessions with a world-known HS256 key —
+    a full auth bypass. Anything < 32 chars is likewise treated as unset."""
+    from genwatch.main import create_app
+
+    monkeypatch.delenv("GENWATCH_MOCK", raising=False)  # non-mock
+    monkeypatch.setenv("GENWATCH_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("GENWATCH_AUTH__JWT_SECRET", bad_secret)
+    monkeypatch.setenv("GENWATCH_AUTH__ADMIN_PASSWORD_HASH", "$2b$12$" + "x" * 53)
+    monkeypatch.setenv("GENWATCH_TRANSPORT", "tcp")
+    monkeypatch.setenv("GENWATCH_MODBUS_TCP__HOST", "127.0.0.1")
+    monkeypatch.setenv("GENWATCH_MODBUS_TCP__PORT", "1")
+
+    app = create_app()
+    with pytest.raises(RuntimeError, match=r"jwt_secret"):
+        async with app.router.lifespan_context(app):
+            pass  # should never enter
+
+
+@pytest.mark.parametrize("bad_hash", ["", "REPLACE_ME", "not-a-bcrypt-hash"])
+async def test_lifespan_refuses_bad_admin_password_hash(monkeypatch, tmp_path, bad_hash):
+    """A missing / placeholder / non-bcrypt admin_password_hash must
+    refuse to boot in production. Otherwise the unit comes up 'healthy'
+    (green systemd + watchdog) while every login 401s — a silent lockout.
+    A real bcrypt hash is required."""
+    from genwatch.main import create_app
+
+    monkeypatch.delenv("GENWATCH_MOCK", raising=False)  # non-mock
+    monkeypatch.setenv("GENWATCH_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("GENWATCH_AUTH__JWT_SECRET", "y" * 64)  # valid
+    monkeypatch.setenv("GENWATCH_AUTH__ADMIN_PASSWORD_HASH", bad_hash)
+    monkeypatch.setenv("GENWATCH_TRANSPORT", "tcp")
+    monkeypatch.setenv("GENWATCH_MODBUS_TCP__HOST", "127.0.0.1")
+    monkeypatch.setenv("GENWATCH_MODBUS_TCP__PORT", "1")
+
+    app = create_app()
+    with pytest.raises(RuntimeError, match=r"admin_password_hash"):
+        async with app.router.lifespan_context(app):
+            pass  # should never enter
+
+
+async def test_control_rejected_when_comms_lost(tmp_path):
+    """A Start must be refused when the H-100 link is LOST. engine_state
+    is pinned to its last value across an outage (state.py), so the
+    validity gate would otherwise pass against stale data and the panel
+    gate would read a stale 'auto'. The confirm token must survive the
+    denial (the gate runs before token-consume) so the operator can retry
+    once comms recover, and no Modbus write may be attempted."""
+    from pathlib import Path
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from genwatch.modbus.registers import load_register_map
+    from genwatch.services.control import ControlError, ControlService
+
+    regmap = load_register_map(Path(__file__).parent.parent / "genwatch/registers/h100.yaml")
+
+    writes: list = []
+
+    class FakeClient:
+        async def write(self, addr, value=None, *, fc=6, values=None):
+            writes.append((addr, value, fc, values))
+            return SimpleNamespace(ok=True, error=None)
+
+    # Stale-but-confident snapshot: looks startable, but comms are LOST.
+    snap = SimpleNamespace(
+        panel_mode="auto", engine_state="stopped",
+        comms=SimpleNamespace(state="lost"),
+    )
+    state = SimpleNamespace(snap=snap)
+    ctl = ControlService(regmap, FakeClient(), MagicMock(), state, slack=None)
+
+    tok = await ctl.issue_token("op")
+    with pytest.raises(ControlError) as ei:
+        await ctl.execute("start", tok.token, "op", "operator")
+    assert ei.value.code == "comms_lost"
+    assert ei.value.http_status == 409
+    assert writes == []  # never touched the wire
+
+    # Token survived the denial — once comms recover the same token works.
+    snap.comms.state = "healthy"
+    res = await ctl.execute("start", tok.token, "op", "operator")
+    assert res["ok"] is True
+    assert writes == [(0x019C, None, 16, [0x0080, 0x0000, 0x0000])]
+
+
 def test_config_does_not_auto_mock_when_device_missing(monkeypatch, tmp_path):
     """When the serial device is absent and mock isn't requested, the
     config layer must leave mock=False — we never silently switch to
