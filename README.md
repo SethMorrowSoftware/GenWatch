@@ -56,6 +56,13 @@ sudo genwatch doctor                          # expect "Modbus: slave 100 respon
 
 Then open `http://<your-pi-ip>:8000` and log in. The Live view should populate within ~2 s.
 
+> **Bringing this live against real hardware?** Follow the step-by-step
+> field procedure in **[`docs/COMMISSIONING.md`](docs/COMMISSIONING.md)** —
+> it walks the read-only verification first, then controls, then (if
+> fitted) the ATS-Pi/ADAM-6060, with safety gates, pass/fail criteria,
+> and a sign-off sheet. The quick start above is enough for a bench/mock
+> run; the runbook is what makes a plant deployment safe.
+
 If `genwatch doctor` reports `NO RESPONSE` on a TCP socket that opens fine, the most common cause is the bridge's **Pack Control** splitting Modbus RTU frames — see [§10 Troubleshooting](#10-troubleshooting). If `nc` itself fails, the bridge isn't reachable or isn't listening — see [§3](#3-configure-the-network-bridge).
 
 ---
