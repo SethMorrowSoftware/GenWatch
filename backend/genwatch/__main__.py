@@ -456,7 +456,7 @@ def _scan(args: list[str]) -> int:
 
     fcs = [int(x) for x in opts.fc.split(",") if x.strip()]
     total_regs = opts.end - opts.start + 1
-    print(f"== Modbus scan ==")
+    print("== Modbus scan ==")
     print(f"  Transport: {settings.transport}")
     if settings.transport == "tcp":
         print(f"  Target:    {settings.modbus_tcp.host}:{settings.modbus_tcp.port}")
@@ -563,9 +563,10 @@ def _scan(args: list[str]) -> int:
                     buf = bytearray()
                     while j < len(live) and live[j][0] == addr_i + (j - i):
                         v = live[j][1]
-                        h, l = (v >> 8) & 0xFF, v & 0xFF
-                        if 0x20 <= h <= 0x7E and 0x20 <= l <= 0x7E:
-                            buf.append(h); buf.append(l)
+                        hi, lo = (v >> 8) & 0xFF, v & 0xFF
+                        if 0x20 <= hi <= 0x7E and 0x20 <= lo <= 0x7E:
+                            buf.append(hi)
+                            buf.append(lo)
                             j += 1
                         else:
                             break

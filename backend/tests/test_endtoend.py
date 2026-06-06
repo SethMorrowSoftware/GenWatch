@@ -300,7 +300,6 @@ async def test_registers_reload_propagates_to_poller(client, app_env):
     actually closes the loop."""
     from copy import deepcopy
     from genwatch.main import create_app
-    from genwatch.modbus.registers import load_register_map
 
     app = create_app()
     transport = httpx.ASGITransport(app=app)

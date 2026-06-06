@@ -276,7 +276,6 @@ async def test_alarm_dedupe_suppresses_repeats_inside_window(tmp_path, monkeypat
 
 async def test_alarm_dedupe_window_expires(tmp_path, monkeypatch):
     """After DEDUPE_WINDOW_S elapses, a repeat alarm fires again."""
-    import time as time_mod
     db = Database(tmp_path / "t.sqlite")
     cfg = SlackConfig(enabled=True, channel="#x", bot_token="xoxb-test", alert_on_alarm=True)
     n = SlackNotifier(cfg, db)

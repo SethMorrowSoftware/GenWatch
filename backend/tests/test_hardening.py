@@ -854,7 +854,7 @@ async def test_poller_eviction_is_per_tier(tmp_path):
     even though base reads might be working fine."""
     from dataclasses import dataclass
     from genwatch.modbus.client import ModbusResult
-    from genwatch.modbus.poller import Poller, TIER_STALE_MULTIPLIER
+    from genwatch.modbus.poller import Poller
     from genwatch.modbus.registers import load_register_map
 
     import time
@@ -1010,7 +1010,7 @@ async def test_modbus_read_releases_lock_between_retry_attempts(tmp_path):
     Stop commands exactly when they're most needed. Closes Modbus H3."""
     import asyncio
     import time as time_mod
-    from genwatch.modbus.client import SerialModbusClient, ModbusResult
+    from genwatch.modbus.client import SerialModbusClient
 
     client = SerialModbusClient(
         device="/dev/null", baud=9600, parity="N",
@@ -1070,7 +1070,7 @@ async def test_poller_apply_regmap_swaps_batches_and_cadence(tmp_path):
     app.state.regmap. Otherwise the operator edits the YAML, reloads,
     and the poller silently keeps reading the old addresses."""
     from copy import deepcopy
-    from dataclasses import dataclass, field
+    from dataclasses import dataclass
     from genwatch.modbus.client import ModbusResult
     from genwatch.modbus.poller import Poller
     from genwatch.modbus.registers import RegisterDef, load_register_map

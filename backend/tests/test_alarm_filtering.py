@@ -22,7 +22,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from genwatch.modbus.poller import CommsHealth, Reading
-from genwatch.modbus.registers import AlarmBit, _load_alarm_bit, load_register_map
+from genwatch.modbus.registers import _load_alarm_bit, load_register_map
 from genwatch.services.state import EventBus, StateMachine
 
 

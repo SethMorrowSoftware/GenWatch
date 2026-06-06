@@ -18,7 +18,6 @@ tests; the TCP-server smoke is exercised in Phase 4 commissioning).
 """
 from __future__ import annotations
 
-import asyncio
 import time
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -31,7 +30,6 @@ from genwatch.services.ats import (
     EXPECTED_ICD_MAJOR,
     EXPECTED_ICD_MINOR,
     AtsService,
-    AtsSnapshot,
 )
 from genwatch.services.state import EventBus
 
