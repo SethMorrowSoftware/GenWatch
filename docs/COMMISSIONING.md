@@ -400,6 +400,28 @@ on-site condensation.
 - [ ] Operator team trained on the controls, the **panel key-switch
       interlock**, and the ATS precedence (ATS-Pi authoritative when healthy)
 - [ ] This runbook completed with all phase sign-offs
+- [ ] Deploying a **tagged release candidate** (e.g. `v0.1.0-rc1`) cut at the
+      exact commissioned commit — **not** a moving `main` — with CI green at
+      that commit. GenWatch and ats-pi-companion run their **matching** tags.
+
+### Release candidate (deploy a tag, never bare `main`)
+
+Cut a tag at the commit you are commissioning (CI green; this runbook worked
+end to end) and deploy only that tag, so the plant always runs a known,
+reproducible build with a clean rollback target:
+
+```bash
+git tag -a v0.1.0-rc1 -m "GenWatch RC1 — commissioned <site>, <date>"
+git push origin v0.1.0-rc1
+# Deploy this exact tag (and the matching ats-pi-companion tag) to the Pis.
+```
+
+Record the deployed build below; this is the artifact the sign-off attests to.
+
+| Component | Tag | Commit SHA |
+|---|---|---|
+| GenWatch | | |
+| ats-pi-companion | | |
 
 ### Final acceptance
 

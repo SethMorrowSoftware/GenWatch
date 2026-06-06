@@ -42,7 +42,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Literal
 
-from genwatch.modbus.poller import CommsHealth, Reading
+from genwatch.modbus.poller import Reading
 
 log = logging.getLogger("mock_ats_pi")
 
