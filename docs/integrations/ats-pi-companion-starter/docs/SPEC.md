@@ -158,7 +158,34 @@ class LiveDataBlock(ModbusSequentialDataBlock):
             self._store.write_register(address - 1 + i, int(v))
 ```
 
-Bind to port 502 (configurable). Unit ID 1. No authentication (ICD §3).
+**Write validation (ICD §3.2 / §6.1).** A write to anything other than
+the four command registers (0x0100-0x0103) MUST be rejected, not silently
+accepted. pymodbus 3.7 only lets the datastore reject a request through
+`validate()`, which the protocol layer turns into Modbus exception
+**0x02** (illegal data address) — it gives no hook to emit the
+ICD-preferred 0x03 (illegal value) or 0x04 (device failure) for a write.
+So the server wraps the slave context in an `AtsSlaveContext` subclass
+whose `validate()` fails any write (FC06/FC16) outside the command block:
+
+```python
+class AtsSlaveContext(ModbusSlaveContext):
+    def validate(self, fc_as_hex, address, count=1):
+        if fc_as_hex in (6, 16):  # writes
+            if not all(0x0100 <= a <= 0x0103 for a in range(address, address + count)):
+                return False      # → Modbus exception 0x02
+        return super().validate(fc_as_hex, address, count)
+```
+
+This 0x02-for-everything behaviour is harmless to the consumer: GenWatch
+treats *any* write exception as "command rejected" regardless of code. An
+out-of-range *value* written to a valid command address (e.g. `0x0007` to
+`cmd_inhibit`) cannot be failed at the response layer in pymodbus 3.7, so
+`write_register` simply declines it (no relay driven) and the server logs
+it. Reads are never constrained by `validate()` so RESERVED reads still
+return 0 per ICD §5.
+
+Bind to port 502 (configurable; the starter defaults to 5020). Unit ID 1.
+No authentication (ICD §3).
 
 ---
 
