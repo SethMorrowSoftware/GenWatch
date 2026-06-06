@@ -18,9 +18,70 @@ from pymodbus.datastore import (
 )
 from pymodbus.server import StartAsyncTcpServer
 
-from .state import RegisterStore
+from .state import (
+    ADDR_CMD_BYPASS_DELAY,
+    ADDR_CMD_FORCE_TRANSFER,
+    ADDR_CMD_INHIBIT,
+    ADDR_CMD_TEST,
+    RegisterStore,
+)
 
 log = logging.getLogger("atspi.server")
+
+# Modbus function codes that write into the holding-register space.
+_WRITE_FUNCTION_CODES = frozenset({6, 16})  # FC06 single, FC16 multiple
+
+# The only addresses a client may write, per ICD §6.1. Everything else in
+# the map is read-only state/identification or RESERVED, and a write to it
+# MUST be rejected (ICD §3.2 / §6.1) rather than silently swallowed.
+_WRITABLE_ADDRS = frozenset({
+    ADDR_CMD_TEST,            # 0x0100
+    ADDR_CMD_INHIBIT,         # 0x0101
+    ADDR_CMD_FORCE_TRANSFER,  # 0x0102
+    ADDR_CMD_BYPASS_DELAY,    # 0x0103
+})
+
+
+class AtsSlaveContext(ModbusSlaveContext):
+    """Slave context that enforces the ICD §6 write map at the wire level.
+
+    pymodbus 3.7 only lets a datastore reject a request through
+    ``validate()``, which the protocol layer turns into Modbus exception
+    **0x02** (ILLEGAL_DATA_ADDRESS). There is no datastore hook to emit
+    0x03 (illegal data value) or 0x04 (server device failure) for a write
+    — ``WriteSingleRegisterRequest.update_datastore`` only checks
+    ``validate()`` and the 0..0xFFFF value bound, then commits. So every
+    rejected write necessarily surfaces as 0x02.
+
+    That is fine for the consumer: GenWatch treats *any* write exception
+    as "command rejected" (see GenWatch ``services/ats_control.py`` — a
+    failed ``client.write`` raises a 502 regardless of exception code), so
+    the specific code does not change its behaviour.
+
+    Without this override the default ``ModbusSlaveContext`` accepts every
+    in-range write as success and relies on the data block to store it —
+    which silently swallows writes to read-only and RESERVED addresses,
+    the exact opposite of the ICD §3.2 / §6.1 contract.
+
+    Only writes are constrained here. Reads are deferred to the base
+    implementation so RESERVED reads still return 0 per ICD §5 instead of
+    faulting.
+    """
+
+    def validate(self, fc_as_hex, address, count=1):  # noqa: N802 (pymodbus interface)
+        if fc_as_hex in _WRITE_FUNCTION_CODES:
+            # ``address`` is the on-the-wire PDU address (0-based); the
+            # command registers live at 0x0100-0x0103. A FC16 write spans
+            # [address, address+count), so every word must be writable.
+            targets = range(address, address + count)
+            if not all(a in _WRITABLE_ADDRS for a in targets):
+                log.warning(
+                    "rejecting write fc=%d addr=0x%04X count=%d — outside ICD §6 "
+                    "command registers (Modbus exception 0x02)",
+                    fc_as_hex, address, count,
+                )
+                return False
+        return super().validate(fc_as_hex, address, count)
 
 
 def _make_data_block(store: RegisterStore, on_read: Callable[[], None] | None):
@@ -37,8 +98,22 @@ def _make_data_block(store: RegisterStore, on_read: Callable[[], None] | None):
             return [store.read_register(address - 1 + i) for i in range(count)]
 
         def setValues(self, address, values):  # noqa: N802
+            # AtsSlaveContext.validate() has already rejected writes to
+            # non-command addresses (→ Modbus 0x02). A write that reaches
+            # here is to a valid command register, but the *value* may
+            # still be undefined (e.g. 0x0007 to cmd_inhibit). pymodbus 3.7
+            # gives us no way to fail the response at this point, so an
+            # undefined value cannot raise 0x03; write_register declines it
+            # (returns False) so no relay is driven, and we log it for
+            # diagnostics rather than letting it pass unnoticed.
             for i, v in enumerate(values):
-                store.write_register(address - 1 + i, int(v))
+                addr = address - 1 + i
+                if not store.write_register(addr, int(v)):
+                    log.warning(
+                        "ignoring write addr=0x%04X value=0x%04X — not a defined "
+                        "command value (ICD §6.1); no output driven",
+                        addr, int(v) & 0xFFFF,
+                    )
 
     # Allocate enough address space for the ICD's register layout
     # (0x0000-0x010F + spare). Values are unused — overridden by
@@ -57,7 +132,10 @@ async def start_server(
     task handle so the caller can cancel it during shutdown.
     """
     block = _make_data_block(store, on_read)
-    slave = ModbusSlaveContext(hr=block, ir=block)
+    # AtsSlaveContext (not the stock ModbusSlaveContext) so writes outside
+    # the ICD §6 command registers are rejected with a Modbus exception
+    # instead of being silently accepted.
+    slave = AtsSlaveContext(hr=block, ir=block)
     context = ModbusServerContext(slaves={unit_id: slave}, single=False)
 
     async def _serve():
