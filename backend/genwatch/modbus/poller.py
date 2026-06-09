@@ -32,6 +32,16 @@ from .registers import RegisterMap, batch_reads, decode_value
 log = logging.getLogger("genwatch.modbus.poller")
 
 
+# After an outage the rolling success window (maxlen 60) is full of
+# failures, and at the prime cadence it takes ~57 good polls (~85 s at
+# 1.5 s) for success_pct to climb back over the 95% 'healthy' threshold.
+# That left the ATS link non-authoritative — and remote control gated —
+# for well over a minute after a clean reconnect. An unbroken streak of
+# good polls is a strong recovery signal, so we promote straight back to
+# 'healthy' on it while leaving the degrade/lost thresholds untouched.
+HEALTHY_RECOVERY_STREAK = 5
+
+
 @dataclass
 class CommsHealth:
     state: str = "healthy"   # healthy | degraded | lost
@@ -41,6 +51,11 @@ class CommsHealth:
     rate_ms: int = 1500
     p95_latency_ms: float = 0.0
     consecutive_failures: int = 0
+    # Symmetric to consecutive_failures — an unbroken run of successful
+    # samples. Lets _classify fast-recover to 'healthy' after an outage
+    # instead of waiting for the whole rolling window to flush its
+    # failures (see HEALTHY_RECOVERY_STREAK). Reset on any failure.
+    consecutive_successes: int = 0
     # Monotonic timestamp of the last successful *prime* poll. Used by
     # the systemd watchdog so a wall-clock jump (NTP, DST) can't either
     # mask a hung loop or trigger a phantom restart. None until first
@@ -409,8 +424,10 @@ class Poller:
         if ok:
             self.health.last_good_at = now
             self.health.consecutive_failures = 0
+            self.health.consecutive_successes += 1
         else:
             self.health.consecutive_failures += 1
+            self.health.consecutive_successes = 0
 
         if self._results:
             n_ok = sum(1 for x in self._results if x)
@@ -434,6 +451,13 @@ class Poller:
     def _classify(self) -> str:
         if self.health.consecutive_failures >= 3:
             return "lost"
+        # Fast recovery: an unbroken streak of good polls returns us to
+        # 'healthy' without waiting for the 60-sample window to flush an
+        # outage's failures (~85 s at the prime cadence). A flapping link
+        # never builds the streak — any failure resets it — so this does
+        # not weaken the anti-flap hysteresis on the degrade path below.
+        if self.health.consecutive_successes >= HEALTHY_RECOVERY_STREAK:
+            return "healthy"
         if self.health.success_pct < 95 or self.health.consecutive_failures >= 1:
             return "degraded"
         return "healthy"

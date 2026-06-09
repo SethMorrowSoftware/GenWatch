@@ -960,6 +960,55 @@ async def test_fanout_partial_failure_does_not_flip_comms_lost(tmp_path):
     assert p.health.last_prime_good_monotonic is not None
 
 
+def test_comms_fast_recovery_after_clean_streak():
+    """After an outage saturates the 60-sample window with failures, comms
+    must fast-recover to 'healthy' on a short clean streak rather than
+    waiting ~57 good polls to flush the window (~85 s at prime cadence).
+    The degrade/lost thresholds are unchanged."""
+    from genwatch.modbus.poller import HEALTHY_RECOVERY_STREAK, Poller
+    from genwatch.modbus.registers import load_register_map
+
+    class FakeClient:
+        async def connect(self):
+            return True
+
+        async def close(self):
+            pass
+
+        async def read(self, addr, count, fc=3):
+            raise AssertionError("read should not be called in this unit test")
+
+    regmap = load_register_map("genwatch/registers/h100.yaml")
+    p = Poller(FakeClient(), regmap, lambda *a: None)
+
+    # Saturate the rolling window with failures → LOST, 0% success.
+    for _ in range(60):
+        p._record(False)
+    assert p.health.state == "lost"
+    assert p.health.success_pct == 0.0
+
+    # A clean streak SHORTER than the threshold stays degraded — the
+    # window is still almost all failures, so the success_pct path alone
+    # would hold it degraded for ~85 s.
+    for _ in range(HEALTHY_RECOVERY_STREAK - 1):
+        p._record(True)
+    assert p.health.state == "degraded"
+    assert p.health.success_pct < 95
+
+    # The streak-th consecutive success fast-recovers to healthy even
+    # though the window still reads well under 95% — proving it was the
+    # streak, not the flushed window.
+    p._record(True)
+    assert p.health.state == "healthy"
+    assert p.health.success_pct < 95
+
+    # A single failure drops it straight back out of healthy (degrade
+    # hysteresis intact) and resets the streak.
+    p._record(False)
+    assert p.health.state == "degraded"
+    assert p.health.consecutive_successes == 0
+
+
 async def test_heartbeat_withheld_when_state_block_fails(tmp_path):
     """The prime heartbeat must reflect engine-state detection, not just
     'some prime register was readable'. If output_status_1 (a state
