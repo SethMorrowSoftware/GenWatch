@@ -209,9 +209,14 @@ if (( build_needed )); then
   if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]] \
        && sudo -u "$SUDO_USER" sh -c 'command -v npm' >/dev/null 2>&1; then
     log "Building frontend as $SUDO_USER (build tooling does not run as root)"
-    # A prior root build could leave a root-owned node_modules that blocks
-    # the unprivileged `npm ci` clean — re-own it best-effort first.
-    chown -R "$SUDO_USER" "$REPO_ROOT/frontend/node_modules" 2>/dev/null || true
+    # A prior root build (or an older installer that built as root) can
+    # leave a root-owned node_modules *or* dist/ that blocks the
+    # unprivileged build: `npm ci` can't clean a root-owned node_modules,
+    # and vite's emptyDir can't unlink files in a root-owned dist/ — both
+    # fail with EACCES. Re-own them to the build user best-effort first.
+    chown -R "$SUDO_USER" \
+      "$REPO_ROOT/frontend/node_modules" \
+      "$REPO_ROOT/frontend/dist" 2>/dev/null || true
     sudo -u "$SUDO_USER" sh -c "cd '$REPO_ROOT/frontend' && npm ci --no-audit --no-fund --ignore-scripts --silent && npm run build"
   else
     warn "Building frontend as root — build-time deps run with full privileges. Run install.sh via 'sudo' from your normal user to drop them."

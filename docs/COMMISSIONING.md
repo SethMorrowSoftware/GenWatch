@@ -340,6 +340,22 @@ GenWatch sees the true switch state — **read-only, no commands yet.**
    `position` must match where the load actually is, and the Normal/
    Emergency availability chips must match the source breakers. Toggle a
    source breaker (if safe/planned) and confirm the chip follows.
+4. **Run the automated acceptance test** — a scripted pass/fail gate that
+   backs the manual cross-checks above with the full functionality +
+   safety suite, straight from the GenWatch Pi (stdlib only, no venv):
+   ```bash
+   # bench (simulated H-100 + live ATS-Pi):
+   GENWATCH_TEST_PASSWORD='<admin pw>' sudo -E python3 \
+     deploy/scripts/acceptance_test.py --expect-mock true \
+     --expected-unit-id 23 --local-checks
+   # production cutover (real H-100): use --expect-mock false
+   ```
+   It is **non-actuating** — it verifies the auth, CSRF, and confirm-token
+   gates without ever sending a valid confirm token, so it cannot start
+   the generator or drive the ATS even if a guard were broken. A clean run
+   prints `VERDICT: SAFE TO PROCEED` and exits 0 (so it can gate a
+   commissioning script). See the script header for the safety model and
+   the opt-in `--actuate-mock-generator` flag (simulated H-100 only).
 
 - **PASS:** ATS card reflects the real switch position + source
   availability; comms healthy + authoritative.
