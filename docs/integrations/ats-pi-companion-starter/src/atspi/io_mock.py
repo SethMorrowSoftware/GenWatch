@@ -86,6 +86,19 @@ class IOMockDriver:
         if bypass_delay_pulse_ms is not None:
             await self._pulse("bypass", bypass_delay_pulse_ms)
 
+    async def reset_outputs(self) -> None:
+        """Release every output and cancel pulse timers (see IODriver)."""
+        for t in (self._test_release_task, self._bypass_release_task):
+            if t is not None:
+                t.cancel()
+        self._test_release_task = None
+        self._bypass_release_task = None
+        self._test_active = False
+        self._inhibit_active = False
+        self._force_transfer_active = False
+        self._bypass_delay_active = False
+        log.info("mock: all outputs reset (released)")
+
     async def _pulse(self, which: str, duration_ms: int) -> None:
         # Clamp to ICD §6.1 (500-1500 ms)
         ms = max(500, min(1500, int(duration_ms)))

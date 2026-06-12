@@ -554,3 +554,72 @@ async def test_db_failure_does_not_crash_poll(ats, store, fake_db):
 
     # Snapshot was still updated even though events failed
     assert ats.snap.position == "generator"
+
+
+# ─── Maintained-command read-back edges (auto-release visibility) ────────
+
+
+def _cmd_external_events(fake_db) -> list:
+    return [
+        c.kwargs for c in fake_db.write_event.call_args_list
+        if c.kwargs.get("type_") == "ATS_COMMAND"
+    ]
+
+
+async def test_unexpected_inhibit_release_emits_warn(ats, store, fake_db):
+    """Read-back falls without a GenWatch release write — the §8.3
+    comms-loss auto-release (or a companion restart). The operator who
+    asserted Inhibit must see that it dropped."""
+    store.cmd_inhibit_active = True
+    await ats.on_poll("prime", store.as_reading("prime"), healthy())
+    await ats.on_poll("prime", store.as_reading("prime"), healthy())
+    fake_db.write_event.reset_mock()
+
+    store.cmd_inhibit_active = False
+    await ats.on_poll("prime", store.as_reading("prime"), healthy())
+
+    evts = _cmd_external_events(fake_db)
+    assert len(evts) == 1
+    assert evts[0]["severity"] == "warn"
+    assert "Inhibit" in evts[0]["message"]
+    assert "auto-release" in evts[0]["message"]
+
+
+async def test_operator_release_does_not_emit_external_event(ats, store, fake_db):
+    """An edge within the echo window of our own write is expected."""
+    store.cmd_inhibit_active = True
+    await ats.on_poll("prime", store.as_reading("prime"), healthy())
+    await ats.on_poll("prime", store.as_reading("prime"), healthy())
+    fake_db.write_event.reset_mock()
+
+    ats.note_command_write("inhibit", False)  # what AtsControlService does
+    store.cmd_inhibit_active = False
+    await ats.on_poll("prime", store.as_reading("prime"), healthy())
+
+    assert _cmd_external_events(fake_db) == []
+
+
+async def test_unexpected_force_transfer_assert_emits_warn(ats, store, fake_db):
+    """Read-back rises without a GenWatch assert — a foreign Modbus
+    client or companion fault drove the output."""
+    await ats.on_poll("prime", store.as_reading("prime"), healthy())
+    await ats.on_poll("prime", store.as_reading("prime"), healthy())
+    fake_db.write_event.reset_mock()
+
+    store.cmd_force_transfer_active = True
+    await ats.on_poll("prime", store.as_reading("prime"), healthy())
+
+    evts = _cmd_external_events(fake_db)
+    assert len(evts) == 1
+    assert evts[0]["severity"] == "warn"
+    assert "Force-transfer" in evts[0]["message"]
+    assert "outside GenWatch" in evts[0]["message"]
+
+
+async def test_first_poll_with_asserted_command_is_not_flagged(ats, store, fake_db):
+    """No baseline on the first poll after a GenWatch restart — a
+    command legitimately asserted before our restart must not warn."""
+    store.cmd_inhibit_active = True
+    await ats.on_poll("prime", store.as_reading("prime"), healthy())
+
+    assert _cmd_external_events(fake_db) == []

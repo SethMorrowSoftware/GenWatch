@@ -111,6 +111,15 @@ async def _amain(args: argparse.Namespace) -> int:
     store = RegisterStore(unit_id=cfg.site.unit_id, state_file=cfg.persistence.state_file)
     watchdog = SafetyWatchdog(store, driver)
 
+    # ICD §9.3 — come up with no commands asserted. The relays live in
+    # external hardware (ADAM-6060) and hold state across an atspi
+    # crash/restart: a force-transfer asserted before the crash, or a
+    # pulse whose release timer died with the old process, would
+    # otherwise stay closed indefinitely. The watchdog retries until
+    # the reset physically lands (the I/O module may be unreachable at
+    # boot).
+    watchdog.request_release("boot reset (ICD §9.3)")
+
     sample_task = asyncio.create_task(_sampling_loop(driver, store), name="sampling")
     command_task = asyncio.create_task(_command_loop(driver, store), name="command-dispatch")
     watchdog_task = asyncio.create_task(watchdog.run(), name="safety-watchdog")

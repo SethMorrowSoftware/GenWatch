@@ -72,6 +72,15 @@ _MODE_BY_VALUE = {
 # Time-skew threshold per ICD §11.
 _TIME_SKEW_THRESHOLD_S = 5.0
 
+# Read-back edges of the maintained commands (inhibit / force-transfer)
+# observed within this window of GenWatch's own write are just our
+# command echoing back — expected, no event. Edges OUTSIDE the window
+# were initiated by something else: the companion's ICD §8.3 comms-loss
+# auto-release, an ATS-Pi restart, or a foreign Modbus client on the
+# wire. One prime poll (1.5 s) + the ICD §6.2 500 ms actuation budget,
+# with generous slack for a degraded link.
+_CMD_ECHO_WINDOW_S = 10.0
+
 
 @dataclass
 class AtsSnapshot:
@@ -153,6 +162,19 @@ class AtsService:
         # Tracks whether we've ever successfully validated the ICD
         # version — guards against repeated error logs on every poll.
         self._icd_version_validated: bool = False
+        # Monotonic timestamps of GenWatch's own recent command writes,
+        # keyed by (command, asserted). Lets the read-back edge detector
+        # tell "our command echoed back" apart from "the companion (or
+        # something else) changed a driven output on its own" — most
+        # importantly the §8.3 comms-loss auto-release, which would
+        # otherwise silently flip an operator's asserted Inhibit off.
+        self._cmd_write_monotonic: dict[tuple[str, bool], float] = {}
+
+    def note_command_write(self, command: str, assert_: bool) -> None:
+        """Called by AtsControlService after each successful command
+        write, so the resulting read-back edge isn't flagged as an
+        externally-initiated change."""
+        self._cmd_write_monotonic[(command, bool(assert_))] = time.monotonic()
 
     # ─── Authority gate ────────────────────────────────────────────────
 
@@ -315,6 +337,15 @@ class AtsService:
                 ts=now,
             )
 
+        # Maintained-command read-back edges not caused by our own
+        # writes. A falling edge is most often the companion's §8.3
+        # comms-loss auto-release after a GenWatch outage — an operator
+        # who asserted Inhibit (e.g. to hold load off the generator
+        # during maintenance) must see that it dropped, not discover it
+        # from a transfer they believed was inhibited. A rising edge
+        # means something other than GenWatch drove the output.
+        self._check_maintained_cmd_edges(prev, cmd_inhibit, cmd_force, now, emitted)
+
         # ATS-Pi reboot detection — uptime going backwards from a known
         # non-zero baseline. We always update _prev_uptime_s afterwards
         # so a single reboot only fires one event (otherwise the next
@@ -414,6 +445,56 @@ class AtsService:
             await self._forward_to_slack(evt)
 
     # ─── Helpers ──────────────────────────────────────────────────────
+
+    def _check_maintained_cmd_edges(
+        self,
+        prev: AtsSnapshot,
+        cmd_inhibit: bool,
+        cmd_force: bool,
+        now: float,
+        emitted: list[dict[str, Any]],
+    ) -> None:
+        """Surface inhibit / force-transfer read-back edges that GenWatch
+        didn't command (see _CMD_ECHO_WINDOW_S). Warn severity — these
+        change what the transfer switch will do next and the operator
+        needs to know the asserted state they set is no longer in force
+        (or that a state they never set has appeared).
+        """
+        if prev.last_reading_ts == 0.0:
+            # First poll after GenWatch boot — no baseline to diff
+            # against, and a command legitimately asserted before our
+            # restart would otherwise warn spuriously.
+            return
+        mono = time.monotonic()
+        for command, label, was, is_now in (
+            ("inhibit", "Inhibit", prev.cmd_inhibit_active, cmd_inhibit),
+            ("force_transfer", "Force-transfer", prev.cmd_force_transfer_active, cmd_force),
+        ):
+            if was == is_now:
+                continue
+            wrote = self._cmd_write_monotonic.get((command, is_now))
+            if wrote is not None and (mono - wrote) <= _CMD_ECHO_WINDOW_S:
+                continue  # echo of our own command — expected
+            if is_now:
+                msg = (
+                    f"ATS {label} asserted outside GenWatch — check for a "
+                    f"foreign Modbus client on the ATS-Pi or a companion fault"
+                )
+            else:
+                msg = (
+                    f"ATS {label} released by the ATS-Pi without an operator "
+                    f"release — comms-loss auto-release (ICD §8.3) or a "
+                    f"companion restart"
+                )
+            self._emit_event(
+                emitted,
+                ev_type="ats-command-external",
+                payload={"command": command, "active": is_now},
+                severity="warn",
+                type_="ATS_COMMAND",
+                message=msg,
+                ts=now,
+            )
 
     def _emit_position(
         self,

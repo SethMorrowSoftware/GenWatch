@@ -241,9 +241,37 @@ The exact algorithm:
 5. Once a successful read happens again, the released-for-timeout
    flag clears and the watchdog re-arms.
 
+Two hard rules the reference implementation (`safety.py`) adds on top
+— keep them if you re-implement:
+
+- **A decided release is retried until it physically lands.** The
+  I/O drive can fail at exactly the wrong moment (ADAM unreachable
+  during a site-wide network fault). The watchdog retries every check
+  tick until `reset_outputs()` succeeds, and the pending release
+  survives a comms recovery — "tried once and logged it" is not a
+  release. (`tests/test_safety.py::test_release_retries_until_driver_recovers`)
+- **The same path runs at boot (ICD §9.3).** The ADAM's relays are
+  external hardware: they hold state across an atspi crash/restart. A
+  force-transfer asserted before a crash — or a pulse whose release
+  timer died with the old process — must be driven open by the new
+  process via `request_release("boot reset")`, not assumed clear
+  because the in-memory store starts at zero.
+
 **Test this with a real timer.** A unit test that mocks `time.monotonic`
 is not sufficient — the safety guarantee must hold against real wall
 time.
+
+> **Defense in depth — the watchdog can't outlive its own process.**
+> Everything above lives in the `atspi` process. If the ATS-Pi itself
+> dies (power loss, kernel hang, SD-card failure) with a maintained
+> command asserted, no software here can release the relay. Configure
+> the **ADAM-6060's own host-watchdog / Fail-Safe Value (FSV)** so the
+> module drives every DO open when Modbus traffic from the Pi stops —
+> see `docs/HARDWARE.md` §3.1. The same applies to reads: the §8.3
+> timer is fed by *any* successful Modbus read, so a diagnostic
+> poller (modpoll loop, second consumer) left running unattended will
+> keep the watchdog fed even when GenWatch is gone — don't leave one
+> running against a production unit.
 
 ---
 

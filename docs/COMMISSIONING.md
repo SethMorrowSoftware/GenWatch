@@ -236,14 +236,23 @@ confirm the one thing the software couldn't: the real ADAM register map.
    [ATS-Pi] ping -c 3 192.168.1.251
    [ATS-Pi] modpoll -m tcp -a 1 -r 1 -c 1 192.168.1.251   # packed DI register
    ```
-2. **Confirm the read map (DI).** Short each DI input in turn (or use the
+2. **Configure the ADAM's own protection** (while you're in the
+   Advantech utility — full rationale in the companion's
+   `docs/HARDWARE.md §3.1`): **power-on value OFF for DO 0–5**, and
+   **host watchdog / fail-safe enabled, timeout ~60 s, FSV OFF for
+   DO 0–5**. This is the only layer that can release a relay if the
+   ATS-Pi itself dies — the §8.3 software release can't outlive its
+   own process. Then verify the power-on half: assert a relay
+   (`modpoll`, or the utility's test page), **pull the ADAM's 24 VDC
+   and re-power it** — every relay must come back **open**.
+3. **Confirm the read map (DI).** Short each DI input in turn (or use the
    ADAM's test inputs) and confirm the packed DI register bit changes per
    `HARDWARE.md §3` (DI0 load-disconnect … DI5 engine-start). If your
    firmware exposes DI/DO differently than `io_adam.py`'s constants
    (`ADDR_PACKED_DI=0x0000`, `ADDR_PACKED_DO=0x0001`, DO coils `0x0010+`),
    **edit those constants** — they're isolated at the top of the file
    for exactly this.
-3. **Confirm the write map (DO) — relays only, nothing wired to the ASCO.**
+4. **Confirm the write map (DO) — relays only, nothing wired to the ASCO.**
    Bring up the companion against the ADAM:
    ```bash
    [ATS-Pi] sudo nano /etc/atspi/config.yaml     # io.driver: adam, io.adam.host: 192.168.1.251
@@ -272,22 +281,40 @@ confirm the one thing the software couldn't: the real ADAM register map.
    Repeat for test (`-r 257`, pulses + self-clears), force-transfer
    (`-r 259`), and bypass-delay (`-r 260`, pulses). (If your tool is
    `mbpoll`, the `-r` reference convention is the same.)
-4. **Verify the §8.3 safety auto-release on the real relay:** assert
+5. **Verify the §8.3 safety auto-release on the real relay:** assert
    inhibit (`-r 258` = 1), confirm DO2 closed, then **kill the laptop's
    Modbus session and wait**. Within **30 ± 5 s** the relay must drop and
    the read-back (`-r 66`) return to 0 with no further action.
+6. **Verify the §9.3 boot reset:** assert inhibit again, then restart
+   the service mid-assert (`[ATS-Pi] sudo systemctl restart atspi`, or
+   `kill -9` the process and let systemd restart it). On startup the
+   service must drive the relay **open** on its own —
+   `journalctl -u atspi` shows `output release requested: boot reset
+   (ICD §9.3)` followed by `outputs released`. A relay that stays
+   closed across a service restart fails this step.
+7. **Verify the ADAM fail-safe (FSV) end-to-end:** assert inhibit, then
+   **stop the service entirely** (`sudo systemctl stop atspi` — nothing
+   is polling the ADAM now, which models a dead/powerless ATS-Pi). The
+   **module itself** must drop the relay within the FSV timeout
+   configured in step 2 (~60 s). Restart the service afterwards.
 
 - **PASS:** every DI bit tracks its contact, every command clicks the
-  correct relay and reflects in the read-back, pulses self-clear, and the
-  30-second auto-release fires on a real relay.
+  correct relay and reflects in the read-back, pulses self-clear, the
+  30-second auto-release fires on a real relay, relays come up open on
+  ADAM power-up and on `atspi` restart, and the ADAM's own FSV drops a
+  relay with the service stopped.
 - **If it fails:** DI/DO mapping wrong → adjust `io_adam.py` constants or
   the HARDWARE §3 wiring plan. Auto-release didn't fire → check the
   `atspi` safety watchdog log; **do not wire to the ASCO until it does.**
+  FSV didn't fire → re-check the host-watchdog settings in the Advantech
+  utility (HARDWARE §3.1); **do not wire to the ASCO without it** — it is
+  the only release path that survives an ATS-Pi power loss.
 
 > **STOP GATE.** Do not wire the ADAM to the ASCO until every relay is
-> proven on the bench and the 30 s auto-release works.
+> proven on the bench and ALL THREE release paths work: the 30 s §8.3
+> auto-release, the §9.3 boot reset, and the module-level FSV.
 
-☐ Phase 5 complete — ADAM map + relays + auto-release verified on the bench — signed ______________ date __________
+☐ Phase 5 complete — ADAM map + relays + all three release paths verified on the bench — signed ______________ date __________
 
 ---
 
@@ -457,7 +484,7 @@ Record the deployed build below; this is the artifact the sign-off attests to.
 | H-100 register map suspect | Service stays read-only-safe; fix `h100.yaml`, `…/api/registers/reload`. No restart needed. |
 | ATS misbehaving | Set `ats.enabled: false`, `systemctl restart genwatch` → falls back to H-100-derived load source; the ATS keeps running on its **own** automatic logic regardless |
 | ATS-Pi / ADAM suspect | Power down the ATS-Pi — the ASCO operates normally on its own controller; GenWatch falls back to H-100 telemetry |
-| Maintained ATS command stuck | Kill the GenWatch session; the ATS-Pi auto-releases within 30 s (ICD §8.3) |
+| Maintained ATS command stuck | Kill the GenWatch session; the ATS-Pi auto-releases within 30 s (ICD §8.3). If the ATS-Pi itself is unresponsive, the ADAM's FSV opens the relays within its timeout (Phase 5 step 2). Ultimate manual fallback: **pull the ADAM's 24 VDC supply** — every relay is wired COM–NO, so de-energized = released. |
 
 ## Appendix B — Quick command reference
 

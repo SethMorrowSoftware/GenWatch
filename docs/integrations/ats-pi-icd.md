@@ -303,7 +303,7 @@ Every observable state change (position, source-availability, mode, fault) MUST 
 | Comms loss after `> 3 × prime_poll_ms` (default 4.5 s) raises a `comms` event of severity `warn` on the ATS link, distinct from the H-100 link's `comms` event. |
 | All ATS command buttons in the UI disable until the link recovers. |
 | Comms recovery raises an `ok`-severity comms event. |
-| If the ATS-Pi was unreachable for > 30 s, GenWatch assumes any commands it had asserted have auto-released per §8.3, and re-publishes them via fresh writes if the UI shows them as still-on (no operator intervention required). |
+| If the ATS-Pi was unreachable for > 30 s, GenWatch assumes any commands it had asserted have auto-released per §8.3. It MUST NOT silently re-assert them: the plant state may have changed since the operator's original intent, so an automatic re-assert of force-transfer or inhibit is more dangerous than leaving the ATS on its own automatic logic. Instead, GenWatch emits a warn-severity event when the read-back confirms the release; the operator re-issues the command deliberately if it is still wanted. |
 
 ### 9.2 GenWatch unreachable from ATS-Pi
 
