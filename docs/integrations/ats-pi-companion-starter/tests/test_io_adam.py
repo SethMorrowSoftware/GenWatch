@@ -192,6 +192,57 @@ async def test_output_fault_on_stuck_relay():
     assert snap.fault_bits & FAULT_OUTPUT
 
 
+async def test_reset_outputs_opens_all_command_relays():
+    """Boot/auto-release reset: every command relay driven open, even
+    state inherited from a previous process (fresh driver instance with
+    no commanded flags set, but the hardware DO bits still high)."""
+    fake = FakeAdam(
+        di=_bits(DI_ON_NORMAL),
+        do=_bits(DO_TEST, DO_FORCE_TRANSFER, DO_INHIBIT, io_adam.DO_BYPASS_DELAY),
+    )
+    d = _driver(fake)
+    out = await d.read_output_state()
+    assert out.force_transfer_active is True  # stale hardware state visible
+    await d.reset_outputs()
+    for ch in (DO_TEST, DO_FORCE_TRANSFER, DO_INHIBIT, io_adam.DO_BYPASS_DELAY):
+        assert (ch, False) in fake.coil_writes
+    out = await d.read_output_state()
+    assert out.test_active is False
+    assert out.force_transfer_active is False
+    assert out.inhibit_active is False
+    assert out.bypass_delay_active is False
+
+
+async def test_reset_outputs_cancels_inflight_pulse():
+    """A reset mid-pulse cancels the release timer — the relay is opened
+    by the reset itself and the dead timer must not fire a late write."""
+    fake = FakeAdam(di=_bits(DI_ON_NORMAL))
+    d = _driver(fake)
+    await d.drive_outputs(test_pulse_ms=500)
+    assert (await d.read_output_state()).test_active is True
+    await d.reset_outputs()
+    writes_after_reset = len(fake.coil_writes)
+    await asyncio.sleep(0.6)  # past the pulse duration
+    assert len(fake.coil_writes) == writes_after_reset, (
+        "cancelled pulse timer must not issue a late coil write"
+    )
+    assert (await d.read_output_state()).test_active is False
+
+
+async def test_reset_outputs_raises_on_write_failure_for_retry():
+    """A failed coil write must surface to the caller (the safety
+    watchdog retries the whole reset) — never be swallowed as success."""
+    fake = FakeAdam(di=_bits(DI_ON_NORMAL), do=_bits(DO_INHIBIT))
+
+    async def _failing_write_coil(address, value, slave):
+        return _FakeRR(error=True)
+
+    fake.write_coil = _failing_write_coil
+    d = _driver(fake)
+    with pytest.raises(OSError):
+        await d.reset_outputs()
+
+
 async def test_assume_auto_mode_default_and_unknown_option():
     fake = FakeAdam(di=_bits(DI_ON_NORMAL))
     assert (await _driver(fake).read_inputs()).ats_mode == "auto"

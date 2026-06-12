@@ -67,6 +67,44 @@ becomes a single channel on the ADAM-6060.
 **Do not** wire DO 4 or DO 5 to ATS terminals 14, 15, or 16 — those are
 factory-use only.
 
+**Wire every DO through the relay's normally-open (COM–NO) contact —
+never NC.** The safety model of the whole stack assumes *de-energized
+relay = command released*: the §8.3 comms-loss auto-release, the boot
+reset, the ADAM fail-safe below, and a plain 24 VDC supply failure all
+work by dropping the relay. A channel wired COM–NC inverts that — a
+power loss would then *assert* force-transfer or inhibit, which is the
+worst possible failure mode. Verify polarity on the bench with the
+ADAM powered **down**: every ASCO-facing circuit must read open.
+
+### 3.1 ADAM-6060 fail-safe configuration (REQUIRED before Phase 6 wiring)
+
+The `atspi` service releases the relays when **GenWatch** goes silent
+(ICD §8.3) and drives them open at **its own** startup (ICD §9.3) — but
+no software on the Pi can release anything if the **Pi itself** dies
+(power loss, kernel hang, corrupted SD card) while force-transfer or
+inhibit is asserted. The ADAM's relays simply hold their last state.
+
+Close that gap with the module's own protection features (Adam/Apax
+.NET Utility → the module's I/O configuration tab; menu names vary
+slightly by firmware — see the ADAM-6000 series manual):
+
+1. **Power-on value (PWV): OFF for DO 0–5.** After a 24 VDC
+   interruption the module must come back with every relay open, not
+   restore the pre-outage state.
+2. **Host watchdog / communication fail-safe: enabled**, timeout
+   ~**60 s**, **Fail-Safe Value (FSV): OFF for DO 0–5.** If the module
+   sees no Modbus traffic from the Pi for the timeout, it drives every
+   relay open on its own. The `atspi` sampling loop polls at 10 Hz, so
+   any healthy service keeps it fed with two orders of magnitude of
+   margin; 60 s keeps a brief service restart (`systemctl restart
+   atspi`) from bouncing the relays.
+
+Both settings are verified on the bench in `COMMISSIONING.md` Phase 5
+**before** any wire lands on the ASCO: power-cycle the ADAM and confirm
+the relays come up open, then assert inhibit and kill the `atspi`
+process (or pull the Pi↔ADAM cable) and confirm the module drops the
+relay by itself within the FSV timeout.
+
 ## 4. Network
 
 - ADAM-6060: static IP, recommend `192.168.1.251`, on the OT VLAN

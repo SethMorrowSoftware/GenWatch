@@ -95,3 +95,20 @@ class IODriver(Protocol):
         by the driver to enforce the contract on the wire.
         """
         ...
+
+    async def reset_outputs(self) -> None:
+        """Drive EVERY command output to its released/de-energized state
+        and cancel any in-flight pulse timers.
+
+        The I/O hardware (ADAM-6060 relays) is external to this process
+        and holds state across a crash/restart — an asserted
+        force-transfer, or a pulse whose release timer died with the
+        process, survives into the next boot unless explicitly cleared.
+        Called at service start (ICD §9.3 "no commands asserted" boot
+        state) and by the safety watchdog's comms-loss auto-release
+        (ICD §8.3).
+
+        Raises on I/O failure so the caller can retry until the release
+        physically lands — a failed release MUST NOT be treated as done.
+        """
+        ...

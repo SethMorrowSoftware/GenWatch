@@ -217,6 +217,11 @@ class AtsControlService:
             )
             raise ControlError("ats_modbus_failed", f"ATS Modbus write failed: {res.error}", 502)
 
+        # Record the write so AtsService's read-back edge detector can
+        # tell this command's echo apart from an externally-initiated
+        # change (§8.3 auto-release, companion restart, foreign client).
+        self.ats.note_command_write(command, assert_)
+
         self.db.write_audit(
             operator,
             f"ats.{command}",

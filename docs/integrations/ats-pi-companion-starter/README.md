@@ -62,6 +62,19 @@ src/atspi/
   io_adam.py        — Advantech ADAM-6060 driver (implemented; verify the
                       Modbus address map on your unit per docs/HARDWARE.md §6)
 
+The safety model is layered — all three release paths are bench-verified
+in GenWatch's COMMISSIONING.md Phase 5 before any wire lands on the ASCO:
+
+  1. §8.3 comms-loss auto-release — GenWatch goes silent ⇒ this service
+     releases the maintained relays within 30 s (retried until the
+     release physically lands).
+  2. §9.3 boot reset — this service drives every relay open at startup,
+     clearing anything a crashed previous process left asserted.
+  3. ADAM-6060 host-watchdog FSV (docs/HARDWARE.md §3.1) — this *Pi*
+     dies ⇒ the I/O module itself drives every relay open. The only
+     path that survives an ATS-Pi power loss; configure it, it is not
+     optional.
+
 docs/
   SPEC.md           — implementation specification (companion to the ICD)
   HARDWARE.md       — BOM, wiring, install

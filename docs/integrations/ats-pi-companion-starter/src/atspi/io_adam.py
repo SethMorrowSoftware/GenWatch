@@ -276,6 +276,30 @@ class IOAdamDriver:
         if bypass_delay_pulse_ms is not None:
             await self._pulse(DO_BYPASS_DELAY, "bypass", bypass_delay_pulse_ms)
 
+    async def reset_outputs(self) -> None:
+        """Drive all four command relays open and clear commanded state.
+
+        See IODriver.reset_outputs — used for the ICD §9.3 boot reset
+        and the §8.3 comms-loss auto-release. The ADAM's relays persist
+        across an atspi restart, so "the store starts cleared" is not
+        enough; the physical channels must be driven low. Raises on the
+        first failed coil write so the caller retries the whole reset
+        (re-writing an already-open relay is harmless).
+        """
+        for t in (self._test_release_task, self._bypass_release_task):
+            if t is not None:
+                t.cancel()
+        self._test_release_task = None
+        self._bypass_release_task = None
+        # Clear commanded state first so a partial failure can't leave
+        # the read-back fault check comparing against a stale "commanded
+        # high" while we're trying to drive everything low.
+        self._cmd_inhibit = False
+        self._cmd_force = False
+        for ch in (DO_TEST, DO_FORCE_TRANSFER, DO_INHIBIT, DO_BYPASS_DELAY):
+            await self._write_do(ch, False)
+        log.info("ADAM: all command relays driven open (reset)")
+
     async def _pulse(self, ch: int, which: str, duration_ms: int) -> None:
         ms = max(PULSE_MIN_MS, min(PULSE_MAX_MS, int(duration_ms)))
         await self._write_do(ch, True)
