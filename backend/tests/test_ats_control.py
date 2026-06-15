@@ -331,3 +331,41 @@ async def test_release_allowed_when_not_authoritative(regmap, fake_db, bus, cont
     )
     assert res["ok"] is True
     assert client.writes == [(0x0102, 0x0000, 6, None)]
+
+
+# ─── Command-endpoint rate limiting ──────────────────────────────────────
+
+
+async def test_command_endpoint_rate_limited(regmap, fake_db, authoritative_ats, control):
+    """The ATS command endpoints are per-operator rate-limited so a client
+    can't loop token->command pairs and flap a maintained relay faster than
+    an operator could react. The confirm-token flow blocks blind replay; this
+    is the additional flood guard at the API layer."""
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    from genwatch.api.ats import _run
+    from genwatch.services.ratelimit import RateLimiter
+
+    ats, _store = authoritative_ats
+    client = FakeClient()
+    svc = AtsControlService(regmap, client, fake_db, ats, control, slack=None)
+    limiter = RateLimiter(capacity=2, refill_per_s=0.0)  # 2 allowed, then blocked
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(ats_control=svc, command_limiter=limiter, db=fake_db)
+        )
+    )
+    p = SimpleNamespace(operator="op", role="operator")
+
+    # First two pulses pass the limiter (fresh token each).
+    await _run(request, "test", await _token(control), p)
+    await _run(request, "test", await _token(control), p)
+    # Third is rate-limited → 429 before consuming a token or writing.
+    n_writes = len(client.writes)
+    with pytest.raises(HTTPException) as ei:
+        await _run(request, "test", await _token(control), p)
+    assert ei.value.status_code == 429
+    assert ei.value.detail["code"] == "rate_limited"
+    assert len(client.writes) == n_writes  # nothing actuated

@@ -68,10 +68,12 @@ def watchdog_interval_s() -> float | None:
 # init, etc.) — those resolve well under a minute in practice. Five
 # minutes leaves comfortable headroom for unusual cases while bounding
 # how long a misconfigured host (wrong IP, wrong port) can keep the
-# service "healthy" to systemd. Past the cap, systemd's `Restart=always`
-# + `StartLimitBurst=10 / IntervalSec=600` will eventually flip the
-# unit to `failed`, surfacing the misconfiguration to the operator
-# instead of leaving the service silently zombie.
+# service "healthy" to systemd. Past the cap we withhold the ping so
+# systemd's WatchdogSec elapses and SIGKILL+restarts the unit; with the
+# start rate limiter disabled (StartLimitIntervalSec=0) it keeps restarting
+# on the RestartSec cadence, so a misconfigured host surfaces as a visible
+# restart loop in the journal rather than a silently-zombie "healthy"
+# service.
 WATCHDOG_COLD_START_GRACE_S = 300.0
 
 
