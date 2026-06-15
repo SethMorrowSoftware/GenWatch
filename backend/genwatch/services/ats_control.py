@@ -58,6 +58,23 @@ def _role_satisfies(role: str, required: str) -> bool:
     return _ROLE_RANK.get(role, 0) >= _ROLE_RANK.get(required, 99)
 
 
+# Faults that block ASSERTING a command. A release (de-energizing a relay)
+# is the fail-safe direction and is never blocked by a fault. INPUT_FAULT /
+# CALIBRATION already drop authority in AtsService.is_authoritative() (so an
+# assert is refused as "not authoritative" before reaching this set); they
+# are listed here too so the gate is correct even if authority semantics
+# change. OUTPUT_FAULT = a driven relay disagrees with its read-back (a stuck
+# relay — don't pile another command on top); MODE_UNKNOWN = the ATS mode
+# can't be verified, so we can't confirm the command is permitted in the
+# current mode (ICD §6.1).
+_ASSERT_BLOCKING_FAULTS = frozenset({
+    "ATS_PI_INPUT_FAULT",
+    "ATS_PI_CALIBRATION",
+    "ATS_PI_OUTPUT_FAULT",
+    "ATS_PI_MODE_UNKNOWN",
+})
+
+
 @dataclass(frozen=True)
 class AtsCommandSpec:
     """Maps an API command to ATS-Pi control register(s) + policy."""
@@ -134,8 +151,7 @@ class AtsControlService:
         # lock internally and releases it before we write; control.execute
         # never acquires this lock, so there's no lock-ordering cycle.
         async with self._lock:
-            # Authority gate. The ATS-Pi's own comms health (independent
-            # of the H-100 link) decides whether we can drive its outputs.
+            # A LOST link can't carry a write in either direction.
             comms_state = self.ats.snap.comms.state
             if comms_state == "lost":
                 self.db.write_audit(operator, f"ats.{command}", "ats_comms=lost", token, "denied")
@@ -145,15 +161,6 @@ class AtsControlService:
                     f"disabled until the companion device is reachable.",
                     502,
                 )
-            if not self.ats.is_authoritative():
-                self.db.write_audit(operator, f"ats.{command}", "not_authoritative", token, "denied")
-                raise ControlError(
-                    "ats_not_authoritative",
-                    f"cannot {command}: ATS-Pi link is not authoritative "
-                    f"(comms degraded, ICD-version mismatch, or unit-id "
-                    f"mismatch). Command refused for safety.",
-                    409,
-                )
 
             # Resolve the control register. Maintained commands pick
             # assert vs release; momentary commands always assert/pulse.
@@ -162,21 +169,58 @@ class AtsControlService:
             else:
                 ctl_name = spec.assert_control
 
-            # Force-transfer healthy-utility guard (assert only). Don't
-            # drop a healthy utility feed onto the generator without an
-            # explicit override flag from the operator.
-            if command == "force_transfer" and assert_ and not override:
-                if self.ats.snap.normal_available is True:
-                    self.db.write_audit(
-                        operator, f"ats.{command}", "normal_available_no_override", token, "denied"
-                    )
+            # An assert drives a relay closed (or pulses one); a release
+            # drives it open. Releasing is the fail-safe direction, so the
+            # authority and fault gates below apply to ASSERTS ONLY — an
+            # operator (or the UI) must always be able to back a command out,
+            # even when the link is degraded or the ATS-Pi is faulted.
+            is_assert = spec.kind != "maintained" or assert_
+            if is_assert:
+                # Asserts require a trustworthy, authoritative link: we must
+                # be able to believe the read-back and the reported position
+                # before driving an output. A degraded link, ICD-version or
+                # unit-id mismatch, or a position-tainting fault (INPUT_FAULT /
+                # CALIBRATION — including the hybrid "reachable but blind"
+                # serial-sense loss) all drop authority.
+                if not self.ats.is_authoritative():
+                    self.db.write_audit(operator, f"ats.{command}", "not_authoritative", token, "denied")
                     raise ControlError(
-                        "override_required",
-                        "force-transfer refused: the utility (normal) source is "
-                        "AVAILABLE. Re-issue with override to transfer the load "
-                        "onto the generator anyway.",
+                        "ats_not_authoritative",
+                        f"cannot {command}: ATS-Pi link is not authoritative "
+                        f"(comms degraded, ICD-version/unit-id mismatch, or the "
+                        f"ATS-Pi cannot currently trust its own position sense). "
+                        f"Command refused for safety.",
                         409,
                     )
+                # Additionally refuse an assert on a fault that authority does
+                # not already cover (OUTPUT_FAULT / MODE_UNKNOWN). Releases are
+                # unaffected — handled by the is_assert guard above.
+                blocking = self.ats.snap.fault_codes & _ASSERT_BLOCKING_FAULTS
+                if blocking:
+                    codes = ",".join(sorted(blocking))
+                    self.db.write_audit(operator, f"ats.{command}", f"fault:{codes}", token, "denied")
+                    raise ControlError(
+                        "ats_fault",
+                        f"cannot {command}: ATS-Pi reports {codes}. Asserting a "
+                        f"command is refused until the fault clears; a release is "
+                        f"still permitted.",
+                        409,
+                    )
+
+                # Force-transfer healthy-utility guard. Don't drop a healthy
+                # utility feed onto the generator without an explicit override.
+                if command == "force_transfer" and not override:
+                    if self.ats.snap.normal_available is True:
+                        self.db.write_audit(
+                            operator, f"ats.{command}", "normal_available_no_override", token, "denied"
+                        )
+                        raise ControlError(
+                            "override_required",
+                            "force-transfer refused: the utility (normal) source is "
+                            "AVAILABLE. Re-issue with override to transfer the load "
+                            "onto the generator anyway.",
+                            409,
+                        )
 
             ctl: ControlDef | None = self.regmap.controls.get(ctl_name) if ctl_name else None
             if ctl is None:

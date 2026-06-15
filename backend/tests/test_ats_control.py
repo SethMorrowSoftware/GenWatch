@@ -268,3 +268,66 @@ async def test_unknown_command_rejected(ats_control):
     with pytest.raises(ControlError) as ei:
         await svc.execute("detonate", token=await _token(control), operator="op", role="operator")
     assert ei.value.code == "unknown_command"
+
+
+# ─── Fault gating: blind/faulted ATS-Pi refuses asserts, allows releases ──
+
+
+async def test_input_fault_blocks_assert(regmap, fake_db, bus, control):
+    """An assert is refused while the ATS-Pi reports INPUT_FAULT (blind
+    sense) even though the Modbus link is healthy — INPUT_FAULT drops
+    authority, so it surfaces as a 409 and nothing is written (audit
+    CRITICAL: 'reachable but blind')."""
+    ats = AtsService(regmap, fake_db, bus, slack=None)
+    store = MockAtsPiStore()
+    store.set_fault_bit(0x0001)  # INPUT_FAULT
+    await ats.on_poll("base", store.as_reading("base"), healthy())
+    assert not ats.is_authoritative()
+    client = FakeClient()
+    svc = AtsControlService(regmap, client, fake_db, ats, control, slack=None)
+    with pytest.raises(ControlError) as ei:
+        await svc.execute("test", token=await _token(control), operator="op", role="operator")
+    assert ei.value.http_status == 409
+    assert client.writes == []
+
+
+async def test_output_fault_blocks_assert_but_allows_release(regmap, fake_db, bus, control):
+    """OUTPUT_FAULT keeps the link authoritative (position still trusted) but
+    blocks a command ASSERT (a relay is misbehaving). A maintained RELEASE
+    must still go through — releasing is the fail-safe direction."""
+    ats = AtsService(regmap, fake_db, bus, slack=None)
+    store = MockAtsPiStore()
+    store.set_fault_bit(0x0002)  # OUTPUT_FAULT
+    await ats.on_poll("base", store.as_reading("base"), healthy())
+    assert ats.is_authoritative()
+    client = FakeClient()
+    svc = AtsControlService(regmap, client, fake_db, ats, control, slack=None)
+
+    with pytest.raises(ControlError) as ei:
+        await svc.execute("inhibit", token=await _token(control), operator="op", role="operator", assert_=True)
+    assert ei.value.code == "ats_fault"
+    assert ei.value.http_status == 409
+    assert client.writes == []
+
+    res = await svc.execute("inhibit", token=await _token(control), operator="op", role="operator", assert_=False)
+    assert res["ok"] is True
+    assert client.writes == [(0x0101, 0x0000, 6, None)]
+
+
+async def test_release_allowed_when_not_authoritative(regmap, fake_db, bus, control):
+    """A maintained-command RELEASE is permitted even when the link is
+    non-authoritative (here: ICD-major mismatch). Backing a command out is
+    the safe direction and must never be blocked."""
+    ats = AtsService(regmap, fake_db, bus, slack=None)
+    store = MockAtsPiStore()
+    store.icd_major = 2  # non-authoritative, comms healthy
+    await ats.on_poll("base", store.as_reading("base"), healthy())
+    assert not ats.is_authoritative()
+    client = FakeClient()
+    svc = AtsControlService(regmap, client, fake_db, ats, control, slack=None)
+    res = await svc.execute(
+        "force_transfer", token=await _token(control, "admin"),
+        operator="admin", role="admin", assert_=False,
+    )
+    assert res["ok"] is True
+    assert client.writes == [(0x0102, 0x0000, 6, None)]

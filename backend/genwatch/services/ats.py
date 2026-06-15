@@ -82,6 +82,23 @@ _TIME_SKEW_THRESHOLD_S = 5.0
 _CMD_ECHO_WINDOW_S = 10.0
 
 
+# Fault bits (ICD §5.1.1) that make the ATS-Pi's reported `position`
+# untrustworthy, so GenWatch must NOT treat the ATS-Pi as the authoritative
+# loadSource while one is active:
+#   - ATS_PI_INPUT_FAULT — a position/availability sense input is stuck or
+#     failing. In a hybrid (serial-sensing) deployment this is also raised
+#     when the ASCO Group 5 RS-485 link drops, in which case the ATS-Pi keeps
+#     serving its LAST-GOOD position over a still-healthy Modbus TCP link
+#     ("reachable but blind"). Trusting it would display — and let an operator
+#     act on — a frozen position.
+#   - ATS_PI_CALIBRATION — both position-sense signals asserted at once, a
+#     physically impossible reading (welded/miswired contact or bad status bit).
+# When either is set, is_authoritative() returns False: loadSource falls back
+# to the H-100 derivation (with the "(via gen telemetry)" provenance) and
+# operator command *asserts* are refused (see services/ats_control.py).
+_POSITION_FAULTS = frozenset({"ATS_PI_INPUT_FAULT", "ATS_PI_CALIBRATION"})
+
+
 @dataclass
 class AtsSnapshot:
     """Live snapshot of the ATS-Pi's reported state.
@@ -188,6 +205,9 @@ class AtsService:
           - ICD major version matches what this consumer was built for
           - at least one base poll has completed (so ICD version is real)
           - expected_unit_id, if configured, matches the device
+          - no position-tainting fault is active (INPUT_FAULT / CALIBRATION):
+            the link can be perfectly healthy yet the reported position be
+            stale or impossible — the hybrid "reachable but blind" case.
         """
         if self.snap.comms.state != "healthy":
             return False
@@ -199,6 +219,12 @@ class AtsService:
             self.expected_unit_id is not None
             and self.snap.ats_pi_unit_id != self.expected_unit_id
         ):
+            return False
+        # A position-tainting fault means the Modbus link can be healthy
+        # while the reported position is stale (frozen on serial-sense loss)
+        # or physically impossible. Don't drive loadSource from it — fall
+        # back to the H-100 derivation (see _POSITION_FAULTS).
+        if self.snap.fault_codes & _POSITION_FAULTS:
             return False
         return True
 
