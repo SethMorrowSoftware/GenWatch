@@ -3,8 +3,8 @@
 | | |
 |---|---|
 | **Version** | 1.0 |
-| **Status** | Draft — pending sign-off by both teams |
-| **Effective** | TBD |
+| **Status** | **Signed off** — wire contract verified compatible end-to-end (GenWatch consumer ↔ ATS-Pi companion). |
+| **Effective** | 2026-06-15 |
 | **Owner (GenWatch side)** | GenWatch project |
 | **Owner (ATS-Pi side)** | (TBD — companion project team) |
 | **Supersedes** | Sections 3-5 of `docs/integrations/asco-series-300.md` (Path B) for sites that deploy an ATS-Pi |
@@ -64,7 +64,7 @@ Out of scope:
                           │   project)  │
                           └──┬──────────┘
                              │
-                             │  Modbus TCP, port 502
+                             │  Modbus TCP, port 5020
                              │  unit ID 1, this ICD's register map
                              │
                   ──────────────────────────────  OT VLAN
@@ -85,6 +85,8 @@ Out of scope:
 
 **Implication:** the entire physical layer (contact debounce, pulse timing, electrical isolation) is the ATS-Pi's responsibility. Bugs there don't surface as GenWatch bugs.
 
+**Driver-agnostic.** How the ATS-Pi obtains the ASCO's state internally — dry contacts through an ADAM-6060 I/O module, the ASCO Group 5 controller's own status over RS-485 serial, or a hybrid (serial for sensing, ADAM for the command relays) — is an ATS-Pi implementation detail. It serves the identical register map either way; GenWatch cannot tell which driver is in use and does not need to.
+
 ---
 
 ## 3. Transport
@@ -94,7 +96,7 @@ Out of scope:
 | Protocol | **Modbus TCP** (MBAP-framed) | *Not* Modbus-RTU-over-TCP. Use the `socket` framer in pymodbus terms. |
 | Server | ATS-Pi | Listens on the configured port |
 | Client | GenWatch | Opens a long-lived TCP connection |
-| Port | **502** | Standard Modbus TCP port. Configurable on the ATS-Pi for sites that already have something else on 502, but **502 is the default and recommended value**. |
+| Port | **5020** | The ATS-Pi runs as a non-root service and binds a high port (no `CAP_NET_BIND_SERVICE` / no root), so **5020 is the default and recommended value**. Configurable on the ATS-Pi; GenWatch's `ats.port` MUST match whatever the companion is set to. |
 | Unit ID | **1** | The ATS-Pi exposes one unit. |
 | Read functions accepted | **FC03** (read holding registers), **FC04** (read input registers — same address space, identical content) | GenWatch will use FC03. FC04 support is optional but recommended for diagnostic tools. |
 | Write functions accepted | **FC06** (write single register), **FC16** (write multiple registers) | All defined commands fit in single-register writes; FC16 is permitted for future multi-word commands. |
@@ -169,7 +171,7 @@ These are the high-priority signals — GenWatch polls them every 1.5 s.
 | 0 | `0x0001` | `INPUT_FAULT` | One or more ATS contact inputs are stuck or failing (e.g. both 14AA and 14BA reading low) |
 | 1 | `0x0002` | `OUTPUT_FAULT` | A driven relay failed the read-back check (commanded high but reading low) |
 | 2 | `0x0004` | `MODE_UNKNOWN` | `ats_mode` cannot be determined |
-| 3 | `0x0008` | `CALIBRATION` | The ATS-Pi has detected an unexpected contact-state combination requiring operator review |
+| 3 | `0x0008` | `CALIBRATION` | Impossible position state — both position-sense contacts (14AA *and* 14BA) read asserted at once. A physically impossible combination: welded/miswired aux contact, or a bad Group 5 status bit. Not a transient — requires operator review of the aux contacts / Group 5 status map. |
 | 4-15 | — | RESERVED | Must be 0 |
 
 GenWatch will surface any non-zero `fault_summary` as a warn-severity alarm with code `ATS_PI_FAULT` and a meta string decoding the active bits.
@@ -198,8 +200,8 @@ All timestamps are **Unix epoch seconds (UTC), u32 big-endian**.
 
 | Addr | Words | Type | Field | Encoding | Notes |
 |---|---|---|---|---|---|
-| `0x0030` | 1 | u16 | `icd_version_major` | unsigned int | This document's version (current: `1`). GenWatch refuses to start the ATS poller if `major` doesn't match its compiled-in expectation. |
-| `0x0031` | 1 | u16 | `icd_version_minor` | unsigned int | Minor version (current: `0`). GenWatch warns but continues if the ATS-Pi's minor is ahead of its expectation (forward-compat); errors if behind. |
+| `0x0030` | 1 | u16 | `icd_version_major` | unsigned int | This document's version (current: `1`). On a `major` mismatch GenWatch drops the ATS-Pi as authoritative — loadSource falls back to the H-100 derivation (§10) and a warn-severity event is raised — but the poller keeps running, so the ATS block still appears in the UI flagged non-authoritative. |
+| `0x0031` | 1 | u16 | `icd_version_minor` | unsigned int | Minor version (current: `0`). A minor mismatch never blocks operation — only a **major** mismatch drops the ATS-Pi as authoritative (§10). Minor-ahead logs an info note (the companion may expose registers this GenWatch build doesn't read); minor-behind logs an error and raises a warn-severity event (registers GenWatch expects read as `0`), but GenWatch keeps operating on the fields it can read. |
 | `0x0032` | 1 | u16 | `ats_pi_fw_major` | unsigned int | ATS-Pi software major version. Diagnostic only. |
 | `0x0033` | 1 | u16 | `ats_pi_fw_minor` | unsigned int | |
 | `0x0034` | 1 | u16 | `ats_pi_fw_patch` | unsigned int | |
@@ -222,7 +224,7 @@ Each command register at `0x0100+N` has a corresponding read-back at `0x0040+N`.
 
 ## 6. Write register map
 
-GenWatch writes to these registers to drive the ATS commands. All writes are FC06 (single register) with the values defined below. The ATS-Pi MUST validate the value and ignore any write that doesn't match a defined pattern (returning Modbus exception `0x03` — illegal data value).
+GenWatch writes to these registers to drive the ATS commands. All writes are FC06 (single register) with the values defined below. The ATS-Pi MUST validate the value and reject any write that doesn't match a defined pattern by returning a Modbus exception. **GenWatch treats *any* Modbus exception (or write failure) as "command rejected" and does not inspect the exception code** — so the specific codes called out below are advisory conventions (useful for diagnostic tools), not a distinction GenWatch enforces.
 
 ### 6.1 Command registers (`0x0100 – 0x010F`)
 
@@ -232,13 +234,13 @@ GenWatch writes to these registers to drive the ATS commands. All writes are FC0
 | `0x0101` | `cmd_inhibit` | Write `0x0001` to assert, `0x0000` to release | Maintained signal on the ASCO inhibit input (terminals 10-11). Stays asserted until released or until the ATS-Pi loses comms with GenWatch for > 30 s (safety auto-release — see §8.3). | `auto`, `manual` |
 | `0x0102` | `cmd_force_transfer` | Write `0x0001` to assert, `0x0000` to release | Maintained signal on the ASCO force-transfer-to-emergency input (terminals 8-9). Same comms-timeout auto-release as inhibit. **High consequence — admin-only on the GenWatch side.** | `auto` only |
 | `0x0103` | `cmd_bypass_delay` | Write `0x0001` | Pulses the bypass-delay input (terminals 12-13) for **≥ 500 ms, ≤ 1500 ms**. | `auto` only |
-| `0x0104` – `0x010F` | — | — | RESERVED — ignore writes, return exception 0x03 | — |
+| `0x0104` – `0x010F` | — | — | RESERVED — reject writes with a Modbus exception (`0x03` illegal data value by convention) | — |
 
 ### 6.2 Write semantics
 
 - A write to any command register MUST return success (not an exception) within 100 ms of receipt, even if the actual relay actuation takes longer.
 - The driven output state MUST be reflected in the corresponding read-back register (`0x0040+N`) within 500 ms.
-- If the ATS-Pi cannot honour a write because of a permitted-mode restriction (see "Permitted in" column), it MUST return Modbus exception `0x04` (server device failure) and surface `fault_summary` bit `INPUT_FAULT` until the next valid command attempt clears it.
+- If the ATS-Pi cannot honour a write because of a permitted-mode restriction (see "Permitted in" column), it MUST reject the write with a Modbus exception (`0x04` server device failure by convention) and surface `fault_summary` bit `INPUT_FAULT` until the next valid command attempt clears it. As above, GenWatch does not distinguish exception codes — any exception surfaces to the operator as a rejected command (HTTP 502).
 
 ---
 

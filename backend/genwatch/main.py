@@ -234,6 +234,21 @@ async def lifespan(app: FastAPI):
             "ATS-Pi integration enabled — %s:%d slave=%d",
             settings.ats.host, settings.ats.port, settings.ats.slave,
         )
+        # Cross-site safety: with no expected_unit_id, the authority gate
+        # skips the unit-id check (ats.py::is_authoritative) and GenWatch
+        # will trust ANY ATS-Pi answering at this host IP — a wrong-site
+        # cross-wire or a re-used IP pointing at the wrong device would go
+        # undetected and feed bad position/availability into the operator
+        # UI. Warn loudly so the omission is visible in the journal.
+        if settings.ats.expected_unit_id is None:
+            log.warning(
+                "ats.expected_unit_id is NOT set — GenWatch will treat ANY "
+                "ATS-Pi reachable at %s:%d as authoritative, with no defence "
+                "against a wrong-site cross-wire. Set ats.expected_unit_id in "
+                "/etc/genwatch/config.yaml to this site's ATS-Pi unit id "
+                "(register 0x0035) to enable the cross-site guard.",
+                settings.ats.host, settings.ats.port,
+            )
     else:
         log.info("ATS-Pi integration disabled (ats.enabled=false)")
 

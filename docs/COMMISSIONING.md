@@ -352,7 +352,7 @@ GenWatch sees the true switch state — **read-only, no commands yet.**
    #   ats:
    #     enabled: true
    #     host: 192.168.1.250        # the ATS-Pi (not the ADAM)
-   #     port: 502                  # or 5020 — match the atspi server
+   #     port: 5020                 # ATS-Pi default; use 502 only if the companion is set to it
    #     expected_unit_id: 23
    sudo systemctl restart genwatch
    journalctl -u genwatch -f        # expect "ATS-Pi integration enabled"
