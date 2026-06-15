@@ -905,20 +905,16 @@ design_handoff_genwatch/                  Original design spec — keep as
                                           lives at frontend/src/styles/
                                           genwatch.css.
 
-docs/integrations/                        Wire contracts + integration plans
-  asco-series-300.md                      DIY Modbus I/O island for sites
-                                          without an ATS-Pi (Path B).
+docs/integrations/                        Wire contract + integration plan
   ats-pi-icd.md                           ATS-Pi ↔ GenWatch wire contract.
                                           Companion repo reads this.
   ats-pi-plan.md                          Phased integration plan
                                           (Phases 1-3 shipped on the
                                           GenWatch side & validated against
                                           the mock; live ATS commands still
-                                          gated on the companion ADAM driver
-                                          + §8.3 comms-loss auto-release).
-  ats-pi-companion-starter/               Starter handed to the companion
-                                          repo team — runnable mock,
-                                          hardened systemd unit, ICD test.
+                                          gated on commissioning the hybrid
+                                          ATS-Pi — Group-5 serial sense +
+                                          ADAM-6060 command relays).
 ```
 
 ### API contract

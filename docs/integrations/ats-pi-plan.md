@@ -5,7 +5,7 @@
 | **Version** | 1.1 |
 | **Status** | Phases 1-3 **software-complete on both sides** (GenWatch consumer + ATS-Pi companion, validated against mocks); live ATS commands gated only on hardware commissioning (ADAM address-map verification + field wiring + ICD §13 golden run). |
 | **Companion document** | [`ats-pi-icd.md`](./ats-pi-icd.md) — the wire contract |
-| **Supersedes (partially)** | [`asco-series-300.md`](./asco-series-300.md) Path B sections 3-5, for sites with an ATS-Pi |
+| **Hardware / wiring** | Owned by the companion project — see the [`ats-pi-companion`](https://github.com/SethMorrowSoftware/ats-pi-companion) repo (`HARDWARE.md` + the RS-485 bench-verify guide) |
 
 > **What this document is.** A phased plan for the GenWatch side of the
 > ATS-Pi integration. Covers what GenWatch needs to build, in what order,
@@ -15,9 +15,10 @@
 > **What this document is not.** Not the ICD (that's
 > [`ats-pi-icd.md`](./ats-pi-icd.md)). Not the ATS-Pi project's plan —
 > the companion team owns their own roadmap. Not a hardware install
-> guide (see [`asco-series-300.md`](./asco-series-300.md) sections 1-4
-> for the BOM and field wiring; only the *consumer* side is in scope
-> here, since the ATS-Pi team owns the physical layer).
+> guide (the BOM and field wiring live in the
+> [`ats-pi-companion`](https://github.com/SethMorrowSoftware/ats-pi-companion)
+> repo; only the *consumer* side is in scope here, since the ATS-Pi team
+> owns the physical layer).
 
 ---
 
@@ -120,7 +121,7 @@ Landed on `main` in commit `a106ef3` (Live view consumes the ATS block). Cross-c
 
 **GenWatch consumer side** — implemented and validated against the mock ATS-Pi: `AtsControlService` (`backend/genwatch/services/ats_control.py`), the four endpoints (`backend/genwatch/api/ats.py`), and the Live-view command row + confirm-modal specs. Covered by `backend/tests/test_ats_control.py` and an end-to-end smoke against `MockAtsPiServer` (confirm → command → ICD register write observed in the read-back).
 
-**Companion side** (`docs/integrations/ats-pi-companion-starter/`) — now software-complete too: the ADAM-6060 driver (`io_adam.py`), the write-command dispatch path (a Modbus write drives the relay through the driver; read-back reflects the *driven* state per ICD §5.5), persistence of `transfer_count_lifetime`, and the §8.3 30 s comms-loss auto-release are all implemented and unit-tested (incl. a real-timer auto-release test). An end-to-end smoke drives a command through the real Modbus server → dispatch → driver → read-back.
+**Companion side** (the [`ats-pi-companion`](https://github.com/SethMorrowSoftware/ats-pi-companion) repo) — software-complete: the hybrid driver (ASCO Group-5 serial sense + ADAM-6060 command relays — `io_hybrid.py` / `io_asco_serial.py` / `io_adam.py`), the write-command dispatch path (a Modbus write drives the relay through the driver; read-back reflects the *driven* state per ICD §5.5), persistence of `transfer_count_lifetime`, and the §8.3 30 s comms-loss auto-release are all implemented and unit-tested (incl. a real-timer auto-release test). An end-to-end smoke drives a command through the real Modbus server → dispatch → driver → read-back.
 
 **Still gated for live use:** the ADAM-6060 Modbus address map must be confirmed against the physical unit's firmware (`HARDWARE.md §6`), the field wiring landed (`HARDWARE.md §3`), and the ICD §13 golden test sequence run against the live ASCO. That's the Phase 4 commissioning work below — no code remains.
 
@@ -607,7 +608,7 @@ Companion-team effort (ATS-Pi build) is parallel and out of scope here.
 
 - **Building energy metering.** When (if) a utility-side meter is installed, extend the ICD with metering registers (kW, kvar, kWh, voltage/frequency). Add a Live view tile and a History dimension. No changes to the v1 contract — the addition would be a v1.x minor bump in the ICD.
 - **Multi-site federation.** If GenWatch ever needs to aggregate multiple site/ATS-Pi pairs, the `ats.expected_unit_id` field already provides per-site identity. The current single-site assumption is a UI / config simplification, not a protocol limitation.
-- **Group G upgrade migration.** If the site ever upgrades the ASCO Group 5 controller to Group G + 72EE (Path A in `asco-series-300.md`), the ATS-Pi can either (a) remain in place as a Modbus-TCP bridge with the same register layout, or (b) be retired in favour of GenWatch talking directly to the 72EE. Decision deferred.
+- **Group G upgrade migration.** If the site ever upgrades the ASCO Group 5 controller to Group G + 72EE, the ATS-Pi can either (a) remain in place as a Modbus-TCP bridge with the same register layout, or (b) be retired in favour of GenWatch talking directly to the 72EE. Decision deferred.
 - **Bypass-isolation switch monitoring.** If a future ATS install includes the bypass-isolation feature (`Y` suffix in the catalog number), additional position contacts on the bypass mechanism could be added to the ICD as new registers in v1.x.
 
 ---
