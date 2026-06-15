@@ -1009,6 +1009,49 @@ def test_comms_fast_recovery_after_clean_streak():
     assert p.health.consecutive_successes == 0
 
 
+def test_comms_no_fast_recovery_while_flapping():
+    """A flapping link (repeated short outages) must NOT keep fast-recovering
+    to 'healthy' — that would flap authority and remote-control gating. The
+    first clean reconnect fast-recovers; after a second LOST episode in the
+    flap window, a short clean streak must stay 'degraded' and earn 'healthy'
+    the slow (success_pct) way."""
+    from genwatch.modbus.poller import HEALTHY_RECOVERY_STREAK, Poller
+    from genwatch.modbus.registers import load_register_map
+
+    class FakeClient:
+        async def connect(self):
+            return True
+
+        async def close(self):
+            pass
+
+        async def read(self, addr, count, fc=3):
+            raise AssertionError("read should not be called in this unit test")
+
+    regmap = load_register_map("genwatch/registers/h100.yaml")
+    p = Poller(FakeClient(), regmap, lambda *a: None)
+
+    # Episode 1: a single outage then a clean streak → fast-recovers.
+    for _ in range(3):
+        p._record(False)
+    assert p.health.state == "lost"
+    for _ in range(HEALTHY_RECOVERY_STREAK):
+        p._record(True)
+    assert p.health.state == "healthy", "first clean reconnect should fast-recover"
+
+    # Episode 2: it drops again — now the link is flapping.
+    for _ in range(3):
+        p._record(False)
+    assert p.health.state == "lost"
+
+    # A clean streak now must NOT fast-recover (two outages in the window);
+    # the link stays 'degraded' until success_pct clears the hysteresis.
+    for _ in range(HEALTHY_RECOVERY_STREAK + 2):
+        p._record(True)
+    assert p.health.state == "degraded", "flapping link must not fast-recover"
+    assert p.health.success_pct < 95
+
+
 async def test_heartbeat_withheld_when_state_block_fails(tmp_path):
     """The prime heartbeat must reflect engine-state detection, not just
     'some prime register was readable'. If output_status_1 (a state
