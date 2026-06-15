@@ -102,7 +102,7 @@ Landed on `main` in commit `4b2583d` (read-only consumer + companion-repo starte
 | **GenWatch effort** | 1-1.5 days. |
 | **Files added** | `backend/genwatch/services/ats.py` (~150 lines); `backend/genwatch/registers/ats_pi.yaml` (~80 lines); `backend/tests/test_ats_service.py` (~250 lines). |
 | **Files modified** | `backend/genwatch/config.py` (+1 model, +1 field); `backend/genwatch/main.py` (lifespan additions, guarded by flag); `backend/genwatch/api/status.py` (new `ats` block when enabled). |
-| **Acceptance criteria** | (1) With `ats.enabled: true` and a mock ATS-Pi serving the ICD register layout on `localhost:5020`, `GET /api/status` returns a populated `ats` block. (2) With `ats.enabled: false`, behaviour is byte-identical to the previous release. (3) ATS link going down does not affect the H-100 poller or generator state machine — verified by killing the mock mid-run. (4) `icd_version_major` mismatch logs an error and refuses to start the ATS poller; H-100 monitoring continues normally. (5) New unit tests pass; existing 91 backend tests still pass. |
+| **Acceptance criteria** | (1) With `ats.enabled: true` and a mock ATS-Pi serving the ICD register layout on `localhost:5020`, `GET /api/status` returns a populated `ats` block. (2) With `ats.enabled: false`, behaviour is byte-identical to the previous release. (3) ATS link going down does not affect the H-100 poller or generator state machine — verified by killing the mock mid-run. (4) `icd_version_major` mismatch logs an error, raises a warn event, and drops the ATS-Pi as authoritative (loadSource falls back to H-100); the ATS poller keeps running and H-100 monitoring is unaffected. (5) New unit tests pass; existing 91 backend tests still pass. |
 
 ### Phase 2 — UI surface for read-side data ✅ Shipped
 
@@ -160,15 +160,17 @@ class AtsConfig(BaseModel):
     """
     enabled: bool = False
     host: str = "192.168.1.250"
-    port: int = 502
+    port: int = 5020
     framer: Literal["socket"] = "socket"  # Modbus TCP, NOT RTU
     slave: int = 1
     timeout_s: float = 1.0
     connect_timeout_s: float = 3.0
     register_file: str = "registers/ats_pi.yaml"
-    # Site identifier — when set, GenWatch refuses to start the poller
-    # if the ATS-Pi reports a different ats_pi_unit_id at register
-    # 0x0035. Prevents wrong-site comms in multi-site future.
+    # Site identifier. When set, GenWatch refuses to treat the ATS-Pi as
+    # authoritative unless its reported ats_pi_unit_id (register 0x0035)
+    # matches — catching a wrong-site cross-wire. Left unset (None) the
+    # check is skipped and GenWatch logs a loud startup warning, since it
+    # then trusts any ATS-Pi at the configured host IP.
     expected_unit_id: int | None = None
 
 
@@ -187,10 +189,10 @@ And document in `deploy/config.yaml.example`:
 ats:
   enabled: false
   host: 192.168.1.250
-  port: 502
+  port: 5020
   slave: 1
   register_file: registers/ats_pi.yaml
-  expected_unit_id: 23           # SITE-23
+  expected_unit_id: 23           # SITE-23 — see note below; unset skips the guard
 ```
 
 ### 5.2 Register YAML — `backend/genwatch/registers/ats_pi.yaml`
@@ -265,7 +267,7 @@ alarm_bits:
   - { register: fault_summary, mask: 0x0001, code: "ATS_PI_INPUT_FAULT",  desc: "ATS-Pi input fault — contact stuck",   severity: warn }
   - { register: fault_summary, mask: 0x0002, code: "ATS_PI_OUTPUT_FAULT", desc: "ATS-Pi output fault — relay readback", severity: warn }
   - { register: fault_summary, mask: 0x0004, code: "ATS_PI_MODE_UNKNOWN", desc: "ATS-Pi cannot determine mode",         severity: warn }
-  - { register: fault_summary, mask: 0x0008, code: "ATS_PI_CALIBRATION",  desc: "ATS-Pi calibration check needed",      severity: warn }
+  - { register: fault_summary, mask: 0x0008, code: "ATS_PI_CALIBRATION",  desc: "Impossible ATS position — both position-sense contacts asserted; check aux contacts or Group 5 status map", severity: warn }
 
 # ─── Controls (Phase 3) ───────────────────────────────────────────────────
 controls:
@@ -547,13 +549,13 @@ Run the ICD §13 golden test sequence against:
 Before flipping `ats.enabled: true` in production:
 
 - [ ] ATS-Pi physically wired and powered per its team's install doc
-- [ ] ATS-Pi reachable from GenWatch Pi: `nc -zv <ats-pi> 502` returns success
-- [ ] `modpoll -m tcp -a 1 -r 1 -c 8 <ats-pi-ip>` returns sensible values (position, source-avails) for the current ATS state
+- [ ] ATS-Pi reachable from GenWatch Pi: `nc -zv <ats-pi> 5020` returns success
+- [ ] `modpoll -m tcp -p 5020 -a 1 -r 1 -c 8 <ats-pi-ip>` returns sensible values (position, source-avails) for the current ATS state
 - [ ] ATS-Pi's `icd_version_major` reads `1`
 - [ ] ATS-Pi's `ats_pi_unit_id` matches `settings.ats.expected_unit_id`
-- [ ] Both Pis show NTP sync: `chronyc tracking` on each, time skew < 1 s
+- [ ] Both Pis show NTP sync: `chronyc tracking` on each, time skew < 5 s (the ICD §9.4 `TIME_SKEW` alarm threshold)
 - [ ] Backup of `/etc/genwatch/config.yaml` taken before edit
-- [ ] Restart GenWatch, watch `journalctl -u genwatch -f` for clean startup with "ATS-Pi integration active" log line
+- [ ] Restart GenWatch, watch `journalctl -u genwatch -f` for clean startup with "ATS-Pi integration enabled" log line
 - [ ] `GET /api/status | jq .ats` returns a populated block with `comms.state == "healthy"`
 - [ ] Live view shows the ATS card with new indicators
 - [ ] Manually trigger a Test command from the UI; observe the ATS perform a test transfer; observe corresponding events in the GenWatch feed

@@ -199,7 +199,10 @@ class AtsConfig(BaseModel):
     # When set, GenWatch refuses to mark the ATS poller authoritative
     # unless the device's reported ats_pi_unit_id register matches. Lets
     # the site catch a misconfigured-IP-points-at-wrong-ATS-Pi mistake
-    # before bad data influences the operator UI.
+    # before bad data influences the operator UI. Left unset (None) the
+    # check is skipped — GenWatch then trusts any ATS-Pi at `host`, so the
+    # lifespan logs a loud startup warning (see main.py) because a
+    # wrong-site cross-wire would otherwise go undetected.
     expected_unit_id: int | None = None
 
 

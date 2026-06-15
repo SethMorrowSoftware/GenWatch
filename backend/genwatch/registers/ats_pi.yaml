@@ -50,7 +50,10 @@ alarm_bits:
   - { register: fault_summary, mask: 0x0001, code: "ATS_PI_INPUT_FAULT",  desc: "ATS-Pi input fault — contact stuck",   severity: warn }
   - { register: fault_summary, mask: 0x0002, code: "ATS_PI_OUTPUT_FAULT", desc: "ATS-Pi output fault — relay readback", severity: warn }
   - { register: fault_summary, mask: 0x0004, code: "ATS_PI_MODE_UNKNOWN", desc: "ATS-Pi cannot determine mode",         severity: warn }
-  - { register: fault_summary, mask: 0x0008, code: "ATS_PI_CALIBRATION",  desc: "ATS-Pi calibration check needed",      severity: warn }
+  # Bit 3 fires when both position-sense inputs read asserted at once —
+  # a physically impossible state (welded/miswired aux contact or a bad
+  # Group 5 status bit), not a transient. Operator copy says so explicitly.
+  - { register: fault_summary, mask: 0x0008, code: "ATS_PI_CALIBRATION",  desc: "Impossible ATS position — both position-sense contacts asserted; check aux contacts or Group 5 status map", severity: warn }
 
 # ─── Registers ────────────────────────────────────────────────────────────
 # Addresses, types, and tier assignments per ICD §5. Prime tier polls
