@@ -7,7 +7,7 @@
 | **Effective** | 2026-06-15 |
 | **Owner (GenWatch side)** | GenWatch project |
 | **Owner (ATS-Pi side)** | (TBD — companion project team) |
-| **Supersedes** | Sections 3-5 of `docs/integrations/asco-series-300.md` (Path B) for sites that deploy an ATS-Pi |
+| **Supersedes** | All prior direct-integration approaches (a direct ADAM-6060 I/O island, or a Group-G + 72EE retrofit). The ATS-Pi companion is the single supported integration. |
 
 > **What this document is.** A frozen contract between two independently
 > developed projects — GenWatch (generator monitor) and ATS-Pi (transfer-
@@ -26,7 +26,7 @@
 The single-site deployment has:
 - A Generac H-100 controller on the generator (already monitored by GenWatch over Modbus-RTU-over-TCP via a Lantronix bridge — unchanged by this ICD).
 - An ASCO Series 300 automatic transfer switch (Group 5 controller, P/N 473670-006, 600 A / 480 V / 3-φ).
-- A new dedicated Raspberry Pi (the **ATS-Pi**) wired directly to the ASCO's auxiliary contacts and 18RX module, exposing the ASCO's state on the LAN.
+- A new dedicated Raspberry Pi (the **ATS-Pi**) that senses the ASCO's state from the Group 5 controller over RS-485 serial and drives the ASCO's command inputs through an ADAM-6060 relay module, exposing the ASCO's state on the LAN.
 
 This ICD covers:
 - The Modbus TCP wire protocol between the ATS-Pi and GenWatch
@@ -39,7 +39,7 @@ This ICD covers:
 Out of scope:
 - The ATS-Pi's internal architecture (its OS, language, I/O hardware choice — all up to the ATS-Pi team, as long as the wire contract below is honoured)
 - GenWatch's internal architecture (the consumer side is documented in `ats-pi-plan.md`)
-- Building-side energy metering (deferred until a meter is installed; this ICD assumes contact-only ATS instrumentation)
+- Building-side energy metering (deferred until a meter is installed)
 
 ---
 
@@ -51,12 +51,12 @@ Out of scope:
                           │   ATS       │
                           │  (Group 5)  │
                           └──┬──────────┘
-                             │ dry contacts:
-                             │   • 18RX RL5, RL6 (source availability)
-                             │   • 14AA / 14BA (position aux)
-                             │   • engine-start out (sense only)
+                             │ ATS-Pi senses + commands the ASCO:
+                             │   • Group 5 status over RS-485 serial —
+                             │     position, source availability,
+                             │     engine-start (sense)
                              │   • test / inhibit / force-transfer /
-                             │     bypass-delay (drive)
+                             │     bypass-delay via ADAM-6060 relays (drive)
                              │
                           ┌──▼──────────┐
                           │   ATS-Pi    │   ← owned by companion-project team
@@ -85,7 +85,7 @@ Out of scope:
 
 **Implication:** the entire physical layer (contact debounce, pulse timing, electrical isolation) is the ATS-Pi's responsibility. Bugs there don't surface as GenWatch bugs.
 
-**Driver-agnostic.** How the ATS-Pi obtains the ASCO's state internally — dry contacts through an ADAM-6060 I/O module, the ASCO Group 5 controller's own status over RS-485 serial, or a hybrid (serial for sensing, ADAM for the command relays) — is an ATS-Pi implementation detail. It serves the identical register map either way; GenWatch cannot tell which driver is in use and does not need to.
+**Driver-agnostic.** How the ATS-Pi obtains the ASCO's state internally is an ATS-Pi implementation detail. It serves the identical register map regardless; GenWatch cannot tell how the state was sensed and does not need to. (The deployed companion uses a **hybrid** driver — Group 5 status over RS-485 for sensing, ADAM-6060 relays for the command outputs — but the wire contract below is the only thing GenWatch depends on.)
 
 ---
 
@@ -168,10 +168,10 @@ These are the high-priority signals — GenWatch polls them every 1.5 s.
 
 | Bit | Mask | Name | Meaning |
 |---|---|---|---|
-| 0 | `0x0001` | `INPUT_FAULT` | One or more ATS contact inputs are stuck or failing (e.g. both 14AA and 14BA reading low) |
+| 0 | `0x0001` | `INPUT_FAULT` | One or more ATS position/availability sense signals are stuck, failing, or unreadable — e.g. the hybrid Group 5 RS-485 link is down (the ATS-Pi is then "reachable but blind", still serving its last-good position), or both position signals read low. GenWatch treats this as position-untrustworthy and drops the ATS-Pi as authoritative (§10). |
 | 1 | `0x0002` | `OUTPUT_FAULT` | A driven relay failed the read-back check (commanded high but reading low) |
 | 2 | `0x0004` | `MODE_UNKNOWN` | `ats_mode` cannot be determined |
-| 3 | `0x0008` | `CALIBRATION` | Impossible position state — both position-sense contacts (14AA *and* 14BA) read asserted at once. A physically impossible combination: welded/miswired aux contact, or a bad Group 5 status bit. Not a transient — requires operator review of the aux contacts / Group 5 status map. |
+| 3 | `0x0008` | `CALIBRATION` | Impossible position state — both position-sense signals read asserted at once. A physically impossible combination: a welded/miswired aux contact or a bad Group 5 status bit. Not a transient — requires operator review of the Group 5 status map / aux contacts. Treated like INPUT_FAULT: position-untrustworthy, ATS-Pi dropped as authoritative (§10). |
 | 4-15 | — | RESERVED | Must be 0 |
 
 GenWatch will surface any non-zero `fault_summary` as a warn-severity alarm with code `ATS_PI_FAULT` and a meta string decoding the active bits.
@@ -344,6 +344,8 @@ The UI MUST annotate the `loadSource` value with its provenance:
 
 This precedence is intentionally one-way: GenWatch does not "vote" between the two sources or take a majority. The ATS-Pi reads the switch's actual position contacts; the H-100 derivation is an inference. The direct measurement wins whenever it's available.
 
+**Exception — position-untrustworthy faults.** A healthy Modbus TCP link does *not* by itself mean the served `position` is fresh. If the ATS-Pi reports `INPUT_FAULT` or `CALIBRATION` (§5.1.1) — most importantly the hybrid case where the Group 5 RS-485 sense link drops while the Modbus TCP link to GenWatch stays up, so the ATS-Pi keeps serving a frozen last-good position — GenWatch treats the ATS-Pi as **non-authoritative** even though comms are `healthy`, falls back to the H-100 derivation (with the "(via gen telemetry)" provenance), and refuses operator command *asserts* until the fault clears. Command *releases* (the fail-safe direction) remain permitted.
+
 ---
 
 ## 11. Time synchronization
@@ -404,7 +406,13 @@ Both projects MUST run this sequence (with mocks) before each ICD-affecting rele
 
 ## Appendix A. ASCO Series 300 terminal reference (this site)
 
-From `docs/integrations/asco-series-300.md` Appendix B. Reproduced here for ATS-Pi wiring reference.
+ATS-Pi wiring reference. In the deployed **hybrid** driver the *read*
+("DI (read)") rows below are sensed from the Group 5 controller over
+RS-485 serial rather than wired as discrete contacts; the *drive*
+("DO (drive)") rows are the ADAM-6060 command-relay landings and are
+wired as shown. The full wiring/BOM lives in the companion
+[`ats-pi-companion`](https://github.com/SethMorrowSoftware/ats-pi-companion)
+repo.
 
 | Terminal | Function | Type | Rating | Wired to ATS-Pi as |
 |---|---|---|---|---|

@@ -41,6 +41,16 @@ log = logging.getLogger("genwatch.modbus.poller")
 # 'healthy' on it while leaving the degrade/lost thresholds untouched.
 HEALTHY_RECOVERY_STREAK = 5
 
+# A clean reconnect is ONE outage followed by sustained success — fast-recover
+# it. A *flapping* link (repeated short drops) also rebuilds the recovery
+# streak every few seconds, which would flap authority and remote-control
+# gating on/off (a brief 'healthy' window an operator could slip a command
+# through). So the fast path is denied once the link has gone LOST
+# FLAP_MAX_EPISODES or more times within FLAP_WINDOW_S; it must then earn
+# 'healthy' the slow way (the success_pct hysteresis below).
+FLAP_WINDOW_S = 120.0
+FLAP_MAX_EPISODES = 2
+
 
 @dataclass
 class CommsHealth:
@@ -115,6 +125,9 @@ class Poller:
         # rolling success window for comms %
         self._results: deque[bool] = deque(maxlen=60)
         self._latencies: deque[float] = deque(maxlen=60)
+        # Monotonic timestamps of transitions INTO 'lost', for flap detection
+        # in _classify (a flapping link must not keep fast-recovering).
+        self._lost_episodes: deque[float] = deque(maxlen=32)
 
         self._running = False
         self._tasks: list[asyncio.Task] = []
@@ -235,8 +248,17 @@ class Poller:
                 continue
             silence = time.monotonic() - mono_last
             if silence > threshold and self.health.state != "lost":
-                self.health.state = "lost"
                 log.warning("Comms LOST — %.1fs since last good prime poll", silence)
+                # Drive the transition through the same counters _classify
+                # uses (rather than poking state directly): reset the recovery
+                # streak and bump failures to the LOST threshold so a single
+                # later success can't immediately un-LOST the link — it must
+                # rebuild the streak and clear the flap gate like any other
+                # reconnect. Record the episode for flap accounting.
+                self.health.consecutive_successes = 0
+                self.health.consecutive_failures = max(self.health.consecutive_failures, 3)
+                self.health.state = "lost"
+                self._lost_episodes.append(time.monotonic())
 
     # ---- batch execution ----
     async def _poll_tier(self, tier: str, batches: list[tuple[int, int]] | None = None) -> None:
@@ -445,6 +467,8 @@ class Poller:
 
         new_state = self._classify()
         if new_state != self.health.state:
+            if new_state == "lost":
+                self._lost_episodes.append(time.monotonic())
             log.info("Comms %s -> %s (%.1f%% success)", self.health.state, new_state, self.health.success_pct)
             self.health.state = new_state
 
@@ -457,7 +481,14 @@ class Poller:
         # never builds the streak — any failure resets it — so this does
         # not weaken the anti-flap hysteresis on the degrade path below.
         if self.health.consecutive_successes >= HEALTHY_RECOVERY_STREAK:
-            return "healthy"
+            # Allow the fast path only if the link isn't flapping: a single
+            # recent outage (a clean reconnect) fast-recovers; repeated
+            # outages within the window must earn 'healthy' the slow way so
+            # authority / remote control don't flap with the link.
+            now = time.monotonic()
+            recent_flaps = sum(1 for t in self._lost_episodes if now - t <= FLAP_WINDOW_S)
+            if recent_flaps < FLAP_MAX_EPISODES:
+                return "healthy"
         if self.health.success_pct < 95 or self.health.consecutive_failures >= 1:
             return "degraded"
         return "healthy"

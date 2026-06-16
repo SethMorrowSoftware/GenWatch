@@ -60,6 +60,23 @@ async def _run(
     override: bool = False,
 ) -> dict:
     svc = _svc(request)
+    # Per-operator rate limit on command actuation. The confirm-token flow
+    # already blocks blind replay (single-use, 30 s TTL), but an authenticated
+    # client could still loop token->command pairs and flap a maintained relay
+    # faster than an operator can react. A small token bucket (burst 3, ~1/5 s)
+    # is ample for human use.
+    limiter = getattr(request.app.state, "command_limiter", None)
+    if limiter is not None:
+        key = f"ats:{p.operator}"
+        if not limiter.check(key):
+            retry = limiter.retry_after_s(key)
+            request.app.state.db.write_audit(
+                p.operator, f"ats.{command}", "rate_limited", token, "denied"
+            )
+            raise HTTPException(
+                429,
+                detail={"code": "rate_limited", "message": f"too many ATS commands; retry in {retry}s"},
+            )
     try:
         return await svc.execute(
             command,

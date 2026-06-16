@@ -386,6 +386,10 @@ async def lifespan(app: FastAPI):
 
     # 5 login attempts then 1 token every 3 minutes (~20/hour steady state).
     login_limiter = RateLimiter(capacity=5, refill_per_s=1.0 / 180.0)
+    # ATS command actuation: burst of 3, then 1 every 5 s, per operator.
+    # Ample for human operation; stops a buggy/hostile client looping
+    # token->command pairs and flapping a maintained relay.
+    command_limiter = RateLimiter(capacity=3, refill_per_s=1.0 / 5.0)
 
     # Attach everything to app.state so route handlers can read it.
     app.state.settings = settings
@@ -399,6 +403,7 @@ async def lifespan(app: FastAPI):
     app.state.retention = retention
     app.state.slack = slack
     app.state.login_limiter = login_limiter
+    app.state.command_limiter = command_limiter
     app.state.version = __version__
     app.state.started_at = time.time()
     # ATS-Pi companion — None when ats.enabled is false.
@@ -426,19 +431,21 @@ async def lifespan(app: FastAPI):
     watchdog_task: asyncio.Task | None = None
     interval = notify.watchdog_interval_s()
     if interval and interval > 0:
-        # We only ping while a *prime* poll has completed within the last
-        # `stale_after` seconds — chosen to be longer than the prime
-        # cadence plus a generous reconnect window, but shorter than
-        # systemd's WatchdogSec so a real hang triggers a restart.
-        # A simple `poller.is_running` flag isn't enough: a deadlocked
-        # poll task keeps the flag True while telemetry freezes.
-        stale_after = max(10.0, (regmap.prime_poll_ms / 1000.0) * 6.0)
         # Tick at ~WatchdogSec/4 (half the systemd-recommended interval)
         # rather than WatchdogSec/2. On a busy Pi an SD-card fsync stall
         # can swallow a tick; the tighter cadence leaves several missed
         # ticks of margin before WatchdogSec elapses and SIGKILLs us,
         # avoiding spurious restarts.
         tick = max(1.0, interval / 2.0)
+        # We only ping while a *prime* poll has completed within the last
+        # `stale_after` seconds. It must be > the prime cadence AND > the
+        # check `tick` — otherwise a single poll that lands just after a tick
+        # makes the next tick see >stale_after of silence on a perfectly
+        # healthy link and spuriously withhold — yet well under systemd's
+        # WatchdogSec so a real freeze still triggers a restart. A simple
+        # `poller.is_running` flag isn't enough: a deadlocked poll task keeps
+        # the flag True while telemetry freezes.
+        stale_after = max(tick * 2.0, (regmap.prime_poll_ms / 1000.0) * 6.0)
         # service_start_mono is captured at the top of lifespan so the
         # cold-start grace is measured from the actual service start,
         # not from after poller/client startup completes (which could

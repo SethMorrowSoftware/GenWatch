@@ -14,9 +14,9 @@ trusted to monitor — and command — a real generator and transfer switch.
 
 | | |
 |---|---|
-| **System** | Generac H-100 (via Lantronix bridge) + ASCO Series 300 (via ATS-Pi + ADAM-6060) |
+| **System** | Generac H-100 (via Lantronix bridge) + ASCO Series 300 (via the hybrid ATS-Pi — Group-5 serial sense + ADAM-6060 command relays) |
 | **Audience** | Commissioning engineer + a qualified electrician for any in-cabinet work |
-| **Companion docs** | README §6/§10/§12 · `integrations/ats-pi-icd.md` · `integrations/ats-pi-plan.md §8` · `ats-pi-companion-starter/docs/HARDWARE.md` · `ats-pi-companion-starter/docs/SPEC.md §9` |
+| **Companion docs** | `integrations/ats-pi-icd.md` · `integrations/ats-pi-plan.md §8` · the [`ats-pi-companion`](https://github.com/SethMorrowSoftware/ats-pi-companion) repo (`HARDWARE.md`, RS-485 bench-verify, `SPEC.md`) |
 | **Estimated time** | ~½ day for H-100 (Phases 1-4); ATS adds ~1 day incl. wiring + an outage window |
 
 ---
@@ -320,18 +320,22 @@ confirm the one thing the software couldn't: the real ADAM register map.
 
 ## Phase 6 — ASCO field wiring (ELECTRICIAN · LOTO)
 
-**Goal:** land the DI/DO field wires. Per `HARDWARE.md §3 + §5`.
+**Goal:** land the command-relay field wires and the Group 5 serial link.
+Per the companion `HARDWARE.md §3 + §5` and the RS-485 bench-verify guide.
 
 1. **LOTO the ATS (utility AND generator sources).**
-2. Verify the 18RX (RL5/RL6) and 14AA/14BA aux contacts are present
-   (HARDWARE §2 survey) — install during this outage if missing.
-3. Land DI wires (ATS contacts → ADAM DI0-5) and DO wires (ADAM relays →
-   ASCO input terminals 6-7 / 8-9 / 10-11 / 12-13) per HARDWARE §3.
-   **Verify the terminal numbers against this unit's manual `381333-289`**
-   — numbering varies by catalog number. **Never wire DO4/DO5** (terminals
-   14-16 are factory-use).
+2. **Sensing (hybrid):** connect the USB-RS485 adapter to the Group 5
+   controller's RS-485 port and confirm the controller's RS485 address +
+   baud (front panel: General → Communication). No 18RX/14AA aux contacts
+   are required — the ATS-Pi reads position, source availability, and
+   engine-start from the Group 5 over serial.
+3. **Commands:** land the DO wires (ADAM relays → ASCO input terminals
+   6-7 / 8-9 / 10-11 / 12-13) per the companion HARDWARE §3. The ADAM DIs
+   are unused in the hybrid driver. **Verify the terminal numbers against
+   this unit's manual `381333-289`** — numbering varies by catalog number.
+   **Never wire DO4/DO5** (terminals 14-16 are factory-use).
 4. **Do not disturb** the existing engine-start wire to the H-100; the
-   ATS-Pi only *senses* it (DI5).
+   ATS-Pi only *senses* engine-start (from the Group 5 over serial).
 5. Remove LOTO, re-energize.
 
 - **PASS:** wiring lands on verified terminals, engine-start wire
@@ -343,8 +347,9 @@ confirm the one thing the software couldn't: the real ADAM register map.
 
 ## Phase 7 — ATS-Pi read-only verification (non-actuating)
 
-**Goal:** with the ADAM now reading the real ASCO contacts, confirm
-GenWatch sees the true switch state — **read-only, no commands yet.**
+**Goal:** with the ATS-Pi now reading the real ASCO state over the Group 5
+serial link, confirm GenWatch sees the true switch state — **read-only, no
+commands yet.**
 
 1. On GenWatch, point at the ATS-Pi and enable read-only:
    ```bash
@@ -386,8 +391,9 @@ GenWatch sees the true switch state — **read-only, no commands yet.**
 
 - **PASS:** ATS card reflects the real switch position + source
   availability; comms healthy + authoritative.
-- **If it fails:** position wrong → DI1/DI2 (14AA/14BA) wiring or the
-  `io_adam` debounce; not authoritative → ICD version or unit-id mismatch
+- **If it fails:** position wrong → check the Group 5 RS-485 status-register/
+  bit map (companion `io.asco_serial` config + the RS-485 bench-verify guide)
+  or the serial link; not authoritative → ICD version or unit-id mismatch
   (`journalctl`); comms lost → `nc -zv 192.168.1.250 <port>` and the
   GenWatch↔ATS-Pi VLAN/ACL.
 

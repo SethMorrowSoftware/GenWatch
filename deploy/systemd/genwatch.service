@@ -20,6 +20,11 @@ WorkingDirectory=/opt/genwatch
 Environment=GENWATCH_CONFIG_PATH=/etc/genwatch/config.yaml
 Environment=GENWATCH_DATA_DIR=/var/lib/genwatch
 Environment=GENWATCH_UI_DIR=/usr/share/genwatch/ui
+# Binds the control API (which includes generator + ATS command endpoints)
+# on ALL interfaces. Auth (bcrypt+JWT), CSRF Origin checks, and a login rate
+# limiter defend it, but it is plain HTTP — put a TLS reverse proxy (Caddy)
+# or Tailscale in front for anything beyond a trusted wired OT LAN. Set to
+# 127.0.0.1 if a local reverse proxy terminates TLS.
 Environment=GENWATCH_HOST=0.0.0.0
 Environment=GENWATCH_PORT=8000
 Environment=GENWATCH_LOG_LEVEL=info
@@ -29,16 +34,19 @@ ExecStart=/opt/genwatch/venv/bin/python -m genwatch serve
 
 # Reliability: restart on any failure. The service is built to stay up
 # even when the Modbus link is down (it surfaces a "comms lost" state in
-# the UI and keeps retrying the link in the background), so a restart
-# here almost always means a hard process crash — pace it slowly enough
-# that we don't burn the SD card with journal churn on a permanent
-# fault, but quickly enough that a transient crash recovers in under a
-# minute. With RestartSec=30 the StartLimit window catches a hard
-# crash-loop after ~5 minutes of restarts.
+# the UI and keeps retrying the link in the background), so a restart here
+# almost always means a hard process crash — paced at RestartSec=30 so we
+# don't burn the SD card with journal churn on a permanent fault.
+#
+# StartLimitIntervalSec=0 DISABLES the start rate limiter on purpose: this
+# is an unattended SAFETY monitor, and a permanently-`failed` unit (the
+# monitor silently offline) is more dangerous than a slow restart loop, so
+# we never give up restarting. A kernel/USB wedge that a service restart
+# can't fix is covered instead by the hardware watchdog
+# (system.conf.d/10-genwatch-hwwatchdog.conf), which resets the whole Pi.
 Restart=always
 RestartSec=30
-StartLimitIntervalSec=600
-StartLimitBurst=10
+StartLimitIntervalSec=0
 
 # Watchdog: systemd will SIGKILL and restart the unit if the app stops
 # pinging sd_notify(WATCHDOG=1). The app pings every 30 s while the
@@ -112,9 +120,13 @@ DeviceAllow=/dev/serial0 rw
 DeviceAllow=/dev/serial1 rw
 DeviceAllow=/dev/genwatch-modbus rw
 
-# Resource caps — Pi 4 has 4 GB, Pi 5 has 4-8 GB. 512M is plenty for the
-# Python service + SQLite + buffered telemetry.
-MemoryMax=512M
+# Resource caps — Pi 4 has 4 GB, Pi 5 has 4-8 GB. MemoryHigh is a soft
+# throttle (reclaim pressure) hit first; MemoryMax is the hard OOM-kill
+# backstop. A slow leak or large WS fan-out then gets throttled and logged
+# rather than abruptly OOM-killing the monitor — which, with Restart=always,
+# would otherwise crash-loop.
+MemoryHigh=384M
+MemoryMax=768M
 TasksMax=128
 LimitNOFILE=4096
 

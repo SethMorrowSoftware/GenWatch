@@ -241,6 +241,62 @@ async def test_icd_major_mismatch_falls_back(
     assert sm.snap.load_source == "utility"
 
 
+# ─── Position-tainting faults drop authority (reachable-but-blind) ───────
+
+
+async def test_input_fault_drops_authority_and_falls_back(
+    h100_regmap, ats_regmap, fake_db, bus, ats_store,
+):
+    """Hybrid 'reachable but blind': the Modbus TCP link is healthy but the
+    ATS-Pi reports INPUT_FAULT (its serial sense to the Group 5 dropped) while
+    still serving a STALE last-good position. GenWatch must drop authority and
+    fall back to the H-100 derivation rather than display/act on the frozen
+    value (audit CRITICAL)."""
+    ats = AtsService(ats_regmap, fake_db, bus)
+    ats_store.set_position("generator")          # last-good before going blind
+    ats_store.set_fault_bit(0x0001)              # ATS_PI_INPUT_FAULT
+    await ats.on_poll("base", ats_store.as_reading("base"), _healthy())
+    assert ats.snap.comms.state == "healthy"
+    assert "ATS_PI_INPUT_FAULT" in ats.snap.fault_codes
+    assert not ats.is_authoritative()
+
+    sm = StateMachine(h100_regmap, fake_db, bus, ats_service=ats)
+    sm.update(Reading(values=_h100_values("stopped")), _healthy())
+    # H-100 fallback (engine stopped → utility), NOT the stale 'generator'.
+    assert sm.snap.load_source == "utility"
+
+
+async def test_calibration_fault_drops_authority(
+    h100_regmap, ats_regmap, fake_db, bus, ats_store,
+):
+    """CALIBRATION (both position-sense signals asserted — physically
+    impossible) also drops authority."""
+    ats = AtsService(ats_regmap, fake_db, bus)
+    ats_store.set_position("generator")
+    ats_store.set_fault_bit(0x0008)              # ATS_PI_CALIBRATION
+    await ats.on_poll("base", ats_store.as_reading("base"), _healthy())
+    assert not ats.is_authoritative()
+
+
+async def test_output_fault_alone_keeps_position_authority(
+    h100_regmap, ats_regmap, fake_db, bus, ats_store,
+):
+    """OUTPUT_FAULT is a command-relay read-back problem, not a position-sense
+    problem — it must NOT drop position authority (the displayed loadSource is
+    still trustworthy). It only blocks command *asserts* (covered in
+    test_ats_control.test_output_fault_blocks_assert_but_allows_release)."""
+    ats = AtsService(ats_regmap, fake_db, bus)
+    ats_store.set_position("generator")
+    ats_store.set_fault_bit(0x0002)              # ATS_PI_OUTPUT_FAULT
+    await ats.on_poll("base", ats_store.as_reading("base"), _healthy())
+    assert "ATS_PI_OUTPUT_FAULT" in ats.snap.fault_codes
+    assert ats.is_authoritative()
+
+    sm = StateMachine(h100_regmap, fake_db, bus, ats_service=ats)
+    sm.update(Reading(values=_h100_values("stopped")), _healthy())
+    assert sm.snap.load_source == "generator"    # ATS position still wins
+
+
 # ─── Event-emission de-duplication ──────────────────────────────────────
 
 
