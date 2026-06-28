@@ -12,8 +12,13 @@ Wants=network-online.target
 Type=notify
 NotifyAccess=main
 
+# Primary group is genwatch (not dialout): files the service creates under
+# /var/lib/genwatch (the SQLite DB, future exports) are then group-owned by
+# genwatch, not readable by every account in dialout. Serial access comes from
+# the dialout SUPPLEMENTARY group instead. (M-5)
 User=genwatch
-Group=dialout
+Group=genwatch
+SupplementaryGroups=dialout
 WorkingDirectory=/opt/genwatch
 
 # Config + secrets live in /etc/genwatch.

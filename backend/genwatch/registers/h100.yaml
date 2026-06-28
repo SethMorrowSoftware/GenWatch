@@ -121,6 +121,19 @@ panel_mode_bits:
   - { mode: "manual",  register: input_status_1, mask: 0x4000 }   # verify on your H-100
   - { mode: "off",     register: input_status_1, mask: 0x2000 }   # verify on your H-100
 
+# ─── Numeric range alarms (optional software backstop) ────────────────────
+# When true, GenWatch raises warn/alarm events when a register's decoded value
+# leaves its warn_range / alarm_range band (below), as a software backstop on
+# top of the H-100's own status bits. Evaluated ONLY while the engine is
+# running/exercising, only on fresh values, and debounced.
+#
+# DEFAULT FALSE on purpose: the bands below ship UNVERIFIED for any specific
+# unit (e.g. battery_volts is a 12 V band; a 24 V start bank floats ~26 V and
+# would false-alarm). Enable this per-site ONLY after you have confirmed every
+# warn_range/alarm_range against the actual panel — otherwise you get alarm
+# fatigue on a live generator.
+numeric_alarms_enabled: false
+
 # ─── Alarm decoding ───────────────────────────────────────────────────────
 # Each entry is one bit in one of the output_status_N bitfield registers.
 # When the bit is set, the alarm is active. Multiple can be active at
@@ -223,7 +236,13 @@ registers:
   - { name: oil_temp,          addr: 0x008A, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: F }
   - { name: coolant_temp,      addr: 0x008C, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: F,    warn_range: [170, 210], alarm_range: [120, 235] }
   - { name: oil_pressure,      addr: 0x008E, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: psi,  warn_range: [35, 80] }
-  - { name: coolant_level,     addr: 0x0090, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: pct, scale: 0.1 }
+  # coolant_level: genmon's HPanelReg reads COOLANT_LEVEL (0x0090) as a RAW
+  # integer (no divider), so the previous scale: 0.1 made GenWatch read 10× too
+  # low — a healthy 95 showed as 9.5 and tripped the UI's low-coolant indicator.
+  # Decode raw. NOTE: confirm the panel's engineering unit during commissioning
+  # (`genwatch panel`) — the H-100 may report this in a controller-specific unit
+  # rather than a true percent.
+  - { name: coolant_level,     addr: 0x0090, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: pct }
   - { name: fuel_level_pct,    addr: 0x0092, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: pct }
   - { name: throttle_position, addr: 0x0096, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: pct }
   - { name: o2_sensor,         addr: 0x0098, fc: 3, type: u32_lo, tier: base, group: "Engine", unit: pct }
@@ -246,7 +265,11 @@ registers:
 
   # Base · 15 s — counters / status
   - { name: active_alarm_count, addr: 0x012F, fc: 3, type: u16, tier: prime, group: "State", unit: count }
-  - { name: run_hours,         addr: 0x0130, fc: 3, type: u32, tier: base, group: "Maintenance", unit: h }
+  # run_hours: genmon's HPanelReg reads ENGINE_HOURS (0x0130) with a /10
+  # divider, so the raw 2-word counter is tenths of an hour. Without scale: 0.1
+  # GenWatch reported engine hours 10× too high (breaks oil-change / warranty
+  # hour tracking). Stays u32 — it is a genuine 32-bit counter.
+  - { name: run_hours,         addr: 0x0130, fc: 3, type: u32, tier: base, group: "Maintenance", unit: h, scale: 0.1 }
   - { name: engine_status_code, addr: 0x0132, fc: 3, type: u16, tier: prime, group: "State", unit: enum }
   - { name: key_switch_state,  addr: 0x01A0, fc: 3, type: bitfld, tier: prime, group: "State", unit: bits }
   - { name: quiettest_status,  addr: 0x022B, fc: 3, type: u16, tier: prime, group: "State", unit: enum }

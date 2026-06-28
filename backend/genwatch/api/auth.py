@@ -15,9 +15,15 @@ class LoginBody(BaseModel):
 
 
 def _client_ip(request: Request) -> str:
-    # Behind a reverse proxy this should read X-Forwarded-For. For a bare
-    # LAN deployment (the documented GenWatch topology) request.client is
-    # authoritative.
+    # request.client.host is authoritative because uvicorn runs with
+    # proxy_headers=True + forwarded_allow_ips (see __main__.py): it rewrites
+    # request.client from X-Forwarded-For ONLY when the immediate peer is a
+    # trusted proxy (loopback by default), and otherwise uses the real socket
+    # peer. So a direct LAN client can't spoof XFF to forge the rate-limit /
+    # audit source, and a same-host Caddy/tailscale-serve proxy that forwards
+    # XFF yields the real client IP. CAVEAT: a proxy that does NOT forward XFF
+    # collapses every client to the proxy's loopback address — ensure the
+    # deployed proxy sets X-Forwarded-For (Caddy does by default).
     return request.client.host if request.client else "unknown"
 
 

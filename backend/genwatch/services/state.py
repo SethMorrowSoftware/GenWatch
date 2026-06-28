@@ -71,6 +71,13 @@ LOAD_OFF_CURRENT_THRESHOLD = 2.0
 LOADSOURCE_DISAGREE_DEBOUNCE_POLLS = 3
 LOADSOURCE_DISAGREE_ALARM_CODE = "ATS_LOADSOURCE_DISAGREE"
 
+# Numeric range alarms (H-5). Only evaluated while the engine is producing —
+# coolant/oil/rpm/etc. ranges are meaningless at rest. Debounced so a single
+# noisy sample can't raise.
+NUMERIC_ALARM_STATES = {"running", "exercising"}
+NUMERIC_ALARM_MIN_POLLS = 3
+NUMERIC_ALARM_CODE_PREFIX = "RANGE_"
+
 
 @dataclass
 class StateSnapshot:
@@ -148,6 +155,12 @@ class StateMachine:
         # loses authority and the comparison becomes meaningless).
         self._loadsource_disagree_count: int = 0
         self._loadsource_disagree_raised: bool = False
+        # Numeric range-alarm state (H-5). Mirrors the bit-alarm debounce:
+        # per-code consecutive out-of-range poll counts, and the codes we've
+        # raised so we know to fire the clear. Active only when the register
+        # map enables numeric alarms (default off).
+        self._numeric_poll_counts: dict[str, int] = {}
+        self._numeric_raised: dict[str, str] = {}  # code -> severity
 
     def apply_regmap(self, new_regmap: RegisterMap) -> None:
         """Swap in a freshly-loaded register map (POST /api/registers/reload).
@@ -417,6 +430,15 @@ class StateMachine:
         # what the previous-tick diff uses for raise detection above.
         self.snap.active_alarms = effective_codes
 
+        # Numeric range alarms (H-5) — optional software backstop derived from
+        # the per-register warn_range/alarm_range bands. Off by default; the
+        # bands must be field-verified before enabling (numeric_alarms_enabled
+        # in h100.yaml). Layered onto active_alarms like the disagree alarm.
+        if regmap.numeric_alarms_enabled:
+            self._check_numeric_ranges(regmap, reading, emitted)
+        if self._numeric_raised:
+            self.snap.active_alarms = self.snap.active_alarms | set(self._numeric_raised)
+
         # Comms transition logging + event
         if comms.state != self.snap.comms.state:
             old_comms = self.snap.comms.state
@@ -504,6 +526,93 @@ class StateMachine:
         return emitted
 
     # ─── Load-source disagreement (ATS vs H-100 cross-check) ──────────
+
+    def _check_numeric_ranges(
+        self, regmap: RegisterMap, reading: Reading, emitted: list[dict[str, Any]]
+    ) -> None:
+        """Raise/clear warn|alarm events from per-register warn_range/
+        alarm_range bands (H-5). Opt-in software backstop on top of the
+        H-100's own status bits.
+
+        Only evaluated while the engine is producing (NUMERIC_ALARM_STATES) and
+        only on FRESH, non-None decoded values — a stale/evicted register
+        (values.get → None) is skipped so an eviction can't masquerade as an
+        out-of-range reading. Debounced NUMERIC_ALARM_MIN_POLLS consecutive
+        polls, mirroring the bit-alarm path. A value back in range clears.
+        """
+        producing = self.snap.engine_state in NUMERIC_ALARM_STATES
+
+        def severity_for(reg) -> tuple[str, str] | None:
+            """Return (severity, band_str) if out of range, else None."""
+            val = reading.values.get(reg.name)
+            if val is None:
+                return None
+            if reg.alarm_range is not None:
+                lo, hi = reg.alarm_range
+                if val < lo or val > hi:
+                    return "alarm", f"{lo}–{hi}"
+            if reg.warn_range is not None:
+                lo, hi = reg.warn_range
+                if val < lo or val > hi:
+                    return "warn", f"{lo}–{hi}"
+            return None
+
+        active_now: dict[str, tuple[str, str, object]] = {}  # code -> (sev, reg, val)
+        if producing:
+            for reg in regmap.registers:
+                if reg.warn_range is None and reg.alarm_range is None:
+                    continue
+                hit = severity_for(reg)
+                if hit is None:
+                    continue
+                code = f"{NUMERIC_ALARM_CODE_PREFIX}{reg.name.upper()}"
+                active_now[code] = (hit[0], reg, hit[1])
+
+        # Debounce counters off the raw out-of-range observation.
+        for code in active_now:
+            self._numeric_poll_counts[code] = self._numeric_poll_counts.get(code, 0) + 1
+        for code in list(self._numeric_poll_counts):
+            if code not in active_now:
+                del self._numeric_poll_counts[code]
+
+        # Raise: out of range for long enough and not already raised.
+        for code, (sev, reg, band) in active_now.items():
+            if self._numeric_poll_counts.get(code, 0) < NUMERIC_ALARM_MIN_POLLS:
+                continue
+            if code in self._numeric_raised:
+                continue
+            val = reading.values.get(reg.name)
+            desc = f"{reg.name} out of range ({val}{(' ' + reg.unit) if reg.unit else ''}, allowed {band})"
+            self._numeric_raised[code] = sev
+            raised = self.db.raise_alarm(code, desc, sev, 0)
+            if raised:
+                self.db.write_event(
+                    severity=sev, type_="ALARM",
+                    message=f"Alarm raised — {desc}", meta=f"code {code}",
+                )
+                emitted.append({
+                    "type": "alarm", "code": code, "desc": desc,
+                    "severity": sev, "ts": time.time(),
+                })
+                log.warning("Numeric alarm raised: %s %s", code, desc)
+
+        # Clear: previously raised but now back in range (or engine no longer
+        # producing, so the band no longer applies).
+        for code in list(self._numeric_raised):
+            if code in active_now:
+                continue
+            self._numeric_raised.pop(code, None)
+            cleared = self.db.clear_alarm(code)
+            if cleared:
+                self.db.write_event(
+                    severity="ok", type_="ALARM",
+                    message=f"Alarm cleared — {code}", meta=f"code {code}",
+                )
+                emitted.append({
+                    "type": "alarm-cleared", "code": code, "desc": code,
+                    "ts": time.time(),
+                })
+                log.info("Numeric alarm cleared: %s", code)
 
     def _check_loadsource_disagreement(
         self, values: dict, emitted: list[dict[str, Any]]

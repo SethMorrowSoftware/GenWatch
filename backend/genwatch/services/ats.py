@@ -760,6 +760,24 @@ class AtsService:
                     success_pct=float(evt.get("successPct", 0.0)),
                     ts=ts,
                 )
+            elif t == "alarm":
+                # ATS fault bits (INPUT_FAULT / OUTPUT_FAULT / CALIBRATION /
+                # MODE_UNKNOWN). These are exactly the conditions that make the
+                # displayed load source wrong or drop ATS authority, so they
+                # MUST page like any other alarm — previously they were raised
+                # in the DB but never forwarded to Slack.
+                await self.slack.alert_alarm(
+                    code=str(evt.get("code", "")),
+                    desc=str(evt.get("desc", "")),
+                    severity=str(evt.get("severity", "warn")),
+                    ts=ts,
+                )
+            elif t == "alarm-cleared":
+                await self.slack.alert_alarm_cleared(
+                    code=str(evt.get("code", "")),
+                    desc=str(evt.get("desc", "")),
+                    ts=ts,
+                )
         except Exception as e:  # noqa: BLE001
             log.exception("ats: slack forward failed: %s", e)
 

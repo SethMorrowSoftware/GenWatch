@@ -35,7 +35,7 @@ def app_env(monkeypatch, tmp_path):
 async def client(app_env):
     app = create_app()
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(transport=transport, base_url="http://test", headers={"X-Requested-With": "pytest"}) as c:
         async with app.router.lifespan_context(app):
             await asyncio.sleep(0.2)
             yield c
@@ -420,9 +420,16 @@ async def test_control_rejected_when_comms_lost(tmp_path):
             return SimpleNamespace(ok=True, error=None)
 
     # Stale-but-confident snapshot: looks startable, but comms are LOST.
+    # Stamp the control-source registers fresh so the freshness gate (H-3)
+    # isolates the comms-state behaviour this test targets.
+    import time as _time
+
+    from genwatch.modbus.poller import Reading
+    fresh_ages = {r.name: _time.monotonic() for r in regmap.registers}
     snap = SimpleNamespace(
         panel_mode="auto", engine_state="stopped",
         comms=SimpleNamespace(state="lost"),
+        last_reading=Reading(value_ages=fresh_ages),
     )
     state = SimpleNamespace(snap=snap)
     ctl = ControlService(regmap, FakeClient(), MagicMock(), state, slack=None)
@@ -436,6 +443,81 @@ async def test_control_rejected_when_comms_lost(tmp_path):
 
     # Token survived the denial — once comms recover the same token works.
     snap.comms.state = "healthy"
+    res = await ctl.execute("start", tok.token, "op", "operator")
+    assert res["ok"] is True
+    assert writes == [(0x019C, None, 16, [0x0080, 0x0000, 0x0000])]
+
+
+async def _mk_control_service(comms_state="healthy", stale_register=None):
+    """Build a ControlService with a realistic snapshot for freshness tests."""
+    import time as _time
+    from pathlib import Path
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from genwatch.modbus.poller import Reading
+    from genwatch.modbus.registers import load_register_map
+    from genwatch.services.control import ControlService
+
+    regmap = load_register_map(Path(__file__).parent.parent / "genwatch/registers/h100.yaml")
+    writes: list = []
+
+    class FakeClient:
+        async def write(self, addr, value=None, *, fc=6, values=None):
+            writes.append((addr, value, fc, values))
+            return SimpleNamespace(ok=True, error=None)
+
+    now = _time.monotonic()
+    ages = {r.name: now for r in regmap.registers}
+    if stale_register is not None:
+        ages[stale_register] = now - 10_000.0  # far past the freshness window
+    snap = SimpleNamespace(
+        panel_mode="auto", engine_state="stopped",
+        comms=SimpleNamespace(state=comms_state),
+        last_reading=Reading(value_ages=ages),
+    )
+    state = SimpleNamespace(snap=snap)
+    ctl = ControlService(regmap, FakeClient(), MagicMock(), state, slack=None)
+    return ctl, writes
+
+
+async def test_control_rejected_when_comms_degraded(tmp_path):
+    """H-3: a 'degraded' link (not just 'lost') must block remote commands —
+    its last-known engine/panel state can't be trusted for a start/stop."""
+    from genwatch.services.control import ControlError
+
+    ctl, writes = await _mk_control_service(comms_state="degraded")
+    tok = await ctl.issue_token("op")
+    with pytest.raises(ControlError) as ei:
+        await ctl.execute("start", tok.token, "op", "operator")
+    assert ei.value.code == "comms_lost"
+    assert ei.value.http_status == 409
+    assert writes == []
+
+
+async def test_control_rejected_when_panel_register_stale(tmp_path):
+    """H-3: even with healthy comms, if the register backing panel_mode is
+    individually stale the command must be rejected (the prime state block
+    can decode while a key-switch single persistently fails)."""
+    from genwatch.services.control import ControlError
+
+    # input_status_1 backs panel_mode (h100.yaml panel_mode_bits).
+    ctl, writes = await _mk_control_service(
+        comms_state="healthy", stale_register="input_status_1",
+    )
+    tok = await ctl.issue_token("op")
+    with pytest.raises(ControlError) as ei:
+        await ctl.execute("start", tok.token, "op", "operator")
+    assert ei.value.code == "stale_data"
+    assert ei.value.http_status == 409
+    assert writes == []
+
+
+async def test_control_allowed_when_healthy_and_fresh(tmp_path):
+    """Control proceeds when comms are healthy AND the control-source
+    registers are fresh — the freshness gate doesn't over-reject."""
+    ctl, writes = await _mk_control_service(comms_state="healthy")
+    tok = await ctl.issue_token("op")
     res = await ctl.execute("start", tok.token, "op", "operator")
     assert res["ok"] is True
     assert writes == [(0x019C, None, 16, [0x0080, 0x0000, 0x0000])]
@@ -537,6 +619,33 @@ def test_db_rollup_1h_and_long_span_read(tmp_path):
     rows = db.read_telemetry("kw", base, base + 30 * 86400)
     assert len(rows) >= 3
     assert all(abs(v - 100.0) < 1.0 for _, v in rows)
+    db.close()
+
+
+def test_db_rollup_1h_is_sample_weighted(tmp_path):
+    """M-9: the hourly average must be sample-weighted, not an average of the
+    minute averages. Build one hour where a dense minute (many samples at
+    100 kW) is followed by a sparse minute (one sample at 0 kW): the weighted
+    hourly mean must sit near 100, not the unweighted ~50."""
+    from genwatch.db import Database
+
+    db = Database(tmp_path / "t.sqlite")
+    base = 2_000_000 - (2_000_000 % 3600)  # align to an hour boundary
+
+    # Minute 0: 60 samples at 100 kW (every second).
+    for i in range(60):
+        db.write_telemetry(base + i, {"total_kw": 100.0, "rpm": 1800.0}, "running", 0)
+    # Minute 1: a single sample at 0 kW.
+    db.write_telemetry(base + 60, {"total_kw": 0.0, "rpm": 0.0}, "running", 0)
+
+    db.aggregate_rollup_1m(base, base + 3600)
+    db.aggregate_rollup_1h(base, base + 3600)
+    rows = db.read_telemetry("kw", base, base + 3600 + 1)
+    assert rows, "expected an hourly bucket"
+    _, kw = rows[0]
+    # Unweighted average-of-averages would be ~50 (mean of 100 and 0).
+    # Sample-weighted: (100*60 + 0*1)/61 ≈ 98.4.
+    assert kw > 90.0, f"hourly kw should be sample-weighted (~98), got {kw}"
     db.close()
 
 
@@ -1352,7 +1461,7 @@ async def test_login_cookie_auto_secure_on_https_request(app_env):
     """Auto-detect: an HTTPS-scheme request gets Secure for free."""
     app = create_app()
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="https://test") as c:
+    async with httpx.AsyncClient(transport=transport, base_url="https://test", headers={"X-Requested-With": "pytest"}) as c:
         async with app.router.lifespan_context(app):
             await asyncio.sleep(0.1)
             r = await c.post("/api/auth/login", json={"password": "test"})
@@ -1373,7 +1482,7 @@ async def test_cookie_secure_explicit_true_forces_secure_even_on_http(monkeypatc
 
     app = create_app()
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(transport=transport, base_url="http://test", headers={"X-Requested-With": "pytest"}) as c:
         async with app.router.lifespan_context(app):
             await asyncio.sleep(0.1)
             r = await c.post("/api/auth/login", json={"password": "test"})
@@ -1393,7 +1502,7 @@ async def test_cookie_samesite_lax_override_applies(monkeypatch, tmp_path):
 
     app = create_app()
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(transport=transport, base_url="http://test", headers={"X-Requested-With": "pytest"}) as c:
         async with app.router.lifespan_context(app):
             await asyncio.sleep(0.1)
             r = await c.post("/api/auth/login", json={"password": "test"})

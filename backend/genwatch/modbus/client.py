@@ -647,8 +647,10 @@ class MockModbusClient:
             base = 8 if self._state == "exercising" else (loaded_amps if running else 0)
             return max(0, int(base + wob * 3))
         if name == "run_hours":
-            # static-ish counter that ticks while running
-            return int(18476 + (time.monotonic() / 36) % 100)
+            # RAW register is tenths of an hour (scale 0.1) — emit ~184760 so the
+            # decode yields a realistic ~18476.0 h and the /10 divider is actually
+            # exercised (a raw value already in whole hours would mask it).
+            return int(184760 + (time.monotonic() / 3.6) % 1000)
         if name == "fuel_level_pct":
             return 78
         return 0

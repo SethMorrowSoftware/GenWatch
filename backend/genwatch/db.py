@@ -356,8 +356,16 @@ class Database:
         raw's 7 d) so hourly history survives well past the raw window —
         without this, all history older than the 1m horizon was silently
         lost despite the schema/config advertising ~2 years. Idempotent via
-        INSERT OR REPLACE. kwh = Σ(minute kW averages)/60; runtime_s is not
-        derivable from the 1m rollup and is left 0.
+        INSERT OR REPLACE. runtime_s is not derivable from the 1m rollup and
+        is left 0.
+
+        Averages are SAMPLE-WEIGHTED (M-9): a plain AVG() of the minute
+        averages double-counts sparse minutes (a minute with 1 sample would
+        weigh the same as one with 120), skewing the hourly rpm/kw/temp toward
+        gappy minutes. SUM(x_avg*samples)/SUM(samples) recovers the true
+        time-weighted mean. kwh = Σ(minute kW averages)/60 — each present
+        minute contributes kw_avg × 1/60 h of energy; missing minutes have no
+        data and are honestly excluded.
         """
         sql = """
             INSERT OR REPLACE INTO telemetry_1h
@@ -365,8 +373,12 @@ class Database:
                  samples, runtime_s, kwh)
             SELECT
                 CAST(ts/3600 AS INTEGER)*3600,
-                AVG(rpm_avg), AVG(hz_avg), AVG(kw_avg),
-                AVG(oil_p_avg), AVG(cool_t_avg), AVG(batt_avg),
+                SUM(rpm_avg * samples)    / NULLIF(SUM(samples), 0),
+                SUM(hz_avg * samples)     / NULLIF(SUM(samples), 0),
+                SUM(kw_avg * samples)     / NULLIF(SUM(samples), 0),
+                SUM(oil_p_avg * samples)  / NULLIF(SUM(samples), 0),
+                SUM(cool_t_avg * samples) / NULLIF(SUM(samples), 0),
+                SUM(batt_avg * samples)   / NULLIF(SUM(samples), 0),
                 COALESCE(SUM(samples), 0),
                 0,
                 COALESCE(SUM(kw_avg), 0.0) / 60.0

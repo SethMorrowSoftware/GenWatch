@@ -628,9 +628,24 @@ def create_app() -> FastAPI:
         origin = request.headers.get("origin")
         referer = request.headers.get("referer")
         if not origin and not referer:
-            # No browser context — non-browser client. Cookie + token
-            # auth alone is sufficient; CSRF requires a victim browser.
-            return await call_next(request)
+            # No Origin/Referer. A genuine same-origin browser fetch always
+            # sends Origin on a non-safe method, so this is either a non-browser
+            # client or an attempt to strip the header. Require a custom request
+            # header (M-8): the GenWatch SPA always sends X-Requested-With, and
+            # a cross-site attacker CANNOT set a custom header on a cross-origin
+            # request without triggering a CORS preflight that our allowlist
+            # rejects. Non-browser clients (curl/ansible) simply add the header.
+            if request.headers.get("x-requested-with"):
+                return await call_next(request)
+            log.warning(
+                "csrf: rejecting %s %s — no Origin/Referer and no "
+                "X-Requested-With header", request.method, path,
+            )
+            return JSONResponse(
+                {"detail": {"code": "csrf_blocked",
+                            "message": "missing Origin/Referer or X-Requested-With"}},
+                status_code=403,
+            )
         host = request.headers.get("host", "")
         same_origin_ok = {
             f"http://{host}",

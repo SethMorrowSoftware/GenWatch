@@ -98,6 +98,36 @@ class ControlService:
         self._tokens: dict[str, ConfirmToken] = {}
         self._lock = asyncio.Lock()
 
+    # Control-relevant data must be at most this many prime-poll cadences old.
+    # Tighter than the poller's eviction threshold (TIER_STALE_MULTIPLIER×, ~3),
+    # so the command path demands fresher data than mere "not yet evicted".
+    _CONTROL_FRESH_MULTIPLIER = 2.0
+
+    def _stale_control_registers(self) -> list[str]:
+        """Names of the registers backing panel_mode / engine_state that are
+        stale (or never decoded), per the live Reading's per-register ages.
+
+        These are the inputs to the panel-AUTO and state-validity gates; if any
+        is stale the gates would be evaluating old data even with healthy comms
+        (the prime state block can decode while a key-switch/status single
+        persistently fails). Returns [] when everything is fresh.
+        """
+        reading = getattr(self.state.snap, "last_reading", None)
+        ages = getattr(reading, "value_ages", {}) or {}
+        cadence_s = max(self.regmap.prime_poll_ms, 1) / 1000.0
+        max_age_s = cadence_s * self._CONTROL_FRESH_MULTIPLIER
+        now_mono = time.monotonic()
+
+        sources = {r.register for r in self.regmap.engine_state_bits}
+        sources |= {r.register for r in self.regmap.panel_mode_bits}
+
+        stale: list[str] = []
+        for name in sorted(sources):
+            ts = ages.get(name)
+            if ts is None or (now_mono - ts) > max_age_s:
+                stale.append(name)
+        return stale
+
     async def apply_regmap(self, new_regmap: RegisterMap) -> None:
         """Swap in a freshly-loaded register map (POST /api/registers/reload).
 
@@ -226,18 +256,42 @@ class ControlService:
             # age out — so without this, an operator (or a stale browser
             # tab) could pass the state-validity and panel-AUTO gates below
             # against minutes-old data and fire a start/stop the H-100
-            # would silently drop. If the link is LOST we cannot confirm
-            # live engine state or key-switch position, so refuse outright.
+            # would silently drop.
+            #
+            # Two checks (H-3):
+            #  1. Comms must be HEALTHY, not just "not lost". A "degraded"
+            #     link still serves last-known values and previously slipped
+            #     through — but we can't trust the engine/panel state under it.
+            #  2. Even when comms reads healthy, the SPECIFIC registers that
+            #     back panel_mode and engine_state can be individually stale
+            #     (the prime state block can decode while key_switch/status
+            #     singles persistently fail; the comms classifier wouldn't
+            #     notice). Reject if any of those registers hasn't decoded
+            #     within the freshness window.
             comms_state = getattr(self.state.snap.comms, "state", "lost")
-            if comms_state == "lost":
+            if comms_state != "healthy":
                 self.db.write_audit(
                     operator, f"control.{verb}", f"comms={comms_state}", token, "denied"
                 )
                 raise ControlError(
                     "comms_lost",
-                    f"cannot {verb}: H-100 communication is LOST — live engine "
-                    f"state and panel position can't be confirmed. Restore the "
-                    f"link (run `genwatch doctor`) before issuing remote commands.",
+                    f"cannot {verb}: H-100 communication is {comms_state.upper()} — "
+                    f"live engine state and panel position can't be confirmed. "
+                    f"Restore the link (run `genwatch doctor`) before issuing "
+                    f"remote commands.",
+                    409,
+                )
+            stale = self._stale_control_registers()
+            if stale:
+                self.db.write_audit(
+                    operator, f"control.{verb}", f"stale={','.join(stale)}", token, "denied"
+                )
+                raise ControlError(
+                    "stale_data",
+                    f"cannot {verb}: the H-100 registers that determine engine "
+                    f"state / panel position are stale ({', '.join(stale)}) even "
+                    f"though the link is up. Wait for a fresh poll or run "
+                    f"`genwatch doctor`.",
                     409,
                 )
 

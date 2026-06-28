@@ -340,6 +340,25 @@ if [[ ! -c /dev/watchdog ]]; then
   warn "On a real Pi this means the bcm2835_wdt kernel module didn't load."
 fi
 
+# ─── 8b. time sync (ICD §9.4/§11: <5 s skew vs the ATS-Pi is a hard contract) ─
+# GenWatch raises TIME_SKEW if its clock and the ATS-Pi's differ by >5 s. The Pi
+# has no battery RTC, so after a power cut it boots at a wrong time until NTP
+# corrects it. Enable a time-sync service and report status.
+if command -v timedatectl &>/dev/null; then
+  log "Enabling NTP time sync (timedatectl set-ntp true)"
+  timedatectl set-ntp true 2>/dev/null || warn "could not enable NTP via timedatectl"
+  systemctl enable --now systemd-timesyncd 2>/dev/null || true
+  if timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -qx yes; then
+    log "Clock is NTP-synchronized"
+  else
+    warn "Clock NOT yet NTP-synchronized. On an air-gapped OT VLAN, point this Pi"
+    warn "  and the ATS-Pi at the same source (or each other) per ICD §11, or"
+    warn "  GenWatch will raise persistent TIME_SKEW alarms."
+  fi
+else
+  warn "timedatectl not found — ensure NTP/chrony keeps this Pi within 5 s of the ATS-Pi (ICD §11)."
+fi
+
 # ─── 9. pre-flight check ──────────────────────────────────────────────────
 log "Running pre-flight diagnostics"
 set +e

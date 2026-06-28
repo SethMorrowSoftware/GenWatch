@@ -414,7 +414,10 @@ def app_env(monkeypatch, tmp_path):
 async def client(app_env):
     app = create_app()
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test",
+        headers={"X-Requested-With": "pytest"},  # compliant client (M-8)
+    ) as c:
         async with app.router.lifespan_context(app):
             await asyncio.sleep(0.2)
             yield c, app

@@ -430,6 +430,42 @@ async def test_fault_bit_cleared_clears_alarm(ats, store, fake_db):
     assert len(clear_calls) == 1
 
 
+class _FakeSlack:
+    """Minimal Slack notifier double capturing alarm forwards (H-8)."""
+
+    def __init__(self):
+        self.alarms: list[tuple] = []
+        self.cleared: list[tuple] = []
+
+    def is_enabled(self) -> bool:
+        return True
+
+    async def alert_alarm(self, code, desc, severity, ts):
+        self.alarms.append((code, desc, severity))
+
+    async def alert_alarm_cleared(self, code, desc, ts):
+        self.cleared.append((code, desc))
+
+
+async def test_ats_fault_alarm_is_forwarded_to_slack(regmap, fake_db, bus):
+    """H-8: ATS fault bits (INPUT_FAULT/CALIBRATION/...) must page to Slack —
+    they are exactly the conditions that make the displayed load source wrong.
+    Previously they were raised in the DB but never forwarded.
+    """
+    slack = _FakeSlack()
+    svc = AtsService(regmap, fake_db, bus, slack=slack)
+    store = MockAtsPiStore()
+    await svc.on_poll("base", store.as_reading("base"), healthy())
+
+    store.set_fault_bit(0x0001, on=True)  # ATS_PI_INPUT_FAULT
+    await svc.on_poll("prime", store.as_reading("prime"), healthy())
+    assert any(c == "ATS_PI_INPUT_FAULT" for c, _d, _s in slack.alarms), slack.alarms
+
+    store.set_fault_bit(0x0001, on=False)
+    await svc.on_poll("prime", store.as_reading("prime"), healthy())
+    assert any(c == "ATS_PI_INPUT_FAULT" for c, _d in slack.cleared), slack.cleared
+
+
 async def test_multiple_fault_bits_decoded_independently(ats, store, fake_db):
     await ats.on_poll("base", store.as_reading("base"), healthy())
 

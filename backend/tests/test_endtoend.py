@@ -28,7 +28,10 @@ def app_env(monkeypatch, tmp_path):
 async def client(app_env):
     app = create_app()
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test",
+        headers={"X-Requested-With": "pytest"},  # compliant client (M-8)
+    ) as c:
         # Trigger lifespan startup
         async with app.router.lifespan_context(app):
             # Give the poller a moment to do a base read
@@ -160,7 +163,10 @@ async def test_control_rejected_when_panel_not_auto(client, app_env):
 
     app = create_app()
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test",
+        headers={"X-Requested-With": "pytest"},  # compliant client (M-8)
+    ) as c:
         async with app.router.lifespan_context(app):
             await asyncio.sleep(0.3)
             # Force the state-machine snapshot's panel_mode to a non-AUTO
@@ -181,9 +187,9 @@ async def test_csrf_blocks_cross_origin_post(client):
     """A POST carrying an Origin header from a foreign domain must be
     rejected 403 with csrf_blocked, regardless of whether the cookie
     is present. Defense-in-depth against SameSite=Lax footguns and
-    misconfigured cors_origins. Non-browser clients (no Origin /
-    Referer) are unaffected — the rest of the test suite proves that
-    by continuing to pass without setting these headers."""
+    misconfigured cors_origins. Non-browser clients with no Origin/
+    Referer are accepted ONLY if they send X-Requested-With (M-8) — the
+    rest of the suite proves that by passing with that default header."""
     await _login(client)
     r = await client.post(
         "/api/control/confirm",
@@ -197,6 +203,30 @@ async def test_csrf_blocks_cross_origin_post(client):
     )
     assert r.status_code == 403, r.text
     assert r.json()["detail"]["code"] == "csrf_blocked"
+
+
+async def test_csrf_blocks_post_with_no_origin_and_no_custom_header(app_env):
+    """M-8: the fail-open is closed — a state-changing POST with NEITHER
+    Origin/Referer NOR X-Requested-With is rejected. (A browser can't set a
+    custom header cross-origin without a preflight our allowlist rejects.)"""
+    app = create_app()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        async with app.router.lifespan_context(app):
+            # Log in as a compliant client (sends the header) to get the cookie.
+            r = await c.post(
+                "/api/auth/login", json={"password": "test"},
+                headers={"X-Requested-With": "pytest"},
+            )
+            assert r.status_code == 200, r.text
+            # Now a state-changing POST with NO Origin and NO X-Requested-With
+            # — even with the valid session cookie — must be rejected.
+            r = await c.post(
+                "/api/alarms/COMMON_ALARM/ack",
+                json={"confirm_token": "anything"},
+            )
+            assert r.status_code == 403, r.text
+            assert r.json()["detail"]["code"] == "csrf_blocked"
 
 
 async def test_csrf_allows_same_origin_post(client):
@@ -221,7 +251,10 @@ async def test_alarm_ack_requires_confirm_token(client, app_env):
 
     app = create_app()
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test",
+        headers={"X-Requested-With": "pytest"},  # compliant client (M-8)
+    ) as c:
         async with app.router.lifespan_context(app):
             await asyncio.sleep(0.3)
             await _login(c)
@@ -264,7 +297,10 @@ async def test_control_state_check_runs_against_fresh_snap(client, app_env):
 
     app = create_app()
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test",
+        headers={"X-Requested-With": "pytest"},  # compliant client (M-8)
+    ) as c:
         async with app.router.lifespan_context(app):
             await asyncio.sleep(0.3)
             await _login(c)
@@ -303,7 +339,10 @@ async def test_registers_reload_propagates_to_poller(client, app_env):
 
     app = create_app()
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test",
+        headers={"X-Requested-With": "pytest"},  # compliant client (M-8)
+    ) as c:
         async with app.router.lifespan_context(app):
             await asyncio.sleep(0.3)
             await _login(c)

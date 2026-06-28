@@ -136,6 +136,12 @@ class RegisterMap:
     registers: list[RegisterDef]
     controls: dict[str, ControlDef]
     raw: dict = field(default_factory=dict)  # for /api/registers GET
+    # When true, the state machine raises warn/alarm events from the per-
+    # register warn_range/alarm_range bands (a software backstop on top of the
+    # H-100's own status bits). Default OFF: the YAML bands ship UNVERIFIED for
+    # any given unit, and live alarms from wrong thresholds cause alarm fatigue.
+    # Enable per-site only after field-verifying the ranges (see h100.yaml).
+    numeric_alarms_enabled: bool = False
 
     # ---- accessors ----
     def by_name(self, name: str) -> RegisterDef | None:
@@ -434,6 +440,7 @@ def load_register_map(path: Path | str) -> RegisterMap:
         registers=registers,
         controls=controls,
         raw=data,
+        numeric_alarms_enabled=bool(data.get("numeric_alarms_enabled", False)),
     )
     report = validate_register_map(rm)
     if report.errors:

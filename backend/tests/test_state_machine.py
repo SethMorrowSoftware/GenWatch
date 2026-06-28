@@ -377,3 +377,69 @@ def test_load_source_started_at_updates_on_transition(sm):
         _comms(),
     )
     assert sm.snap.load_source_started_at > t0
+
+
+# ─── Numeric range alarms (H-5) ──────────────────────────────────────────
+
+
+def _running_with_coolant(coolant=None):
+    """A running-engine reading, optionally with a coolant_temp value."""
+    vals = _values_for("running", current=200, kw=150)
+    if coolant is not None:
+        vals["coolant_temp"] = coolant
+    return Reading(values=vals)
+
+
+def _emitted_codes(emitted, ev_type):
+    return [e.get("code") for e in emitted if e.get("type") == ev_type]
+
+
+def test_numeric_alarms_off_by_default(sm):
+    """With numeric_alarms_enabled false (the default), an out-of-range value
+    raises nothing — the dead-config hazard, now explicitly inert."""
+    assert sm.regmap.numeric_alarms_enabled is False
+    for _ in range(5):
+        emitted = sm.update(_running_with_coolant(240), _comms())  # >235 alarm band
+    assert _emitted_codes(emitted, "alarm") == []
+    assert not any(c.startswith("RANGE_") for c in sm.snap.active_alarms)
+
+
+def test_numeric_alarm_raises_when_enabled_and_sustained(sm):
+    """Enabled + engine running + value out of the alarm band for the debounce
+    window → a RANGE_COOLANT_TEMP alarm is raised once."""
+    sm.regmap.numeric_alarms_enabled = True
+    raised = []
+    for _ in range(3):  # NUMERIC_ALARM_MIN_POLLS
+        emitted = sm.update(_running_with_coolant(240), _comms())
+        raised += _emitted_codes(emitted, "alarm")
+    assert "RANGE_COOLANT_TEMP" in raised
+    assert "RANGE_COOLANT_TEMP" in sm.snap.active_alarms
+
+
+def test_numeric_alarm_not_raised_when_engine_stopped(sm):
+    """The band is meaningless at rest — no alarm even if out of range."""
+    sm.regmap.numeric_alarms_enabled = True
+    for _ in range(5):
+        vals = _values_for("stopped")
+        vals["coolant_temp"] = 240
+        emitted = sm.update(Reading(values=vals), _comms())
+    assert _emitted_codes(emitted, "alarm") == []
+
+
+def test_numeric_alarm_skips_missing_value(sm):
+    """A stale/evicted register (value None) must not trip the comparator."""
+    sm.regmap.numeric_alarms_enabled = True
+    for _ in range(5):
+        emitted = sm.update(_running_with_coolant(None), _comms())
+    assert _emitted_codes(emitted, "alarm") == []
+
+
+def test_numeric_alarm_clears_when_back_in_range(sm):
+    """Once raised, a return to the normal band fires a clear event."""
+    sm.regmap.numeric_alarms_enabled = True
+    for _ in range(3):
+        sm.update(_running_with_coolant(240), _comms())
+    assert "RANGE_COOLANT_TEMP" in sm.snap.active_alarms
+    emitted = sm.update(_running_with_coolant(190), _comms())  # within 170-210
+    assert "RANGE_COOLANT_TEMP" in _emitted_codes(emitted, "alarm-cleared")
+    assert "RANGE_COOLANT_TEMP" not in sm.snap.active_alarms
